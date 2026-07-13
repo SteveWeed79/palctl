@@ -58,6 +58,15 @@ class PalBot(discord.Client):
         self._register()
         bus.on_any(self._on_event)
 
+    def reconfigure(self, cfg: Config, api: PalApi) -> None:
+        """Pick up a config reload: channel, notification toggles, API endpoint.
+
+        Enabling the bot when it never started, or changing its token, still
+        needs a daemon restart — discord.py can't swap tokens on a live client.
+        """
+        self._cfg = cfg
+        self._api = api
+
     # ---------- event relay ----------
 
     async def _channel(self) -> discord.abc.Messageable | None:
@@ -379,12 +388,22 @@ class PalBot(discord.Client):
             task.add_done_callback(self._bg_tasks.discard)
 
 
-async def run_bot(cfg: Config, api: PalApi, bus: EventBus, store: SessionStore, sched):
+async def run_bot(
+    cfg: Config,
+    api: PalApi,
+    bus: EventBus,
+    store: SessionStore,
+    sched,
+    on_created=None,
+):
     token = get_discord_token()
     if not (cfg.discord.enabled and token):
         return  # bot is opt-in; daemon runs fine without it
 
     bot = PalBot(cfg, api, bus, store, sched)
+    if on_created is not None:
+        # Hand the instance back to the daemon so reload-config can reach it.
+        on_created(bot)
     try:
         await bot.start(token)
     except discord.LoginFailure:

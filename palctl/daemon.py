@@ -102,6 +102,7 @@ class Daemon:
         self.tracker = PlayerTracker(self.bus, self.store)
         self.scheduler = Scheduler(self.cfg, self.api, self.bus)
         self.watchdog = Watchdog(self.cfg, self.api, self.bus)
+        self.bot = None  # set by run_bot if the Discord bot is enabled
 
         # None = haven't polled yet; don't announce "up" just because the
         # daemon (not the server) was restarted.
@@ -119,6 +120,9 @@ class Daemon:
 
         self.bus.on_any(self._persist)
         self.bus.on_any(self._log_event)
+
+    def _set_bot(self, bot) -> None:
+        self.bot = bot
 
     def _spawn(self, coro) -> None:
         # asyncio holds only weak refs to tasks; keep one or it can be GC'd mid-run.
@@ -322,6 +326,8 @@ class Daemon:
                     # too or the reload silently changes nothing.
                     self.scheduler.reconfigure(self.cfg, self.api)
                     self.watchdog.reconfigure(self.cfg, self.api)
+                    if self.bot is not None:
+                        self.bot.reconfigure(self.cfg, self.api)
                 else:
                     return web.json_response({"error": f"unknown action {what}"}, status=400)
             except Exception as e:
@@ -347,7 +353,8 @@ class Daemon:
     async def run(self) -> None:
         runner = web.AppRunner(self._routes())
         await runner.setup()
-        # 127.0.0.1 only. This API has no auth; it must never leave the box.
+        # 127.0.0.1 only, and every request must carry the per-user token
+        # (see localauth) — but this API still must never leave the box.
         await web.TCPSite(runner, "127.0.0.1", DAEMON_PORT).start()
         self.log.info("daemon up; localhost API on 127.0.0.1:%d", DAEMON_PORT)
 
@@ -359,7 +366,10 @@ class Daemon:
             self.watchdog.run(),
             self.scheduler.run(),
             self._update_check_loop(),
-            run_bot(self.cfg, self.api, self.bus, self.store, self.scheduler),
+            run_bot(
+                self.cfg, self.api, self.bus, self.store, self.scheduler,
+                on_created=self._set_bot,
+            ),
         )
 
     async def _update_check_loop(self) -> None:
