@@ -12,12 +12,23 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 
 import psutil
 
-PAL_PROCESS_NAMES = ("PalServer-Win64-Shipping.exe", "PalServer.exe")
+IS_WINDOWS = sys.platform.startswith("win")
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# Shipping binaries first (Windows then Linux), then the thin launchers — so the
+# leak watchdog watches the process that actually holds the memory, on either OS.
+PAL_PROCESS_NAMES = (
+    "PalServer-Win64-Shipping.exe",
+    "PalServer-Linux-Shipping",
+    "PalServer.exe",
+    "PalServer.sh",
+)
 
 
 @dataclass(frozen=True)
@@ -66,24 +77,48 @@ def proc_stats() -> ProcStats | None:
         return None
 
 
-# ---------------- service control ----------------
+# ---------------- service control (Windows sc.exe / Linux systemd) ----------------
+#
+# The rest of palctl only knows service_state / start_service / stop_service; the
+# platform difference is confined here. The command builders and output parsers
+# are pure so they're testable on any OS.
 
 
-def _sc(*args: str) -> str:
+def _run_capture(cmd: list[str]) -> str:
     return subprocess.run(
-        ["sc.exe", *args],
-        capture_output=True,
-        text=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        cmd, capture_output=True, text=True, creationflags=_NO_WINDOW
     ).stdout
 
 
-def service_state(service_name: str) -> str:
-    out = _sc("query", service_name)
+def _parse_sc_state(out: str) -> str:
     for state in ("RUNNING", "STOPPED", "START_PENDING", "STOP_PENDING"):
         if state in out:
             return state
     return "UNKNOWN"
+
+
+def _parse_systemctl_state(out: str) -> str:
+    return {
+        "active": "RUNNING",
+        "inactive": "STOPPED",
+        "failed": "STOPPED",
+        "activating": "START_PENDING",
+        "deactivating": "STOP_PENDING",
+    }.get(out.strip(), "UNKNOWN")
+
+
+def _state_command(name: str) -> list[str]:
+    return ["sc.exe", "query", name] if IS_WINDOWS else ["systemctl", "is-active", name]
+
+
+def _action_command(action: str, name: str) -> list[str]:
+    """action is 'start' or 'stop'. sc.exe and systemctl happen to share verbs."""
+    return ["sc.exe", action, name] if IS_WINDOWS else ["systemctl", action, name]
+
+
+def service_state(service_name: str) -> str:
+    out = _run_capture(_state_command(service_name))
+    return _parse_sc_state(out) if IS_WINDOWS else _parse_systemctl_state(out)
 
 
 async def _wait_for(service_name: str, target: str, timeout: float = 120.0) -> bool:
@@ -99,12 +134,12 @@ async def _wait_for(service_name: str, target: str, timeout: float = 120.0) -> b
 async def start_service(service_name: str) -> bool:
     if service_state(service_name) == "RUNNING":
         return True
-    _sc("start", service_name)
+    _run_capture(_action_command("start", service_name))
     return await _wait_for(service_name, "RUNNING")
 
 
 async def stop_service(service_name: str) -> bool:
     if service_state(service_name) == "STOPPED":
         return True
-    _sc("stop", service_name)
+    _run_capture(_action_command("stop", service_name))
     return await _wait_for(service_name, "STOPPED")

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -126,7 +127,11 @@ class Config:
 
     @property
     def live_ini(self) -> Path:
-        return self.saved_dir / "Config" / "WindowsServer" / "PalWorldSettings.ini"
+        # The server writes its live ini under WindowsServer/ or LinuxServer/
+        # depending on the server's OS — which is this box's OS, since palctl
+        # runs on the same machine as the server.
+        sub = "WindowsServer" if sys.platform.startswith("win") else "LinuxServer"
+        return self.saved_dir / "Config" / sub / "PalWorldSettings.ini"
 
     @property
     def default_ini(self) -> Path:
@@ -135,19 +140,24 @@ class Config:
     # ---------- persistence ----------
 
     @classmethod
+    def from_dict(cls, raw: dict) -> Config:
+        """Build a Config from a raw dict, dropping keys from other versions and
+        rebuilding the nested dataclasses. Shared by load() and profiles."""
+        return cls(
+            **{
+                **_known(cls, raw, exclude=("watchdog", "schedule", "discord")),
+                "watchdog": WatchdogConfig(**_known(WatchdogConfig, raw.get("watchdog", {}))),
+                "schedule": ScheduleConfig(**_known(ScheduleConfig, raw.get("schedule", {}))),
+                "discord": DiscordConfig(**_known(DiscordConfig, raw.get("discord", {}))),
+            }
+        )
+
+    @classmethod
     def load(cls) -> Config:
         if not CONFIG_PATH.exists():
             return cls()
         try:
-            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            return cls(
-                **{
-                    **_known(cls, raw, exclude=("watchdog", "schedule", "discord")),
-                    "watchdog": WatchdogConfig(**_known(WatchdogConfig, raw.get("watchdog", {}))),
-                    "schedule": ScheduleConfig(**_known(ScheduleConfig, raw.get("schedule", {}))),
-                    "discord": DiscordConfig(**_known(DiscordConfig, raw.get("discord", {}))),
-                }
-            )
+            return cls.from_dict(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
             # A corrupt config must not crash-loop the daemon under NSSM.
             # Set the file aside so the values can still be recovered by hand.

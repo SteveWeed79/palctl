@@ -1,0 +1,20 @@
+# winget installer manifest (template).
+#
+# Submit these three files to microsoft/winget-pkgs under
+#   manifests/s/SteveWeed79/palctl/<version>/
+# once a release exists. Fill InstallerUrl + InstallerSha256 from the tagged
+# release (the release workflow already publishes SHA256SUMS.txt), then run
+# `winget validate` before opening the PR. After that: `winget install palctl`.
+PackageIdentifier: SteveWeed79.palctl
+PackageVersion: 0.1.0
+InstallerType: inno
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/SteveWeed79/pal-it-up/releases/download/v0.1.0/palctl-setup.exe
+    InstallerSha256: REPLACE_WITH_SHA256_FROM_SHA256SUMS_TXT
+ManifestType: installer
+ManifestVersion: 1.6.0

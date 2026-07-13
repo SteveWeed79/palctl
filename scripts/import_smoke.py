@@ -36,6 +36,8 @@ MODULES = [
     "palctl.discovery",
     "palctl.steamcmd",
     "palctl.winservice",
+    "palctl.systemd",
+    "palctl.profiles",
     "palctl.serversetup",
     "palctl.preflight",
     "palctl.netinfo",

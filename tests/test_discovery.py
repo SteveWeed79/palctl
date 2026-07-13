@@ -76,6 +76,17 @@ def test_is_steamcmd(tmp_path: Path):
     assert not is_steamcmd(tmp_path / "missing" / "steamcmd.exe")
 
 
+def test_is_steamcmd_accepts_linux_names(tmp_path: Path):
+    sh = tmp_path / "steamcmd.sh"
+    sh.write_text("#!/bin/sh\n", encoding="utf-8")
+    assert is_steamcmd(sh)
+
+
+def test_is_server_root_linux_via_palserver_sh(tmp_path: Path):
+    (tmp_path / "PalServer.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    assert is_server_root(tmp_path)
+
+
 def test_detect_server_roots_dedups_and_validates(tmp_path: Path, monkeypatch):
     real = tmp_path / "PalServer"
     real.mkdir()
@@ -84,12 +95,12 @@ def test_detect_server_roots_dedups_and_validates(tmp_path: Path, monkeypatch):
     fake.mkdir()
 
     # No process, no registry: drive detection entirely off the "common dirs"
-    # list, with one valid path listed twice and one invalid path.
+    # list, with one valid path listed twice and one invalid path. Patch both
+    # platforms' lists so the test is OS-agnostic.
     monkeypatch.setattr(discovery, "server_root_from_process", lambda: None)
     monkeypatch.setattr(discovery, "_steam_library_roots", list)
-    monkeypatch.setattr(
-        discovery, "_COMMON_SERVER_DIRS", (str(real), str(real), str(fake))
-    )
+    for attr in ("_COMMON_SERVER_DIRS_WIN", "_COMMON_SERVER_DIRS_LINUX"):
+        monkeypatch.setattr(discovery, attr, (str(real), str(real), str(fake)))
 
     roots = detect_server_roots()
     assert roots == [real]  # valid, de-duplicated; the invalid one dropped
@@ -105,6 +116,7 @@ def test_detect_server_roots_prefers_running_process(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr(discovery, "server_root_from_process", lambda: proc_root)
     monkeypatch.setattr(discovery, "_steam_library_roots", list)
-    monkeypatch.setattr(discovery, "_COMMON_SERVER_DIRS", (str(common),))
+    for attr in ("_COMMON_SERVER_DIRS_WIN", "_COMMON_SERVER_DIRS_LINUX"):
+        monkeypatch.setattr(discovery, attr, (str(common),))
 
     assert detect_server_roots()[0] == proc_root  # process root wins

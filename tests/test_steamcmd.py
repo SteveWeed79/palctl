@@ -2,10 +2,29 @@
 the ini backup is what saves people's tuning from a validate, so both are
 pinned by tests even though the network/subprocess parts aren't."""
 
+import io
+import tarfile
 import zipfile
 from pathlib import Path
 
 from palctl import steamcmd
+
+
+def test_default_steamcmd_url_by_platform():
+    url = steamcmd.default_steamcmd_url()
+    assert url.endswith(".zip") or url.endswith(".tar.gz")
+
+
+def test_extract_steamcmd_from_targz(tmp_path: Path):
+    tgz = tmp_path / "steamcmd_linux.tar.gz"
+    payload = b"#!/bin/sh\n"
+    with tarfile.open(tgz, "w:gz") as t:
+        info = tarfile.TarInfo("steamcmd.sh")
+        info.size = len(payload)
+        t.addfile(info, io.BytesIO(payload))
+
+    out = steamcmd.extract_steamcmd(tgz, tmp_path / "out")
+    assert out.name == "steamcmd.sh" and out.exists()
 
 
 def test_update_command_order_and_validate():

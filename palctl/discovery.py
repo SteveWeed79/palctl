@@ -19,32 +19,48 @@ from __future__ import annotations
 
 import re
 import shutil
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
 APP_ID = "2394010"  # Palworld Dedicated Server on Steam
+IS_WINDOWS = sys.platform.startswith("win")
 
 # A folder is a Palworld server root if it carries one of these. Default-
 # PalWorldSettings.ini is the most reliable — it ships with the server and
-# nothing else on disk has that name — so it goes first.
+# nothing else on disk has that name — so it goes first. Windows and Linux
+# markers both listed so detection works on either.
 _SERVER_MARKERS: tuple[str, ...] = (
     "DefaultPalWorldSettings.ini",
     "PalServer.exe",
+    "PalServer.sh",
     str(Path("Pal") / "Binaries" / "Win64" / "PalServer-Win64-Shipping.exe"),
+    str(Path("Pal") / "Binaries" / "Linux" / "PalServer-Linux-Shipping"),
 )
+_STEAMCMD_NAMES = {"steamcmd.exe", "steamcmd.sh", "steamcmd"}
 
 _LIB_PATH_RE = re.compile(r'"path"\s*"([^"]+)"')
 
-# Where people most commonly end up, checked after the registry-driven guesses.
-_COMMON_SERVER_DIRS: tuple[str, ...] = (
+# Where people most commonly end up, checked after the registry / Steam-dir guesses.
+_COMMON_SERVER_DIRS_WIN: tuple[str, ...] = (
     r"C:\steamcmd\steamapps\common\PalServer",
     r"C:\PalServer",
     r"C:\Program Files (x86)\Steam\steamapps\common\PalServer",
     r"C:\Program Files\Steam\steamapps\common\PalServer",
 )
-_COMMON_STEAMCMD: tuple[str, ...] = (
+_COMMON_SERVER_DIRS_LINUX: tuple[str, ...] = (
+    "~/.steam/steam/steamapps/common/PalServer",
+    "~/Steam/steamapps/common/PalServer",
+    "~/palworld",
+)
+_COMMON_STEAMCMD_WIN: tuple[str, ...] = (
     r"C:\steamcmd\steamcmd.exe",
     r"C:\SteamCMD\steamcmd.exe",
+)
+_COMMON_STEAMCMD_LINUX: tuple[str, ...] = (
+    "~/steamcmd/steamcmd.sh",
+    "~/Steam/steamcmd/steamcmd.sh",
+    "/usr/games/steamcmd",
 )
 
 
@@ -60,9 +76,9 @@ def is_server_root(path: Path) -> bool:
 
 
 def is_steamcmd(path: Path) -> bool:
-    """True if ``path`` is an existing steamcmd.exe."""
+    """True if ``path`` is an existing steamcmd (steamcmd.exe / steamcmd.sh)."""
     try:
-        return path.is_file() and path.name.lower() == "steamcmd.exe"
+        return path.is_file() and path.name.lower() in _STEAMCMD_NAMES
     except OSError:
         return False
 
@@ -103,10 +119,25 @@ def _win_steam_dirs() -> list[Path]:
     return _dedup(dirs)
 
 
+def _linux_steam_dirs() -> list[Path]:
+    """Common Steam install dirs on Linux (Steam client or a manual SteamCMD)."""
+    home = Path.home()
+    candidates = [
+        home / ".steam" / "steam",
+        home / ".local" / "share" / "Steam",
+        home / ".steam" / "root",
+    ]
+    return _dedup([p for p in candidates if p.exists()])
+
+
+def _steam_dirs() -> list[Path]:
+    return _win_steam_dirs() if IS_WINDOWS else _linux_steam_dirs()
+
+
 def _steam_library_roots() -> list[Path]:
     """Every Steam library root: the install dir plus each entry in the vdf."""
     roots: list[Path] = []
-    for steam in _win_steam_dirs():
+    for steam in _steam_dirs():
         roots.append(steam)
         vdf = steam / "steamapps" / "libraryfolders.vdf"
         try:
@@ -154,15 +185,19 @@ def detect_server_roots() -> list[Path]:
     for lib in _steam_library_roots():
         candidates.append(lib / "steamapps" / "common" / "PalServer")
 
-    candidates.extend(Path(p) for p in _COMMON_SERVER_DIRS)
+    common = _COMMON_SERVER_DIRS_WIN if IS_WINDOWS else _COMMON_SERVER_DIRS_LINUX
+    candidates.extend(Path(p).expanduser() for p in common)
 
     return _dedup_valid(candidates, is_server_root)
 
 
 def detect_steamcmd() -> list[Path]:
-    """Verified steamcmd.exe paths, best guess first. May be empty."""
-    candidates = [Path(p) for p in _COMMON_STEAMCMD]
-    candidates.extend(steam / "steamcmd.exe" for steam in _win_steam_dirs())
+    """Verified steamcmd paths (steamcmd.exe / steamcmd.sh), best guess first."""
+    common = _COMMON_STEAMCMD_WIN if IS_WINDOWS else _COMMON_STEAMCMD_LINUX
+    candidates = [Path(p).expanduser() for p in common]
+
+    exe_name = "steamcmd.exe" if IS_WINDOWS else "steamcmd.sh"
+    candidates.extend(steam / exe_name for steam in _steam_dirs())
 
     found = shutil.which("steamcmd.exe") or shutil.which("steamcmd")
     if found:

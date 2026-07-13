@@ -165,6 +165,26 @@ registers the daemon service without touching a terminal full of `nssm` lines.
 Secrets go into Windows Credential Manager (DPAPI-encrypted), never into a config
 file.
 
+### Linux (headless)
+
+The daemon and its whole core — REST client, memory-leak watchdog, scheduler,
+backups, path detection, and SteamCMD install/update — run on Linux too. Service
+control uses **systemd** instead of NSSM, SteamCMD comes from the Linux tarball,
+and paths resolve under `~/.steam` / `LinuxServer/`. Register the daemon with:
+
+```
+python -m palctl.daemon install-service   # writes a systemd unit, enables it
+```
+
+The desktop GUI/wizard are Windows-first; on a headless Linux host you drive the
+daemon via its config, the Discord bot, and the service CLI.
+
+### winget
+
+Once a release is tagged, palctl can be installed with
+`winget install SteveWeed79.palctl` — the manifest template lives in
+[packaging/winget/](packaging/winget/).
+
 ### Discord (optional)
 
 Create an app at discord.com/developers → Bot → copy the token → invite it to your

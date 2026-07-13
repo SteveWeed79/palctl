@@ -405,20 +405,34 @@ def service_target() -> tuple[str, str, str]:
 
 
 def install_service() -> None:
-    """Register (and start) the palctl daemon as a Windows service via NSSM."""
-    from . import winservice
-
-    nssm = winservice.ensure_nssm(config_dir() / "bin")
+    """Register (and start) the palctl daemon as a service — NSSM on Windows,
+    systemd on Linux."""
     exe, args, app_dir = service_target()
-    winservice.install_service(nssm, SERVICE_NAME, exe, args, app_dir)
+    if sys.platform.startswith("win"):
+        from . import winservice
+
+        nssm = winservice.ensure_nssm(config_dir() / "bin")
+        winservice.install_service(nssm, SERVICE_NAME, exe, args, app_dir)
+    else:
+        from . import systemd
+
+        exec_start = f"{exe} {args}".strip()
+        systemd.install_service(
+            SERVICE_NAME, exec_start, description="palctl daemon", working_dir=app_dir
+        )
     print(f"[daemon] service '{SERVICE_NAME}' installed and started.")
 
 
 def uninstall_service() -> None:
-    from . import winservice
+    if sys.platform.startswith("win"):
+        from . import winservice
 
-    nssm = winservice.ensure_nssm(config_dir() / "bin")
-    winservice.remove_service(nssm, SERVICE_NAME)
+        nssm = winservice.ensure_nssm(config_dir() / "bin")
+        winservice.remove_service(nssm, SERVICE_NAME)
+    else:
+        from . import systemd
+
+        systemd.remove_service(SERVICE_NAME)
     print(f"[daemon] service '{SERVICE_NAME}' removed.")
 
 
