@@ -41,6 +41,7 @@ MODULES = [
     "palctl.netinfo",
     "palctl.localauth",
     "palctl.diagnostics",
+    "palctl.selfupdate",
     "palctl.logging_setup",
     "palctl.bot",
     "palctl.daemon",

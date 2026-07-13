@@ -70,6 +70,10 @@ class ScheduleConfig:
     autosave_minutes: int = 15
     backup_hours: int = 6
     backup_retain: int = 24
+    # Palworld patches constantly. Opt-in: run a SteamCMD update at a quiet hour,
+    # reusing the same stop -> backup -> update -> restart flow as manual updates.
+    auto_update: bool = False
+    auto_update_at: str = "05:00"
 
 
 @dataclass
@@ -81,6 +85,11 @@ class DiscordConfig:
     notify_level_up: bool = True
     notify_watchdog: bool = True
     notify_server_up_down: bool = True
+    notify_update_available: bool = True
+    # A single embed that refreshes in place with live status, instead of spam.
+    status_message: bool = False
+    # Sent to the channel when a player joins, if set. "{name}" is filled in.
+    welcome_message: str = ""
 
 
 @dataclass
@@ -97,6 +106,9 @@ class Config:
     api_port: int = 8212
 
     poll_seconds: int = 10
+
+    # Check GitHub for a newer palctl on startup (best-effort; just notifies).
+    check_for_updates: bool = True
 
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)

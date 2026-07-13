@@ -81,3 +81,21 @@ def test_parse_progress_extracts_percent():
 def test_parse_progress_none_for_ordinary_lines():
     assert steamcmd.parse_progress("Success! App '2394010' fully installed.") is None
     assert steamcmd.parse_progress("") is None
+
+
+def test_parse_installed_buildid():
+    acf = '"AppState"\n{\n\t"appid"\t"2394010"\n\t"buildid"\t"12345678"\n}'
+    assert steamcmd.parse_installed_buildid(acf) == "12345678"
+    assert steamcmd.parse_installed_buildid("nothing here") is None
+
+
+def test_parse_latest_buildid_reads_public_branch():
+    txt = (
+        '"branches"\n{\n'
+        '  "public" { "buildid" "999" "timeupdated" "170000" }\n'
+        '  "beta"   { "buildid" "111" }\n'
+        "}"
+    )
+    assert steamcmd.parse_latest_buildid(txt) == "999"
+    # No public branch -> no answer, rather than guessing the wrong branch.
+    assert steamcmd.parse_latest_buildid('"branches" { "beta" { "buildid" "1" } }') is None

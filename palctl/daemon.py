@@ -351,12 +351,44 @@ class Daemon:
         await web.TCPSite(runner, "127.0.0.1", DAEMON_PORT).start()
         self.log.info("daemon up; localhost API on 127.0.0.1:%d", DAEMON_PORT)
 
+        if self.cfg.check_for_updates:
+            self._spawn(self._check_palctl_update())
+
         await asyncio.gather(
             self._poll_loop(),
             self.watchdog.run(),
             self.scheduler.run(),
+            self._update_check_loop(),
             run_bot(self.cfg, self.api, self.bus, self.store, self.scheduler),
         )
+
+    async def _update_check_loop(self) -> None:
+        """Ask Steam whether a newer server build exists, a couple of minutes
+        after start and then every few hours. Purely a notification."""
+        await asyncio.sleep(120)
+        while True:
+            try:
+                await self.scheduler.check_update_available()
+            except Exception as e:
+                self.log.warning("server update check failed: %s", e)
+            await asyncio.sleep(6 * 3600)
+
+    async def _check_palctl_update(self) -> None:
+        from . import __version__, selfupdate
+
+        try:
+            newer = await asyncio.to_thread(selfupdate.check)
+        except Exception:
+            newer = None
+        if newer:
+            await self.bus.emit(
+                Event(
+                    "update_available",
+                    f"⬆️ palctl **{newer}** is available (you have {__version__}). "
+                    "Grab it from the GitHub releases.",
+                    {"component": "palctl", "latest": newer},
+                )
+            )
 
 
 def service_target() -> tuple[str, str, str]:

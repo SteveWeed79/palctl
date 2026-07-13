@@ -54,6 +54,7 @@ class PalBot(discord.Client):
         self._store = store
         self._sched = scheduler
         self._bg_tasks: set[asyncio.Task] = set()
+        self._status_started = False
         self._register()
         bus.on_any(self._on_event)
 
@@ -88,6 +89,7 @@ class PalBot(discord.Client):
             "backup": True,
             "update": True,
             "restore": True,
+            "update_available": d.notify_update_available,
             "error": True,
         }
         if not wants.get(e.kind, False):
@@ -104,6 +106,9 @@ class PalBot(discord.Client):
         )
         try:
             await ch.send(embed=discord.Embed(description=e.message, colour=colour))
+            if e.kind == "join" and d.welcome_message:
+                name = e.data.get("name", "there")
+                await ch.send(d.welcome_message.replace("{name}", name))
         except discord.DiscordException:
             pass
 
@@ -118,6 +123,53 @@ class PalBot(discord.Client):
         roles = getattr(interaction.user, "roles", [])
         return any(r.id == role_id for r in roles)
 
+    # ---------- status embed (shared by /status and the live message) ----------
+
+    async def _status_embed(self) -> discord.Embed:
+        svc = procs.service_state(self._cfg.service_name)
+        stats = procs.proc_stats()
+
+        e = discord.Embed(title="Palworld Server", colour=BLUE)
+        e.add_field(name="Service", value=svc)
+        try:
+            m = await self._api.metrics()
+            e.add_field(name="Players", value=f"{m.current_players}/{m.max_players}")
+            e.add_field(name="Server FPS", value=str(m.server_fps))
+            e.add_field(name="Frame time", value=f"{m.server_frame_time:.1f} ms")
+            e.add_field(name="Uptime", value=_fmt_uptime(m.uptime))
+            e.add_field(name="In-game day", value=str(m.days))
+            e.add_field(name="Base camps", value=str(m.base_camps))
+        except PalApiError as err:
+            e.add_field(name="REST API", value=f"unreachable — {err}", inline=False)
+            e.colour = RED
+
+        if stats:
+            limit = self._cfg.watchdog.memory_limit_mb
+            pct = stats.memory_mb / limit * 100 if limit else 0
+            e.add_field(
+                name="Memory",
+                value=f"{stats.memory_mb:,.0f} MB ({pct:.0f}% of watchdog limit)",
+            )
+            e.add_field(name="CPU", value=f"{stats.cpu_percent:.0f}%")
+        return e
+
+    async def _status_loop(self) -> None:
+        """Keep one embed refreshed in place, rather than spamming the channel."""
+        msg = None
+        while not self.is_closed():
+            await asyncio.sleep(60)
+            if not (self._cfg.discord.enabled and self._cfg.discord.status_message):
+                continue
+            ch = await self._channel()
+            if ch is None:
+                continue
+            try:
+                embed = await self._status_embed()
+                embed.title = "Palworld Server — live"
+                msg = await msg.edit(embed=embed) if msg else await ch.send(embed=embed)
+            except discord.DiscordException:
+                msg = None  # message deleted or channel gone; re-post next tick
+
     # ---------- commands ----------
 
     def _register(self) -> None:
@@ -126,34 +178,7 @@ class PalBot(discord.Client):
         @tree.command(name="status", description="Server status, FPS, memory, uptime")
         async def status(interaction: discord.Interaction) -> None:
             await interaction.response.defer()
-            svc = procs.service_state(self._cfg.service_name)
-            stats = procs.proc_stats()
-
-            e = discord.Embed(title="Palworld Server", colour=BLUE)
-            e.add_field(name="Service", value=svc)
-
-            try:
-                m = await self._api.metrics()
-                e.add_field(name="Players", value=f"{m.current_players}/{m.max_players}")
-                e.add_field(name="Server FPS", value=str(m.server_fps))
-                e.add_field(name="Frame time", value=f"{m.server_frame_time:.1f} ms")
-                e.add_field(name="Uptime", value=_fmt_uptime(m.uptime))
-                e.add_field(name="In-game day", value=str(m.days))
-                e.add_field(name="Base camps", value=str(m.base_camps))
-            except PalApiError as err:
-                e.add_field(name="REST API", value=f"unreachable — {err}", inline=False)
-                e.colour = RED
-
-            if stats:
-                limit = self._cfg.watchdog.memory_limit_mb
-                pct = stats.memory_mb / limit * 100 if limit else 0
-                e.add_field(
-                    name="Memory",
-                    value=f"{stats.memory_mb:,.0f} MB ({pct:.0f}% of watchdog limit)",
-                )
-                e.add_field(name="CPU", value=f"{stats.cpu_percent:.0f}%")
-
-            await interaction.followup.send(embed=e)
+            await interaction.followup.send(embed=await self._status_embed())
 
         @tree.command(name="players", description="Who's online")
         async def players(interaction: discord.Interaction) -> None:
@@ -346,6 +371,12 @@ class PalBot(discord.Client):
                 type=discord.ActivityType.watching, name="the Palworld server"
             )
         )
+        # on_ready can fire again on reconnect; only ever start one status loop.
+        if not self._status_started:
+            self._status_started = True
+            task = asyncio.create_task(self._status_loop())
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
 
 
 async def run_bot(cfg: Config, api: PalApi, bus: EventBus, store: SessionStore, sched):

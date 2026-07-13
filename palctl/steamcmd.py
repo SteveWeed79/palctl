@@ -35,6 +35,7 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # SteamCMD prints e.g. "Update state (0x61) downloading, progress: 42.34 (123 / 456)".
 _PROGRESS_RE = re.compile(r"progress:\s*([\d.]+)")
+_BUILDID_RE = re.compile(r'"buildid"\s*"(\d+)"')
 
 
 def parse_progress(line: str) -> float | None:
@@ -46,6 +47,50 @@ def parse_progress(line: str) -> float | None:
         return float(m.group(1))
     except ValueError:
         return None
+
+
+def parse_installed_buildid(acf_text: str) -> str | None:
+    """The build id from a Steam appmanifest_<appid>.acf (the installed build)."""
+    m = _BUILDID_RE.search(acf_text)
+    return m.group(1) if m else None
+
+
+def parse_latest_buildid(app_info_text: str) -> str | None:
+    """
+    The public-branch build id from `steamcmd +app_info_print` output (the latest
+    available build). The first buildid after the "public" branch key is it.
+    """
+    idx = app_info_text.find('"public"')
+    if idx == -1:
+        return None
+    m = _BUILDID_RE.search(app_info_text, idx)
+    return m.group(1) if m else None
+
+
+def installed_buildid(server_root: str | Path, app_id: str = APP_ID) -> str | None:
+    """Read the installed build id from the server's Steam manifest, if present."""
+    acf = Path(server_root) / "steamapps" / f"appmanifest_{app_id}.acf"
+    try:
+        return parse_installed_buildid(acf.read_text(encoding="utf-8", errors="ignore"))
+    except OSError:
+        return None
+
+
+async def latest_buildid(steamcmd: str | Path, app_id: str = APP_ID) -> str | None:
+    """Ask Steam for the latest public build id. Best-effort; None on any failure."""
+    cmd = [
+        str(steamcmd), "+login", "anonymous",
+        "+app_info_update", "1", "+app_info_print", str(app_id), "+quit",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            creationflags=_NO_WINDOW,
+        )
+        out, _ = await proc.communicate()
+    except OSError:
+        return None
+    return parse_latest_buildid(out.decode(errors="replace"))
 
 
 def update_command(

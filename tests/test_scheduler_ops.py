@@ -160,3 +160,43 @@ def test_restore_backup_rejects_traversal_without_stopping(tmp_path, monkeypatch
 
     assert not calls  # a bad name must not take the server down
     assert any(e.kind == "error" for e in events)
+
+
+# ---------------- update-available check ----------------
+
+
+def _patch_buildids(monkeypatch, installed, latest):
+    monkeypatch.setattr(sched_mod.steamcmd, "installed_buildid", lambda root, app: installed)
+
+    async def _latest(sc, app):
+        return latest
+
+    monkeypatch.setattr(sched_mod.steamcmd, "latest_buildid", _latest)
+
+
+def test_update_available_notifies_when_builds_differ(tmp_path, monkeypatch):
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path)
+    _patch_buildids(monkeypatch, installed="100", latest="200")
+
+    bus = EventBus()
+    events = _collect(bus)
+    assert _run(sched_mod.Scheduler(cfg, FakeApi(), bus).check_update_available()) is True
+    assert any(e.kind == "update_available" for e in events)
+
+
+def test_update_available_quiet_when_current(tmp_path, monkeypatch):
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path)
+    _patch_buildids(monkeypatch, installed="100", latest="100")
+
+    bus = EventBus()
+    events = _collect(bus)
+    assert _run(sched_mod.Scheduler(cfg, FakeApi(), bus).check_update_available()) is False
+    assert not any(e.kind == "update_available" for e in events)

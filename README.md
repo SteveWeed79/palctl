@@ -55,6 +55,9 @@ PC, which is the situation most people are trying to get out of.
 **Daemon**
 - Memory-leak watchdog (consecutive-sample confirmation, player hold-off, hard limit, cooldown)
 - Scheduled restarts with in-game countdown, autosave, rotating backups
+- Opt-in scheduled auto-update (Palworld patches constantly) — the same
+  save → backup → SteamCMD → restart flow as a manual update
+- Notifies when a newer server build is available, or a newer palctl release
 - Opt-in crash/hang auto-recovery: if the API stops answering while palctl didn't
   stop the server, it brings it back — rate-limited so a crash-loop isn't hammered
 - Join / leave / level-up events, synthesised by diffing the player list
@@ -85,7 +88,9 @@ PC, which is the situation most people are trying to get out of.
 
 **Discord bot**
 `/status` `/players` `/playtime` `/announce` `/save` `/backup` `/backups` `/restore` `/restart` `/update` `/kick` `/ban`
-plus join/leave, level-up, watchdog, and server up/down notifications.
+plus join/leave, level-up, watchdog, server up/down, and update-available
+notifications — with an optional auto-refreshing status message and a
+`{name}` join welcome.
 
 ---
 
