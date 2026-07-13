@@ -2,18 +2,28 @@
 # (windowed) into a single dist\palctl\ folder, so end users never install
 # Python. Build with:  pyinstaller --noconfirm --clean packaging\palctl.spec
 #
-# This is a Windows build step and is not exercised by CI — if a runtime
-# "ModuleNotFoundError" shows up in the frozen build, add the offending module
-# to `hiddenimports` below (keyring's and PySide6's backends are the usual
-# suspects, which is why they're already listed).
+# Design notes for reliability (this can't be test-run off Windows, so it's
+# built to fail as rarely as possible):
+#   * No MERGE(). MERGE de-duplicates shared libraries between the two exes but
+#     is finicky about ordering and paths; here we run two independent Analyses
+#     and let COLLECT de-duplicate by destination instead. Slightly larger build
+#     graph, materially fewer surprises.
+#   * keyring and discord both choose/what-to-load at runtime, which PyInstaller's
+#     static import scan can miss — so we pull in ALL their submodules explicitly.
+#
+# If a frozen build still hits a runtime "ModuleNotFoundError", the message names
+# the module exactly: add it to `hiddenimports` and rebuild.
 
 from PyInstaller.utils.hooks import collect_submodules
 
 hiddenimports = [
-    "keyring.backends.Windows",       # DPAPI-backed secret storage
-    "keyring.backends.SecretService",
-    "win32timezone",                  # pulled in by pywin32 via keyring
+    # keyring selects its backend dynamically (Windows Credential Locker via
+    # win32ctypes at runtime); collect every backend so the right one is present.
+    *collect_submodules("keyring"),
+    # discord.py loads subpackages lazily.
     *collect_submodules("discord"),
+    # pywin32 timezone helper the keyring Windows backend can reach for.
+    "win32timezone",
 ]
 
 daemon_a = Analysis(
@@ -27,11 +37,6 @@ gui_a = Analysis(
     pathex=[".."],
     hiddenimports=hiddenimports,
     noarchive=False,
-)
-
-MERGE(
-    (daemon_a, "daemon_entry", "palctl-daemon"),
-    (gui_a, "gui_entry", "palctl-gui"),
 )
 
 daemon_pyz = PYZ(daemon_a.pure)
@@ -54,6 +59,7 @@ gui_exe = EXE(
     console=False,  # windowed
 )
 
+# One folder with both exes; COLLECT de-duplicates the shared Qt / Python runtime.
 COLLECT(
     daemon_exe,
     daemon_a.binaries,
