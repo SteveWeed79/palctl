@@ -102,7 +102,9 @@ palctl status | players | events | start | stop | restart | save
 ```
 Talks to the daemon's token-gated localhost API, so it works anywhere the
 daemon runs — ssh sessions, cron jobs, and the headless-Linux setup the GUI
-can't serve. `palctl kick zoe` resolves the name to a user ID for you.
+can't serve. `palctl kick zoe` resolves the name to a user ID for you. The
+installer ships it as `palctl.exe` (tick "Add palctl to the PATH" to use it
+from any terminal); from source it's the `palctl` script pip installs.
 
 **Web dashboard** — `palctl ui`
 The daemon serves a read-only dashboard at `http://127.0.0.1:8830` (localhost

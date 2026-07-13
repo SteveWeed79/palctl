@@ -42,6 +42,31 @@ Name: "{autodesktop}\palctl"; Filename: "{app}\palctl-gui.exe"; Tasks: desktopic
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 Name: "daemonservice"; Description: "Register and start the palctl background service now"
+Name: "addtopath"; Description: "Add palctl to the PATH (use the ""palctl"" command in any terminal)"; Flags: unchecked
+
+[Registry]
+; Append {app} to the system PATH so palctl.exe works from any shell. Guarded
+; by NeedsAddPath so a reinstall doesn't append a duplicate. Not removed on
+; uninstall: safely editing PATH back out is riskier than one stale entry.
+Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; \
+  ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; \
+  Tasks: addtopath; Check: NeedsAddPath(ExpandConstant('{app}'))
+
+[Code]
+function NeedsAddPath(Param: string): boolean;
+var
+  OrigPath: string;
+begin
+  if not RegQueryStringValue(HKEY_LOCAL_MACHINE,
+    'SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
+    'Path', OrigPath) then
+  begin
+    Result := True;
+    exit;
+  end;
+  { Look for the dir bracketed by semicolons, case-insensitively. }
+  Result := Pos(';' + Uppercase(Param) + ';', ';' + Uppercase(OrigPath) + ';') = 0;
+end;
 
 [Run]
 ; Self-register the daemon service (downloads NSSM on first use).
