@@ -1,0 +1,153 @@
+"""
+App config + secrets.
+
+Everything is set through the UI. Nothing is hand-edited, and no secret ever
+touches disk in the clear.
+
+Non-secret config -> %APPDATA%/palctl/config.json
+Secrets (admin password, Discord bot token) -> Windows Credential Manager via
+`keyring`, which on Windows is DPAPI-backed and encrypted against your user
+account. A leaked bot token means somebody else's code runs as your bot, so
+plaintext in a config file is not acceptable.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+import keyring
+
+SERVICE_ID = "palctl"
+
+
+def config_dir() -> Path:
+    base = os.environ.get("APPDATA") or str(Path.home() / ".config")
+    d = Path(base) / "palctl"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+CONFIG_PATH = config_dir() / "config.json"
+
+
+@dataclass
+class WatchdogConfig:
+    enabled: bool = True
+    # Palworld's memory leak is well documented. Restart on bloat, not on a guess.
+    memory_limit_mb: int = 12_000
+    # Don't restart on a single spike — require N consecutive samples over the line.
+    consecutive_samples: int = 3
+    # Never restart while people are mid-session unless it's really bad.
+    skip_if_players_online: bool = True
+    hard_limit_mb: int = 16_000  # override skip_if_players_online above this
+    warn_seconds: int = 300  # in-game countdown before the restart
+    poll_seconds: int = 60
+
+
+@dataclass
+class ScheduleConfig:
+    enabled: bool = True
+    daily_restart: bool = True
+    daily_restart_at: str = "06:00"
+    autosave_minutes: int = 15
+    backup_hours: int = 6
+    backup_retain: int = 24
+
+
+@dataclass
+class DiscordConfig:
+    enabled: bool = False
+    channel_id: int = 0
+    admin_role_id: int = 0  # who may run /restart, /kick, /ban
+    notify_join_leave: bool = True
+    notify_level_up: bool = True
+    notify_watchdog: bool = True
+    notify_server_up_down: bool = True
+
+
+@dataclass
+class Config:
+    # Paths
+    server_root: str = r"C:\steamcmd\steamapps\common\PalServer"
+    steamcmd_path: str = r"C:\steamcmd\steamcmd.exe"
+    backup_root: str = r"D:\PalworldBackups"
+    service_name: str = "PalServer"
+    app_id: str = "2394010"
+
+    # REST API
+    api_host: str = "127.0.0.1"
+    api_port: int = 8212
+
+    poll_seconds: int = 10
+
+    watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
+    schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+    discord: DiscordConfig = field(default_factory=DiscordConfig)
+
+    # ---------- derived paths ----------
+
+    @property
+    def saved_dir(self) -> Path:
+        return Path(self.server_root) / "Pal" / "Saved"
+
+    @property
+    def savegames_dir(self) -> Path:
+        return self.saved_dir / "SaveGames"
+
+    @property
+    def live_ini(self) -> Path:
+        return self.saved_dir / "Config" / "WindowsServer" / "PalWorldSettings.ini"
+
+    @property
+    def default_ini(self) -> Path:
+        return Path(self.server_root) / "DefaultPalWorldSettings.ini"
+
+    # ---------- persistence ----------
+
+    @classmethod
+    def load(cls) -> "Config":
+        if not CONFIG_PATH.exists():
+            return cls()
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return cls(
+            **{
+                **{k: v for k, v in raw.items()
+                   if k not in ("watchdog", "schedule", "discord")},
+                "watchdog": WatchdogConfig(**raw.get("watchdog", {})),
+                "schedule": ScheduleConfig(**raw.get("schedule", {})),
+                "discord": DiscordConfig(**raw.get("discord", {})),
+            }
+        )
+
+    def save(self) -> None:
+        CONFIG_PATH.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+
+
+# ---------------- secrets ----------------
+# Stored in Windows Credential Manager (DPAPI). Never written to config.json.
+
+
+def set_admin_password(password: str) -> None:
+    keyring.set_password(SERVICE_ID, "admin_password", password)
+
+
+def get_admin_password() -> str:
+    return keyring.get_password(SERVICE_ID, "admin_password") or ""
+
+
+def set_discord_token(token: str) -> None:
+    keyring.set_password(SERVICE_ID, "discord_token", token)
+
+
+def get_discord_token() -> str:
+    return keyring.get_password(SERVICE_ID, "discord_token") or ""
+
+
+def clear_secret(name: str) -> None:
+    try:
+        keyring.delete_password(SERVICE_ID, name)
+    except keyring.errors.PasswordDeleteError:
+        pass
