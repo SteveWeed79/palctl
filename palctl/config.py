@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -52,6 +53,15 @@ class WatchdogConfig:
     warn_seconds: int = 300  # in-game countdown before the restart
     poll_seconds: int = 60
 
+    # Opt-in crash/hang recovery. NSSM already restarts a *crashed* process, but
+    # it can't fix a server that's still running yet has stopped answering (a
+    # hang). If the REST API is unreachable for `crash_confirm_polls` polls while
+    # palctl itself didn't stop the server, bring it back — rate-limited so a
+    # genuine crash-loop doesn't get hammered.
+    auto_restart_on_crash: bool = False
+    crash_confirm_polls: int = 3
+    crash_restart_max_per_hour: int = 3
+
 
 @dataclass
 class ScheduleConfig:
@@ -61,6 +71,10 @@ class ScheduleConfig:
     autosave_minutes: int = 15
     backup_hours: int = 6
     backup_retain: int = 24
+    # Palworld patches constantly. Opt-in: run a SteamCMD update at a quiet hour,
+    # reusing the same stop -> backup -> update -> restart flow as manual updates.
+    auto_update: bool = False
+    auto_update_at: str = "05:00"
 
 
 @dataclass
@@ -72,6 +86,11 @@ class DiscordConfig:
     notify_level_up: bool = True
     notify_watchdog: bool = True
     notify_server_up_down: bool = True
+    notify_update_available: bool = True
+    # A single embed that refreshes in place with live status, instead of spam.
+    status_message: bool = False
+    # Sent to the channel when a player joins, if set. "{name}" is filled in.
+    welcome_message: str = ""
 
 
 @dataclass
@@ -89,6 +108,9 @@ class Config:
 
     poll_seconds: int = 10
 
+    # Check GitHub for a newer palctl on startup (best-effort; just notifies).
+    check_for_updates: bool = True
+
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
@@ -105,7 +127,11 @@ class Config:
 
     @property
     def live_ini(self) -> Path:
-        return self.saved_dir / "Config" / "WindowsServer" / "PalWorldSettings.ini"
+        # The server writes its live ini under WindowsServer/ or LinuxServer/
+        # depending on the server's OS — which is this box's OS, since palctl
+        # runs on the same machine as the server.
+        sub = "WindowsServer" if sys.platform.startswith("win") else "LinuxServer"
+        return self.saved_dir / "Config" / sub / "PalWorldSettings.ini"
 
     @property
     def default_ini(self) -> Path:
@@ -114,19 +140,24 @@ class Config:
     # ---------- persistence ----------
 
     @classmethod
+    def from_dict(cls, raw: dict) -> Config:
+        """Build a Config from a raw dict, dropping keys from other versions and
+        rebuilding the nested dataclasses. Shared by load() and profiles."""
+        return cls(
+            **{
+                **_known(cls, raw, exclude=("watchdog", "schedule", "discord")),
+                "watchdog": WatchdogConfig(**_known(WatchdogConfig, raw.get("watchdog", {}))),
+                "schedule": ScheduleConfig(**_known(ScheduleConfig, raw.get("schedule", {}))),
+                "discord": DiscordConfig(**_known(DiscordConfig, raw.get("discord", {}))),
+            }
+        )
+
+    @classmethod
     def load(cls) -> Config:
         if not CONFIG_PATH.exists():
             return cls()
         try:
-            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            return cls(
-                **{
-                    **_known(cls, raw, exclude=("watchdog", "schedule", "discord")),
-                    "watchdog": WatchdogConfig(**_known(WatchdogConfig, raw.get("watchdog", {}))),
-                    "schedule": ScheduleConfig(**_known(ScheduleConfig, raw.get("schedule", {}))),
-                    "discord": DiscordConfig(**_known(DiscordConfig, raw.get("discord", {}))),
-                }
-            )
+            return cls.from_dict(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
             # A corrupt config must not crash-loop the daemon under NSSM.
             # Set the file aside so the values can still be recovered by hand.

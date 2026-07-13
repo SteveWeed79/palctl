@@ -17,6 +17,19 @@ from .inifile import is_blank
 COUNTDOWN_MARKS = (600, 300, 60, 30, 10)
 
 
+def next_daily(now: datetime, time_str: str, fallback_hour: int = 6) -> datetime:
+    """The next occurrence of HH:MM after `now`. A malformed time falls back to
+    `fallback_hour`:00 rather than raising, so bad config can't kill the loop."""
+    try:
+        hh, _, mm = time_str.partition(":")
+        target = now.replace(hour=int(hh), minute=int(mm or 0), second=0, microsecond=0)
+    except ValueError:
+        target = now.replace(hour=fallback_hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
+
+
 class Scheduler:
     def __init__(self, cfg: Config, api: PalApi, bus: EventBus) -> None:
         self._cfg = cfg
@@ -32,6 +45,7 @@ class Scheduler:
             self._autosave_loop(),
             self._backup_loop(),
             self._daily_restart_loop(),
+            self._auto_update_loop(),
         )
 
     # ---------- autosave ----------
@@ -92,16 +106,7 @@ class Scheduler:
     # ---------- daily restart ----------
 
     def _next_restart(self) -> datetime:
-        now = datetime.now()
-        try:
-            hh, _, mm = self._cfg.schedule.daily_restart_at.partition(":")
-            target = now.replace(hour=int(hh), minute=int(mm or 0), second=0, microsecond=0)
-        except ValueError:
-            # A malformed time in config.json must not kill the daemon.
-            target = now.replace(hour=6, minute=0, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        return target
+        return next_daily(datetime.now(), self._cfg.schedule.daily_restart_at, 6)
 
     async def _daily_restart_loop(self) -> None:
         while True:
@@ -117,6 +122,48 @@ class Scheduler:
                 continue
 
             await self.restart_with_countdown("Scheduled daily restart")
+
+    # ---------- scheduled auto-update ----------
+
+    def _next_update(self) -> datetime:
+        return next_daily(datetime.now(), self._cfg.schedule.auto_update_at, 5)
+
+    async def _auto_update_loop(self) -> None:
+        while True:
+            if not (self._cfg.schedule.enabled and self._cfg.schedule.auto_update):
+                await asyncio.sleep(60)
+                continue
+
+            wait = (self._next_update() - datetime.now()).total_seconds()
+            await asyncio.sleep(max(0.0, wait))
+
+            if not (self._cfg.schedule.enabled and self._cfg.schedule.auto_update):
+                continue
+
+            await self.update_server()
+
+    async def check_update_available(self) -> bool:
+        """Compare the installed build id to Steam's latest; emit an event if a
+        newer one exists. Best-effort — a missing steamcmd just means 'no'."""
+        cfg = self._cfg
+        if not cfg.steamcmd_path or not Path(cfg.steamcmd_path).exists():
+            return False
+        installed = await asyncio.to_thread(
+            steamcmd.installed_buildid, cfg.server_root, cfg.app_id
+        )
+        latest = await steamcmd.latest_buildid(cfg.steamcmd_path, cfg.app_id)
+        if installed and latest and installed != latest:
+            await self._bus.emit(
+                Event(
+                    "update_available",
+                    f"⬆️ A Palworld server update is available (installed build "
+                    f"{installed}, latest {latest}). Use `/update` or the Console "
+                    "**Update** button when it's convenient.",
+                    {"installed": installed, "latest": latest},
+                )
+            )
+            return True
+        return False
 
     async def restart_with_countdown(self, reason: str) -> None:
         """Announce, count down, save, restart. Also used by the GUI/bot buttons."""
@@ -152,6 +199,53 @@ class Scheduler:
                 {"recovered": ok},
             )
         )
+
+    # ---------- restore ----------
+
+    async def restore_backup(self, name: str) -> None:
+        """
+        Stop the server, restore a backup over SaveGames, bring it back.
+
+        `backups.restore` rejects path-traversal names and snapshots the current
+        world to a `-pre-restore` copy first, so restoring the wrong one is itself
+        undoable. We pre-check the name exists so a typo doesn't take the server
+        down for nothing.
+        """
+        cfg = self._cfg
+        src = Path(cfg.backup_root) / name
+        if any(c in name for c in ("..", "/", "\\")) or not src.is_dir():
+            await self._bus.emit(Event("error", f"Restore aborted: no such backup '{name}'."))
+            return
+
+        await self._bus.emit(
+            Event("restore", f"♻️ Restoring backup `{name}` — stopping the server.")
+        )
+        try:
+            try:
+                await self._api.save()
+            except Exception:
+                pass
+            await procs.stop_service(cfg.service_name)
+            await asyncio.to_thread(
+                backups.restore, Path(cfg.backup_root), name, cfg.savegames_dir
+            )
+            await self._bus.emit(
+                Event("restore", f"📥 Restored `{name}`. Starting the server.")
+            )
+        except Exception as e:
+            await self._bus.emit(Event("error", f"Restore failed: {e}"))
+        finally:
+            await procs.start_service(cfg.service_name)
+            ok = await self._api.wait_until_alive(timeout=240)
+            await self._bus.emit(
+                Event(
+                    "restore",
+                    "✅ Server back up after restore."
+                    if ok
+                    else "❌ Server did not come back after the restore. Needs a look.",
+                    {"recovered": ok},
+                )
+            )
 
     # ---------- server update (SteamCMD) ----------
 

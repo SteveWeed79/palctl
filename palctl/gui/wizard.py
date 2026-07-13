@@ -54,6 +54,7 @@ class SetupPlan:
     api_port: int
     password: str
     install_server: bool
+    install_vcredist: bool
     register_server_service: bool
     register_daemon_service: bool
     service_name: str
@@ -77,6 +78,10 @@ class SetupWorker(QThread):
         plan = self._plan
         cfg = self._cfg
         try:
+            if not self._preflight(plan):
+                self.done.emit(False)
+                return
+
             self._log("Saving configuration…")
             cfg.server_root = plan.server_root
             cfg.steamcmd_path = plan.steamcmd_path
@@ -102,11 +107,46 @@ class SetupWorker(QThread):
             if plan.register_daemon_service:
                 self._register_daemon_service()
 
+            self._verify_and_report(plan)
+
             self._log("\n✅ Setup complete.")
             self.done.emit(True)
         except Exception as e:
             self._log(f"\n❌ Setup failed: {e}")
             self.done.emit(False)
+
+    def _preflight(self, plan: SetupPlan) -> bool:
+        """Run readiness checks. Returns False (abort) only on a blocking failure —
+        no disk space to install into, or no admin rights to register services.
+        Everything else is a warning the run can proceed past."""
+        from .. import preflight
+
+        self._log("Running readiness checks…")
+        checks = preflight.run_all(
+            plan.server_root, plan.api_port,
+            need_install=plan.install_server,
+            need_admin=plan.register_server_service or plan.register_daemon_service,
+        )
+        blocking = False
+        for c in checks:
+            self._log(f"  {c.icon} {c.name}: {c.detail}")
+            if c.ok is not False:
+                continue
+            if c.name.startswith("Visual C++") and plan.install_vcredist:
+                self._install_vcredist()
+            else:
+                self._log(f"     → {c.fix}")
+                if c.name in ("Disk space", "Administrator"):
+                    blocking = True
+        if blocking:
+            self._log("\n❌ Fix the ❌ item(s) above, then run setup again.")
+        return not blocking
+
+    def _install_vcredist(self) -> None:
+        from .. import preflight
+
+        code = preflight.install_vcredist(on_line=lambda m: self._log(f"     {m}"))
+        self._log(f"     Visual C++ runtime installer finished (exit {code}).")
 
     def _install_server(self, cfg: Config, plan: SetupPlan) -> None:
         from .. import steamcmd
@@ -124,10 +164,67 @@ class SetupWorker(QThread):
             f"Installing / updating the Palworld server into {plan.server_root} "
             "(this downloads a few GB the first time)…"
         )
+        self._last_pct = -1
         code = steamcmd.run_update(
-            steam, plan.server_root, app_id=cfg.app_id, on_line=self._log
+            steam, plan.server_root, app_id=cfg.app_id, on_line=self._steam_sink
         )
         self._log(f"  SteamCMD finished (exit {code}).")
+
+    def _steam_sink(self, line: str) -> None:
+        """Turn SteamCMD's chatty output into a single, updating percentage so a
+        multi-GB download doesn't look frozen or spam the log."""
+        from .. import steamcmd
+
+        pct = steamcmd.parse_progress(line)
+        if pct is not None:
+            whole = int(pct)
+            if whole != self._last_pct:
+                self._last_pct = whole
+                self._log(f"  downloading… {whole}%")
+        elif line.strip():
+            self._log(f"  {line}")
+
+    def _verify_and_report(self, plan: SetupPlan) -> None:
+        """The payoff: actually start the server and confirm the REST API answers,
+        then print the address players connect to. 'It works' beats 'it's set up'."""
+        import asyncio
+
+        from .. import netinfo, procs
+        from ..api import PalApi
+
+        if plan.register_server_service:
+            self._log("Starting the server to check it actually works…")
+            try:
+                asyncio.run(procs.start_service(plan.service_name))
+            except Exception as e:
+                self._log(f"  couldn't start the service: {e}")
+
+            self._log("  waiting for the server to answer (this can take a minute)…")
+            api = PalApi("127.0.0.1", plan.api_port, plan.password)
+            ok = False
+            try:
+                ok = asyncio.run(api.wait_until_alive(timeout=240))
+            except Exception as e:
+                self._log(f"  REST check error: {e}")
+            self._log(
+                "  ✅ Server is up and answering — it works."
+                if ok
+                else "  ⚠️ Registered, but the server hasn't answered yet. It may "
+                "still be starting; watch the Dashboard, or check the log."
+            )
+
+        lan = netinfo.lan_ip()
+        pub = netinfo.public_ip()
+        port = netinfo.GAME_PORT_DEFAULT
+        self._log("\nTell your friends to connect to:")
+        if lan:
+            self._log(f"  On your network:   {lan}:{port}")
+        if pub:
+            self._log(f"  Over the internet:  {pub}:{port}")
+        self._log(
+            f"  For internet play you must forward UDP port {port} on your router "
+            "to this PC — palctl can't do that part for you."
+        )
 
     def _register_server_service(self, cfg: Config, plan: SetupPlan) -> None:
         from .. import winservice
@@ -214,13 +311,17 @@ class SetupWizard(QDialog):
         self.install_server = QCheckBox(
             "Install / update the server with SteamCMD (needed if it isn't installed)"
         )
+        self.install_vc = QCheckBox(
+            "Install the Visual C++ runtime if it's missing (the server needs it)"
+        )
+        self.install_vc.setChecked(True)
         self.reg_server = QCheckBox("Register the Palworld server as a Windows service")
         self.reg_server.setChecked(True)
         self.reg_daemon = QCheckBox(
             "Register the palctl daemon as a Windows service (keeps it always running)"
         )
         self.reg_daemon.setChecked(True)
-        for cb in (self.install_server, self.reg_server, self.reg_daemon):
+        for cb in (self.install_server, self.install_vc, self.reg_server, self.reg_daemon):
             sf.addWidget(cb)
         root.addWidget(steps)
 
@@ -237,11 +338,31 @@ class SetupWizard(QDialog):
         buttons.addStretch(1)
         self.close_btn = QPushButton("Close")
         self.close_btn.clicked.connect(self.reject)
+        self.check_btn = QPushButton("Check readiness")
+        self.check_btn.clicked.connect(self._check_readiness)
         self.run_btn = QPushButton("Run setup")
         self.run_btn.clicked.connect(self._run)
         buttons.addWidget(self.close_btn)
+        buttons.addWidget(self.check_btn)
         buttons.addWidget(self.run_btn)
         root.addLayout(buttons)
+
+    def _check_readiness(self) -> None:
+        """A quick, side-effect-free preview of the preflight checks so the user
+        can fix problems before committing to a multi-GB download."""
+        from .. import preflight
+
+        self.log.clear()
+        self.log.append("Readiness check:")
+        checks = preflight.run_all(
+            self.server_root.text().strip(), self.port.value(),
+            need_install=self.install_server.isChecked(),
+            need_admin=self.reg_server.isChecked() or self.reg_daemon.isChecked(),
+        )
+        for c in checks:
+            self.log.append(f"  {c.icon} {c.name}: {c.detail}")
+            if c.ok is False and c.fix:
+                self.log.append(f"     → {c.fix}")
 
     def _generate_password(self) -> None:
         import secrets
@@ -265,12 +386,14 @@ class SetupWizard(QDialog):
             api_port=self.port.value(),
             password=password,
             install_server=self.install_server.isChecked(),
+            install_vcredist=self.install_vc.isChecked(),
             register_server_service=self.reg_server.isChecked(),
             register_daemon_service=self.reg_daemon.isChecked(),
             service_name=self._cfg.service_name or "PalServer",
         )
 
         self.run_btn.setEnabled(False)
+        self.check_btn.setEnabled(False)
         self.close_btn.setEnabled(False)
         self.progress.show()
         self.log.clear()
@@ -286,10 +409,11 @@ class SetupWizard(QDialog):
     def _finished(self, ok: bool) -> None:
         self.progress.hide()
         self.run_btn.setEnabled(True)
+        self.check_btn.setEnabled(True)
         self.close_btn.setEnabled(True)
         if ok:
             QMessageBox.information(
                 self, "Setup complete",
-                "palctl is configured. Start the server from the Console tab (or "
-                "it'll come up with the service), then watch the Dashboard.",
+                "palctl is configured and the server was started. The log shows the "
+                "address your friends connect to. Watch the Dashboard from here.",
             )

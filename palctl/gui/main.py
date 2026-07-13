@@ -60,17 +60,28 @@ from ..discovery import (
     is_server_root,
     is_steamcmd,
 )
+from ..localauth import TOKEN_HEADER, get_or_create_token
 from .settings_editor import SettingsEditor
 
 DAEMON = f"http://127.0.0.1:{DAEMON_PORT}"
 
+_token_cache: str | None = None
+
+
+def _auth_headers() -> dict:
+    global _token_cache
+    if _token_cache is None:
+        _token_cache = get_or_create_token()
+    return {TOKEN_HEADER: _token_cache}
+
 
 def call(path: str, body: dict | None = None) -> dict:
+    headers = _auth_headers()
     with httpx.Client(timeout=10) as c:
         r = (
-            c.post(f"{DAEMON}{path}", json=body or {})
+            c.post(f"{DAEMON}{path}", json=body or {}, headers=headers)
             if body is not None or path.startswith("/action")
-            else c.get(f"{DAEMON}{path}")
+            else c.get(f"{DAEMON}{path}", headers=headers)
         )
         r.raise_for_status()
         return r.json()
@@ -283,6 +294,10 @@ class Console(QWidget):
             row2.addWidget(btn)
         v.addLayout(row2)
 
+        restore_btn = QPushButton("Restore backup…")
+        restore_btn.clicked.connect(self._restore)
+        v.addWidget(restore_btn)
+
         self.log = QTextEdit(readOnly=True)
         v.addWidget(self.log, 1)
 
@@ -305,6 +320,37 @@ class Console(QWidget):
         try:
             call(f"/action/{action}", {})
             self.log.append(f"→ {label}")
+        except Exception as e:
+            self.log.append(f"❌ {e}")
+
+    def _restore(self) -> None:
+        try:
+            backups = call("/backups")  # GET → [{name, size_mb}, ...]
+        except Exception as e:
+            self.log.append(f"❌ couldn't list backups: {e}")
+            return
+        if not backups:
+            QMessageBox.information(self, "No backups", "No backups found yet.")
+            return
+
+        names = [b["name"] for b in backups]
+        name, ok = QInputDialog.getItem(
+            self, "Restore backup",
+            "Pick a backup to restore (the server will restart):",
+            names, 0, False,
+        )
+        if not ok or not name:
+            return
+        confirm = QMessageBox.question(
+            self, "Restore?",
+            f"Restore '{name}'?\n\nThis overwrites the current world and restarts "
+            "the server. A safety copy of the current world is taken first.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            call("/action/restore", {"name": name})
+            self.log.append(f"→ restore {name}")
         except Exception as e:
             self.log.append(f"❌ {e}")
 
@@ -446,10 +492,12 @@ class ConfigTab(QWidget):
         self.wd_hard.setSuffix(" MB")
         self.wd_hard.setValue(cfg.watchdog.hard_limit_mb)
         self.wd_skip = QCheckBox(checked=cfg.watchdog.skip_if_players_online)
+        self.wd_autorec = QCheckBox(checked=cfg.watchdog.auto_restart_on_crash)
         wf.addRow("Enabled", self.wd_enabled)
         wf.addRow("Restart above", self.wd_limit)
         wf.addRow("Force even with players above", self.wd_hard)
         wf.addRow("Hold off while players online", self.wd_skip)
+        wf.addRow("Auto-restart on crash / hang", self.wd_autorec)
         v.addWidget(wd)
 
         sch = QGroupBox("Schedule")
@@ -493,7 +541,31 @@ class ConfigTab(QWidget):
         save = QPushButton("Save config && reload daemon")
         save.clicked.connect(self._save)
         v.addWidget(save)
+
+        diag = QPushButton("Export diagnostics (logs + config) for a bug report…")
+        diag.clicked.connect(self._export_diagnostics)
+        v.addWidget(diag)
         v.addStretch(1)
+
+    def _export_diagnostics(self) -> None:
+        from ..diagnostics import build_bundle
+
+        default = str(Path.home() / "palctl-diagnostics.zip")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save diagnostics", default, "Zip archive (*.zip)"
+        )
+        if not path:
+            return
+        try:
+            build_bundle(Path(path))
+            QMessageBox.information(
+                self, "Diagnostics saved",
+                f"Saved to:\n{path}\n\nAttach this to a bug report. It contains "
+                "your logs and config — but no passwords (those never leave "
+                "Windows Credential Manager).",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Failed", str(e))
 
     def _save(self) -> None:
         c = self._cfg
@@ -507,6 +579,7 @@ class ConfigTab(QWidget):
         c.watchdog.memory_limit_mb = self.wd_limit.value()
         c.watchdog.hard_limit_mb = self.wd_hard.value()
         c.watchdog.skip_if_players_online = self.wd_skip.isChecked()
+        c.watchdog.auto_restart_on_crash = self.wd_autorec.isChecked()
 
         c.schedule.enabled = self.sch_enabled.isChecked()
         c.schedule.daily_restart = self.sch_restart.isChecked()

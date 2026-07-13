@@ -55,27 +55,42 @@ PC, which is the situation most people are trying to get out of.
 **Daemon**
 - Memory-leak watchdog (consecutive-sample confirmation, player hold-off, hard limit, cooldown)
 - Scheduled restarts with in-game countdown, autosave, rotating backups
+- Opt-in scheduled auto-update (Palworld patches constantly) — the same
+  save → backup → SteamCMD → restart flow as a manual update
+- Notifies when a newer server build is available, or a newer palctl release
+- Opt-in crash/hang auto-recovery: if the API stops answering while palctl didn't
+  stop the server, it brings it back — rate-limited so a crash-loop isn't hammered
 - Join / leave / level-up events, synthesised by diffing the player list
 - Session + playtime tracking in SQLite (Palworld remembers none of this)
 - Server up/down detection
+- Rotating log file in `%APPDATA%/palctl/logs` (Palworld ships none)
+- Localhost control API gated by a per-user token, so only you (not any local
+  process) can drive start/stop/restore/kick/ban
 
 **GUI**
 - Dashboard: FPS, frame time, memory sparkline, uptime, in-game day, base camps
 - Players: level, ping, location, building count, kick/ban
-- Console: announce (real spaces — REST, not RCON), save, backup, start/stop/restart,
-  and **update the server** (SteamCMD, with the ini guarded across `validate`)
+- Console: announce (real spaces — REST, not RCON), save, backup, **restore a
+  backup** (with a pre-restore safety copy), start/stop/restart, and **update the
+  server** (SteamCMD, with the ini guarded across `validate`)
 - **Settings editor**: parses the one-line `OptionSettings=(...)` blob into a
   searchable, grouped, typed form. Preserves unknown keys from future patches.
   Backs up the ini on every save, because SteamCMD `validate` wipes it.
 - Config: paths (with **Browse** and **Auto-detect**, and a live ✓/✗ that tells
   you the path is really a server before you save), watchdog thresholds,
-  schedules, Discord — all entered in the UI
-- **First-run wizard**: finds the server and steamcmd, turns on the REST API,
-  can install the server from Steam for you, and registers both Windows services
+  schedules, Discord — all entered in the UI — plus a one-click **Export
+  diagnostics** (logs + config, no secrets) for bug reports
+- **First-run wizard**: runs readiness checks (disk space, the Visual C++ runtime
+  the server needs, admin rights, a free port), finds the server and steamcmd,
+  turns on the REST API, can install the server from Steam for you, registers both
+  Windows services, then **starts the server and confirms the REST API answers** —
+  and prints the address your friends connect to (with the port-forward reminder)
 
 **Discord bot**
-`/status` `/players` `/playtime` `/announce` `/save` `/backup` `/restart` `/update` `/kick` `/ban`
-plus join/leave, level-up, watchdog, and server up/down notifications.
+`/status` `/players` `/playtime` `/announce` `/save` `/backup` `/backups` `/restore` `/restart` `/update` `/kick` `/ban`
+plus join/leave, level-up, watchdog, server up/down, and update-available
+notifications — with an optional auto-refreshing status message and a
+`{name}` join welcome.
 
 ---
 
@@ -122,6 +137,13 @@ fetch it; it just can't conjure it from nothing.
 > says so explicitly. `palctl` only ever talks to `127.0.0.1`. Don't
 > port-forward 8212.
 
+> **The installer isn't code-signed.** palctl is free and hasn't bought a
+> certificate, so Windows SmartScreen shows a one-time *"Windows protected your
+> PC"* prompt — click **More info → Run anyway**. Every release ships a
+> `SHA256SUMS.txt` so you can confirm the download matches what CI built. Removing
+> the prompt for free is on the roadmap via SignPath Foundation's open-source
+> code-signing program.
+
 ### Option B — from source
 
 **Requires:** Windows, Python 3.11+.
@@ -142,6 +164,26 @@ palctl-daemon.exe install-service      # or: python -m palctl.daemon install-ser
 registers the daemon service without touching a terminal full of `nssm` lines.
 Secrets go into Windows Credential Manager (DPAPI-encrypted), never into a config
 file.
+
+### Linux (headless)
+
+The daemon and its whole core — REST client, memory-leak watchdog, scheduler,
+backups, path detection, and SteamCMD install/update — run on Linux too. Service
+control uses **systemd** instead of NSSM, SteamCMD comes from the Linux tarball,
+and paths resolve under `~/.steam` / `LinuxServer/`. Register the daemon with:
+
+```
+python -m palctl.daemon install-service   # writes a systemd unit, enables it
+```
+
+The desktop GUI/wizard are Windows-first; on a headless Linux host you drive the
+daemon via its config, the Discord bot, and the service CLI.
+
+### winget
+
+Once a release is tagged, palctl can be installed with
+`winget install SteveWeed79.palctl` — the manifest template lives in
+[packaging/winget/](packaging/winget/).
 
 ### Discord (optional)
 
@@ -170,5 +212,13 @@ Both run in CI on Windows and Linux, Python 3.11 and 3.12.
 
 ## License
 
-AGPL-3.0. Use it, fork it, run it. If you host it as a service, your changes stay
-open.
+**AGPL-3.0-or-later.** Use it, fork it, run it. If you modify it and let others
+use that modified version over a network, your changes stay open. The full text
+is in [LICENSE](LICENSE).
+
+**Commercial licensing.** If the AGPL doesn't fit — for example, you want to
+bundle palctl into a closed-source product — a separate commercial license is
+available. Open an issue or contact the maintainer.
+
+**Contributing.** palctl uses a light CLA ([CLA.md](CLA.md)) so the dual-license
+option above stays possible. See [CONTRIBUTING.md](CONTRIBUTING.md).

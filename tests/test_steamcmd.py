@@ -2,10 +2,29 @@
 the ini backup is what saves people's tuning from a validate, so both are
 pinned by tests even though the network/subprocess parts aren't."""
 
+import io
+import tarfile
 import zipfile
 from pathlib import Path
 
 from palctl import steamcmd
+
+
+def test_default_steamcmd_url_by_platform():
+    url = steamcmd.default_steamcmd_url()
+    assert url.endswith(".zip") or url.endswith(".tar.gz")
+
+
+def test_extract_steamcmd_from_targz(tmp_path: Path):
+    tgz = tmp_path / "steamcmd_linux.tar.gz"
+    payload = b"#!/bin/sh\n"
+    with tarfile.open(tgz, "w:gz") as t:
+        info = tarfile.TarInfo("steamcmd.sh")
+        info.size = len(payload)
+        t.addfile(info, io.BytesIO(payload))
+
+    out = steamcmd.extract_steamcmd(tgz, tmp_path / "out")
+    assert out.name == "steamcmd.sh" and out.exists()
 
 
 def test_update_command_order_and_validate():
@@ -71,3 +90,31 @@ def test_backup_file_roundtrip(tmp_path: Path):
 
 def test_backup_file_missing_is_none(tmp_path: Path):
     assert steamcmd.backup_file(tmp_path / "nope.ini") is None
+
+
+def test_parse_progress_extracts_percent():
+    line = "Update state (0x61) downloading, progress: 42.34 (1234 / 5678)"
+    assert steamcmd.parse_progress(line) == 42.34
+
+
+def test_parse_progress_none_for_ordinary_lines():
+    assert steamcmd.parse_progress("Success! App '2394010' fully installed.") is None
+    assert steamcmd.parse_progress("") is None
+
+
+def test_parse_installed_buildid():
+    acf = '"AppState"\n{\n\t"appid"\t"2394010"\n\t"buildid"\t"12345678"\n}'
+    assert steamcmd.parse_installed_buildid(acf) == "12345678"
+    assert steamcmd.parse_installed_buildid("nothing here") is None
+
+
+def test_parse_latest_buildid_reads_public_branch():
+    txt = (
+        '"branches"\n{\n'
+        '  "public" { "buildid" "999" "timeupdated" "170000" }\n'
+        '  "beta"   { "buildid" "111" }\n'
+        "}"
+    )
+    assert steamcmd.parse_latest_buildid(txt) == "999"
+    # No public branch -> no answer, rather than guessing the wrong branch.
+    assert steamcmd.parse_latest_buildid('"branches" { "beta" { "buildid" "1" } }') is None
