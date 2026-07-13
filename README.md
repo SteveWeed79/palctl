@@ -55,15 +55,19 @@ PC, which is the situation most people are trying to get out of.
 **Daemon**
 - Memory-leak watchdog (consecutive-sample confirmation, player hold-off, hard limit, cooldown)
 - Scheduled restarts with in-game countdown, autosave, rotating backups
+- Opt-in crash/hang auto-recovery: if the API stops answering while palctl didn't
+  stop the server, it brings it back — rate-limited so a crash-loop isn't hammered
 - Join / leave / level-up events, synthesised by diffing the player list
 - Session + playtime tracking in SQLite (Palworld remembers none of this)
 - Server up/down detection
+- Rotating log file in `%APPDATA%/palctl/logs` (Palworld ships none)
 
 **GUI**
 - Dashboard: FPS, frame time, memory sparkline, uptime, in-game day, base camps
 - Players: level, ping, location, building count, kick/ban
-- Console: announce (real spaces — REST, not RCON), save, backup, start/stop/restart,
-  and **update the server** (SteamCMD, with the ini guarded across `validate`)
+- Console: announce (real spaces — REST, not RCON), save, backup, **restore a
+  backup** (with a pre-restore safety copy), start/stop/restart, and **update the
+  server** (SteamCMD, with the ini guarded across `validate`)
 - **Settings editor**: parses the one-line `OptionSettings=(...)` blob into a
   searchable, grouped, typed form. Preserves unknown keys from future patches.
   Backs up the ini on every save, because SteamCMD `validate` wipes it.
@@ -74,7 +78,7 @@ PC, which is the situation most people are trying to get out of.
   can install the server from Steam for you, and registers both Windows services
 
 **Discord bot**
-`/status` `/players` `/playtime` `/announce` `/save` `/backup` `/restart` `/update` `/kick` `/ban`
+`/status` `/players` `/playtime` `/announce` `/save` `/backup` `/backups` `/restore` `/restart` `/update` `/kick` `/ban`
 plus join/leave, level-up, watchdog, and server up/down notifications.
 
 ---

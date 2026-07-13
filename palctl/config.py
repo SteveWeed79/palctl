@@ -52,6 +52,15 @@ class WatchdogConfig:
     warn_seconds: int = 300  # in-game countdown before the restart
     poll_seconds: int = 60
 
+    # Opt-in crash/hang recovery. NSSM already restarts a *crashed* process, but
+    # it can't fix a server that's still running yet has stopped answering (a
+    # hang). If the REST API is unreachable for `crash_confirm_polls` polls while
+    # palctl itself didn't stop the server, bring it back — rate-limited so a
+    # genuine crash-loop doesn't get hammered.
+    auto_restart_on_crash: bool = False
+    crash_confirm_polls: int = 3
+    crash_restart_max_per_hour: int = 3
+
 
 @dataclass
 class ScheduleConfig:

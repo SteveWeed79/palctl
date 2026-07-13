@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from .api import PalApi, PalApiError
 from .bot import run_bot
 from .config import Config, config_dir, get_admin_password
 from .events import Event, EventBus, PlayerTracker, SessionStore
+from .logging_setup import setup_logging
 from .scheduler import Scheduler
 from .watchdog import Watchdog
 
@@ -33,8 +35,14 @@ DAEMON_PORT = 8830  # localhost only
 SERVICE_NAME = "palctl-daemon"  # the Windows service name NSSM registers
 
 
+def _within_window(times: list[float], now: float, window: float = 3600.0) -> list[float]:
+    """Timestamps from the last `window` seconds. Used to rate-limit auto-recovery."""
+    return [t for t in times if t >= now - window]
+
+
 class Daemon:
     def __init__(self) -> None:
+        self.log = setup_logging()
         self.cfg = Config.load()
         self.bus = EventBus()
         self.store = SessionStore()
@@ -52,7 +60,15 @@ class Daemon:
         self._history: list[dict] = []  # rolling metrics, for the GUI graphs
         self._tasks: set[asyncio.Task] = set()
 
+        # Crash/hang auto-recovery bookkeeping.
+        self._ever_alive = False           # only recover a server that WAS up
+        self._desired_running = True       # user "Stop" flips this off
+        self._busy = False                 # a palctl op (restart/update/restore) is running
+        self._down_polls = 0               # consecutive unreachable polls
+        self._autorestart_times: list[float] = []
+
         self.bus.on_any(self._persist)
+        self.bus.on_any(self._log_event)
 
     def _spawn(self, coro) -> None:
         # asyncio holds only weak refs to tasks; keep one or it can be GC'd mid-run.
@@ -60,8 +76,24 @@ class Daemon:
         self._tasks.add(t)
         t.add_done_callback(self._tasks.discard)
 
+    def _spawn_op(self, coro) -> None:
+        """Spawn a palctl-initiated server operation, holding `_busy` for its
+        duration so crash auto-recovery doesn't fight an intentional stop."""
+        async def _run() -> None:
+            self._busy = True
+            try:
+                await coro
+            finally:
+                self._busy = False
+
+        self._spawn(_run())
+
     async def _persist(self, e: Event) -> None:
         await asyncio.to_thread(self.store.log_event, e)
+
+    async def _log_event(self, e: Event) -> None:
+        level = self.log.error if e.kind == "error" else self.log.info
+        level("%s: %s", e.kind, e.message)
 
     # ---------- polling ----------
 
@@ -82,11 +114,14 @@ class Daemon:
                 await self.tracker.handle_server_down()
                 await self.bus.emit(Event("server_down", "🔴 Server is **down**."))
             self._alive = False
+            await self._maybe_autorecover()
             return
 
         if self._alive is False:
             await self.bus.emit(Event("server_up", "🟢 Server is **up**."))
         self._alive = True
+        self._ever_alive = True
+        self._down_polls = 0
 
         await self.tracker.update(players)
 
@@ -102,6 +137,62 @@ class Daemon:
             }
         )
         del self._history[:-720]  # ~2h at 10s polling
+
+    # ---------- crash / hang auto-recovery ----------
+
+    async def _maybe_autorecover(self) -> None:
+        """
+        Called on every poll where the REST API is unreachable. Brings the server
+        back only when it was up before, palctl didn't stop it, and we haven't
+        already restarted too many times this hour.
+        """
+        wd = self.cfg.watchdog
+        if not wd.auto_restart_on_crash or not self._ever_alive:
+            return
+        # An intentional stop, a countdown restart, an update, or a watchdog
+        # memory restart all take the server down on purpose — don't fight them.
+        if self._busy or self.watchdog.is_restarting or not self._desired_running:
+            self._down_polls = 0
+            return
+
+        self._down_polls += 1
+        if self._down_polls < max(1, wd.crash_confirm_polls):
+            return
+
+        now = time.time()
+        self._autorestart_times = _within_window(self._autorestart_times, now)
+        if len(self._autorestart_times) >= wd.crash_restart_max_per_hour:
+            return  # crash-looping — stop hammering, let a human look
+
+        self._down_polls = 0
+        self._autorestart_times.append(now)
+        await self.bus.emit(
+            Event(
+                "watchdog",
+                "🚑 Server unreachable and palctl didn't stop it — auto-recovering.",
+                {"action": "autorecover"},
+            )
+        )
+        self._spawn_op(self._autorecover())
+
+    async def _autorecover(self) -> None:
+        try:
+            # Stop first, in case it's hung rather than gone — then start clean.
+            await procs.stop_service(self.cfg.service_name)
+            await asyncio.sleep(2)
+            await procs.start_service(self.cfg.service_name)
+            ok = await self.api.wait_until_alive(timeout=240)
+            await self.bus.emit(
+                Event(
+                    "watchdog",
+                    "✅ Server recovered."
+                    if ok
+                    else "❌ Auto-recover ran but the server is still down.",
+                    {"recovered": ok},
+                )
+            )
+        except Exception as e:
+            await self.bus.emit(Event("error", f"Auto-recover failed: {e}"))
 
     # ---------- localhost API for the GUI ----------
 
@@ -132,13 +223,17 @@ class Daemon:
 
             try:
                 if what == "start":
+                    self._desired_running = True
                     await procs.start_service(self.cfg.service_name)
                 elif what == "stop":
+                    # Intentional: don't let auto-recovery start it back up.
+                    self._desired_running = False
                     with contextlib.suppress(PalApiError):
                         await self.api.save()
                     await procs.stop_service(self.cfg.service_name)
                 elif what == "restart":
-                    self._spawn(
+                    self._desired_running = True
+                    self._spawn_op(
                         self.scheduler.restart_with_countdown(
                             body.get("reason", "Admin restart")
                         )
@@ -150,7 +245,11 @@ class Daemon:
                 elif what == "backup":
                     self._spawn(self.scheduler.backup_now("gui"))
                 elif what == "update-server":
-                    self._spawn(self.scheduler.update_server())
+                    self._desired_running = True
+                    self._spawn_op(self.scheduler.update_server())
+                elif what == "restore":
+                    self._desired_running = True
+                    self._spawn_op(self.scheduler.restore_backup(body["name"]))
                 elif what == "kick":
                     await self.api.kick(body["user_id"], body.get("reason", ""))
                 elif what == "ban":
@@ -191,7 +290,7 @@ class Daemon:
         await runner.setup()
         # 127.0.0.1 only. This API has no auth; it must never leave the box.
         await web.TCPSite(runner, "127.0.0.1", DAEMON_PORT).start()
-        print(f"[daemon] localhost API on 127.0.0.1:{DAEMON_PORT}")
+        self.log.info("daemon up; localhost API on 127.0.0.1:%d", DAEMON_PORT)
 
         await asyncio.gather(
             self._poll_loop(),

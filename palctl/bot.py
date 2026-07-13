@@ -20,7 +20,7 @@ from datetime import timedelta
 import discord
 from discord import app_commands
 
-from . import procs
+from . import backups, procs
 from .api import PalApi, PalApiError
 from .config import Config, get_discord_token
 from .events import Event, EventBus, SessionStore
@@ -87,6 +87,7 @@ class PalBot(discord.Client):
             "restart": True,
             "backup": True,
             "update": True,
+            "restore": True,
             "error": True,
         }
         if not wants.get(e.kind, False):
@@ -260,6 +261,40 @@ class PalBot(discord.Client):
                 "back here when it's finished."
             )
             task = asyncio.create_task(self._sched.update_server())
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+
+        @tree.command(name="backups", description="List the most recent backups")
+        async def backups_cmd(interaction: discord.Interaction) -> None:
+            from pathlib import Path
+
+            await interaction.response.defer()
+            bs = await asyncio.to_thread(
+                backups.listing, Path(self._cfg.backup_root)
+            )
+            if not bs:
+                await interaction.followup.send("No backups yet.")
+                return
+            lines = [f"`{b.name}` — {b.size_mb:.0f} MB" for b in bs[:15]]
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="Recent backups", description="\n".join(lines), colour=BLUE
+                )
+            )
+
+        @tree.command(
+            name="restore", description="Restore a backup by name (stops the server)"
+        )
+        @app_commands.describe(name="Backup name, as shown by /backups")
+        async def restore(interaction: discord.Interaction, name: str) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message("Not allowed.", ephemeral=True)
+                return
+            await interaction.response.send_message(
+                f"♻️ Restoring `{name}` — the server will restart. A safety copy of "
+                "the current world is taken first. I'll report back here."
+            )
+            task = asyncio.create_task(self._sched.restore_backup(name))
             self._bg_tasks.add(task)
             task.add_done_callback(self._bg_tasks.discard)
 

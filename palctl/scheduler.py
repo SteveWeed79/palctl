@@ -153,6 +153,53 @@ class Scheduler:
             )
         )
 
+    # ---------- restore ----------
+
+    async def restore_backup(self, name: str) -> None:
+        """
+        Stop the server, restore a backup over SaveGames, bring it back.
+
+        `backups.restore` rejects path-traversal names and snapshots the current
+        world to a `-pre-restore` copy first, so restoring the wrong one is itself
+        undoable. We pre-check the name exists so a typo doesn't take the server
+        down for nothing.
+        """
+        cfg = self._cfg
+        src = Path(cfg.backup_root) / name
+        if any(c in name for c in ("..", "/", "\\")) or not src.is_dir():
+            await self._bus.emit(Event("error", f"Restore aborted: no such backup '{name}'."))
+            return
+
+        await self._bus.emit(
+            Event("restore", f"♻️ Restoring backup `{name}` — stopping the server.")
+        )
+        try:
+            try:
+                await self._api.save()
+            except Exception:
+                pass
+            await procs.stop_service(cfg.service_name)
+            await asyncio.to_thread(
+                backups.restore, Path(cfg.backup_root), name, cfg.savegames_dir
+            )
+            await self._bus.emit(
+                Event("restore", f"📥 Restored `{name}`. Starting the server.")
+            )
+        except Exception as e:
+            await self._bus.emit(Event("error", f"Restore failed: {e}"))
+        finally:
+            await procs.start_service(cfg.service_name)
+            ok = await self._api.wait_until_alive(timeout=240)
+            await self._bus.emit(
+                Event(
+                    "restore",
+                    "✅ Server back up after restore."
+                    if ok
+                    else "❌ Server did not come back after the restore. Needs a look.",
+                    {"recovered": ok},
+                )
+            )
+
     # ---------- server update (SteamCMD) ----------
 
     async def update_server(self, *, validate: bool = True) -> None:

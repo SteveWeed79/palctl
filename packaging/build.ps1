@@ -17,9 +17,11 @@ Write-Host "==> Installing palctl + PyInstaller"
 & $py -m pip install pyinstaller
 
 Write-Host "==> Building binaries with PyInstaller"
-# Run from packaging\ so the spec's relative entry-script paths resolve.
+# Run from packaging\ so the spec's relative entry-script paths resolve, but send
+# the output to the repo-root dist\ / build\ so installer.iss (which references
+# ..\dist from packaging\) finds it.
 Push-Location packaging
-& $py -m PyInstaller --noconfirm --clean palctl.spec
+& $py -m PyInstaller --noconfirm --clean --distpath ..\dist --workpath ..\build palctl.spec
 Pop-Location
 
 Write-Host "==> Binaries are in dist\palctl\"
