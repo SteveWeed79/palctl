@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import secrets
 import sys
 import time
 from dataclasses import asdict
@@ -22,7 +23,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from . import backups, procs
+from . import backups, localauth, procs
 from .api import PalApi, PalApiError
 from .bot import run_bot
 from .config import Config, config_dir, get_admin_password
@@ -40,9 +41,58 @@ def _within_window(times: list[float], now: float, window: float = 3600.0) -> li
     return [t for t in times if t >= now - window]
 
 
+def autorecover_phase(
+    *,
+    enabled: bool,
+    ever_alive: bool,
+    busy: bool,
+    restarting: bool,
+    desired_running: bool,
+) -> str:
+    """
+    First half of the crash-recovery decision — the guards. Pure, so the whole
+    'never fight an intentional stop' rule is testable without a live daemon.
+
+    Returns:
+      'ignore' — feature off, or the server never came up; do nothing.
+      'reset'  — palctl took the server down on purpose (stop/restart/update/
+                 restore/watchdog); clear the down-streak, do nothing.
+      'count'  — a genuine unexpected outage; count this poll toward recovery.
+    """
+    if not enabled or not ever_alive:
+        return "ignore"
+    if busy or restarting or not desired_running:
+        return "reset"
+    return "count"
+
+
+def should_recover_now(
+    *, down_polls: int, confirm_polls: int, recent_restarts: int, cap: int
+) -> bool:
+    """Second half: only recover after N confirming polls, and not if we've
+    already restarted `cap` times this hour (a real crash-loop needs a human)."""
+    if down_polls < max(1, confirm_polls):
+        return False
+    return recent_restarts < cap
+
+
+def make_auth_middleware(token: str):
+    """aiohttp middleware that rejects any request without the shared token."""
+
+    @web.middleware
+    async def _auth(request: web.Request, handler):
+        sent = request.headers.get(localauth.TOKEN_HEADER, "")
+        if not secrets.compare_digest(sent, token):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return await handler(request)
+
+    return _auth
+
+
 class Daemon:
     def __init__(self) -> None:
         self.log = setup_logging()
+        self._token = localauth.get_or_create_token()
         self.cfg = Config.load()
         self.bus = EventBus()
         self.store = SessionStore()
@@ -147,22 +197,30 @@ class Daemon:
         already restarted too many times this hour.
         """
         wd = self.cfg.watchdog
-        if not wd.auto_restart_on_crash or not self._ever_alive:
+        phase = autorecover_phase(
+            enabled=wd.auto_restart_on_crash,
+            ever_alive=self._ever_alive,
+            busy=self._busy,
+            restarting=self.watchdog.is_restarting,
+            desired_running=self._desired_running,
+        )
+        if phase == "ignore":
             return
-        # An intentional stop, a countdown restart, an update, or a watchdog
-        # memory restart all take the server down on purpose — don't fight them.
-        if self._busy or self.watchdog.is_restarting or not self._desired_running:
+        if phase == "reset":
             self._down_polls = 0
             return
 
+        # phase == "count": a genuine unexpected outage.
         self._down_polls += 1
-        if self._down_polls < max(1, wd.crash_confirm_polls):
-            return
-
         now = time.time()
         self._autorestart_times = _within_window(self._autorestart_times, now)
-        if len(self._autorestart_times) >= wd.crash_restart_max_per_hour:
-            return  # crash-looping — stop hammering, let a human look
+        if not should_recover_now(
+            down_polls=self._down_polls,
+            confirm_polls=wd.crash_confirm_polls,
+            recent_restarts=len(self._autorestart_times),
+            cap=wd.crash_restart_max_per_hour,
+        ):
+            return
 
         self._down_polls = 0
         self._autorestart_times.append(now)
@@ -197,7 +255,8 @@ class Daemon:
     # ---------- localhost API for the GUI ----------
 
     def _routes(self) -> web.Application:
-        app = web.Application()
+        # Every request must carry the shared token — see localauth.
+        app = web.Application(middlewares=[make_auth_middleware(self._token)])
 
         async def state(_: web.Request) -> web.Response:
             stats = procs.proc_stats()

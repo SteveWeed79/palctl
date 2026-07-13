@@ -39,6 +39,8 @@ MODULES = [
     "palctl.serversetup",
     "palctl.preflight",
     "palctl.netinfo",
+    "palctl.localauth",
+    "palctl.diagnostics",
     "palctl.logging_setup",
     "palctl.bot",
     "palctl.daemon",

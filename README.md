@@ -61,6 +61,8 @@ PC, which is the situation most people are trying to get out of.
 - Session + playtime tracking in SQLite (Palworld remembers none of this)
 - Server up/down detection
 - Rotating log file in `%APPDATA%/palctl/logs` (Palworld ships none)
+- Localhost control API gated by a per-user token, so only you (not any local
+  process) can drive start/stop/restore/kick/ban
 
 **GUI**
 - Dashboard: FPS, frame time, memory sparkline, uptime, in-game day, base camps
@@ -73,7 +75,8 @@ PC, which is the situation most people are trying to get out of.
   Backs up the ini on every save, because SteamCMD `validate` wipes it.
 - Config: paths (with **Browse** and **Auto-detect**, and a live ✓/✗ that tells
   you the path is really a server before you save), watchdog thresholds,
-  schedules, Discord — all entered in the UI
+  schedules, Discord — all entered in the UI — plus a one-click **Export
+  diagnostics** (logs + config, no secrets) for bug reports
 - **First-run wizard**: runs readiness checks (disk space, the Visual C++ runtime
   the server needs, admin rights, a free port), finds the server and steamcmd,
   turns on the REST API, can install the server from Steam for you, registers both

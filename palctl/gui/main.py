@@ -60,17 +60,28 @@ from ..discovery import (
     is_server_root,
     is_steamcmd,
 )
+from ..localauth import TOKEN_HEADER, get_or_create_token
 from .settings_editor import SettingsEditor
 
 DAEMON = f"http://127.0.0.1:{DAEMON_PORT}"
 
+_token_cache: str | None = None
+
+
+def _auth_headers() -> dict:
+    global _token_cache
+    if _token_cache is None:
+        _token_cache = get_or_create_token()
+    return {TOKEN_HEADER: _token_cache}
+
 
 def call(path: str, body: dict | None = None) -> dict:
+    headers = _auth_headers()
     with httpx.Client(timeout=10) as c:
         r = (
-            c.post(f"{DAEMON}{path}", json=body or {})
+            c.post(f"{DAEMON}{path}", json=body or {}, headers=headers)
             if body is not None or path.startswith("/action")
-            else c.get(f"{DAEMON}{path}")
+            else c.get(f"{DAEMON}{path}", headers=headers)
         )
         r.raise_for_status()
         return r.json()
@@ -530,7 +541,31 @@ class ConfigTab(QWidget):
         save = QPushButton("Save config && reload daemon")
         save.clicked.connect(self._save)
         v.addWidget(save)
+
+        diag = QPushButton("Export diagnostics (logs + config) for a bug report…")
+        diag.clicked.connect(self._export_diagnostics)
+        v.addWidget(diag)
         v.addStretch(1)
+
+    def _export_diagnostics(self) -> None:
+        from ..diagnostics import build_bundle
+
+        default = str(Path.home() / "palctl-diagnostics.zip")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save diagnostics", default, "Zip archive (*.zip)"
+        )
+        if not path:
+            return
+        try:
+            build_bundle(Path(path))
+            QMessageBox.information(
+                self, "Diagnostics saved",
+                f"Saved to:\n{path}\n\nAttach this to a bug report. It contains "
+                "your logs and config — but no passwords (those never leave "
+                "Windows Credential Manager).",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Failed", str(e))
 
     def _save(self) -> None:
         c = self._cfg
