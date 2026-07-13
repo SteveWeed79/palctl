@@ -71,3 +71,13 @@ def test_backup_file_roundtrip(tmp_path: Path):
 
 def test_backup_file_missing_is_none(tmp_path: Path):
     assert steamcmd.backup_file(tmp_path / "nope.ini") is None
+
+
+def test_parse_progress_extracts_percent():
+    line = "Update state (0x61) downloading, progress: 42.34 (1234 / 5678)"
+    assert steamcmd.parse_progress(line) == 42.34
+
+
+def test_parse_progress_none_for_ordinary_lines():
+    assert steamcmd.parse_progress("Success! App '2394010' fully installed.") is None
+    assert steamcmd.parse_progress("") is None

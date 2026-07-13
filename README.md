@@ -74,8 +74,11 @@ PC, which is the situation most people are trying to get out of.
 - Config: paths (with **Browse** and **Auto-detect**, and a live ✓/✗ that tells
   you the path is really a server before you save), watchdog thresholds,
   schedules, Discord — all entered in the UI
-- **First-run wizard**: finds the server and steamcmd, turns on the REST API,
-  can install the server from Steam for you, and registers both Windows services
+- **First-run wizard**: runs readiness checks (disk space, the Visual C++ runtime
+  the server needs, admin rights, a free port), finds the server and steamcmd,
+  turns on the REST API, can install the server from Steam for you, registers both
+  Windows services, then **starts the server and confirms the REST API answers** —
+  and prints the address your friends connect to (with the port-forward reminder)
 
 **Discord bot**
 `/status` `/players` `/playtime` `/announce` `/save` `/backup` `/backups` `/restore` `/restart` `/update` `/kick` `/ban`

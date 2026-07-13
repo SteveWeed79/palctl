@@ -15,6 +15,7 @@ download and the process runners are thin wrappers over them.
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import subprocess
 import tempfile
@@ -31,6 +32,20 @@ STEAMCMD_WIN_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zi
 LineSink = Callable[[str], None]
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# SteamCMD prints e.g. "Update state (0x61) downloading, progress: 42.34 (123 / 456)".
+_PROGRESS_RE = re.compile(r"progress:\s*([\d.]+)")
+
+
+def parse_progress(line: str) -> float | None:
+    """Pull the download percent out of a SteamCMD progress line, or None."""
+    m = _PROGRESS_RE.search(line)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
 
 
 def update_command(
