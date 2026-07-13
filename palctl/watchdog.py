@@ -83,11 +83,34 @@ class Watchdog:
 
         hard = stats.memory_mb >= wd.hard_limit_mb
 
-        players = []
+        # None = the REST API didn't answer, which is different from "nobody
+        # online": we can't warn anyone in-game and we can't know the server
+        # is empty.
+        players: list | None = None
         try:
             players = await self._api.players()
         except Exception:
             pass
+
+        if players is None and wd.skip_if_players_online and not hard:
+            # Below the hard limit, an unknown player list gets the same
+            # benefit of the doubt as a populated one. A hung API is crash
+            # auto-recovery's job; _over stays as-is so the restart fires on
+            # the first tick where we can see again.
+            if not self._hold_notified:
+                await self._bus.emit(
+                    Event(
+                        "watchdog",
+                        f"⚠️ Memory at **{stats.memory_mb:,.0f} MB** (limit "
+                        f"{wd.memory_limit_mb:,}) but the player list is "
+                        f"unreachable — holding off in case anyone is online. "
+                        f"Will force a restart above {wd.hard_limit_mb:,} MB.",
+                        {"memory_mb": stats.memory_mb, "players": None,
+                         "action": "deferred"},
+                    )
+                )
+                self._hold_notified = True
+            return
 
         if players and wd.skip_if_players_online and not hard:
             # Keep _over as-is: the moment the last player leaves (or memory
@@ -107,7 +130,7 @@ class Watchdog:
                 self._hold_notified = True
             return
 
-        await self._restart(stats.memory_mb, len(players), hard)
+        await self._restart(stats.memory_mb, len(players or []), hard)
 
     async def _restart(self, memory_mb: float, player_count: int, hard: bool) -> None:
         self._restarting = True
