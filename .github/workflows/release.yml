@@ -10,7 +10,14 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v*"        # v0.1.2
+      - "[0-9]*"    # 0.1.2  (the tag that just got missed)
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to build and release (e.g. v0.1.2)"
+        required: true
+        default: "v0.1.2"
 
 permissions:
   contents: write   # create the release and upload assets
@@ -67,6 +74,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           draft: true
+          # Use the pushed tag, or the tag typed into the manual "Run workflow".
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             packaging/Output/palctl-setup.exe
             palctl-portable.zip
