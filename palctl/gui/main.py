@@ -11,10 +11,9 @@ from __future__ import annotations
 
 import sys
 from collections import deque
-from pathlib import Path
 
 import httpx
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -268,7 +267,7 @@ class Console(QWidget):
         ):
             btn = QPushButton(label)
             btn.clicked.connect(
-                lambda _=False, a=action, c=confirm, l=label: self._act(a, c, l)
+                lambda _=False, a=action, c=confirm, text=label: self._act(a, c, text)
             )
             row2.addWidget(btn)
         v.addLayout(row2)

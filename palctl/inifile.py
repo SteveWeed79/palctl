@@ -142,7 +142,7 @@ class PalSettings:
     # ---------- parsing ----------
 
     @classmethod
-    def parse(cls, text: str) -> "PalSettings":
+    def parse(cls, text: str) -> PalSettings:
         m = _OPTION_RE.search(text)
         if not m:
             raise ValueError(
@@ -164,7 +164,7 @@ class PalSettings:
         return cls(options, order)
 
     @classmethod
-    def load(cls, path: Path) -> "PalSettings":
+    def load(cls, path: Path) -> PalSettings:
         return cls.parse(path.read_text(encoding="utf-8-sig"))
 
     # ---------- access ----------

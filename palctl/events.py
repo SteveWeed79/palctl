@@ -20,20 +20,18 @@ charges for that.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import sqlite3
 import threading
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .api import Player
 from .config import config_dir
-
 
 # ---------------- events ----------------
 
@@ -43,7 +41,7 @@ class Event:
     kind: str  # join | leave | levelup | server_up | server_down | watchdog | backup | error
     message: str
     data: dict[str, Any] = field(default_factory=dict)
-    at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 Handler = Callable[[Event], Awaitable[None]]
@@ -121,7 +119,7 @@ class SessionStore:
         with self._lock:
             self._db.execute(
                 "INSERT INTO sessions (user_id, name, joined_at, level_start) VALUES (?,?,?,?)",
-                (p.user_id, p.name, datetime.now(timezone.utc).isoformat(), p.level),
+                (p.user_id, p.name, datetime.now(UTC).isoformat(), p.level),
             )
             self._db.commit()
 
@@ -137,7 +135,7 @@ class SessionStore:
                 return 0.0
 
             rowid, joined_at = row
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             self._db.execute(
                 "UPDATE sessions SET left_at=?, level_end=? WHERE rowid=?",
                 (now.isoformat(), level, rowid),

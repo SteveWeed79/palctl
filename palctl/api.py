@@ -43,7 +43,7 @@ class Metrics:
     days: int
 
     @classmethod
-    def from_json(cls, d: dict) -> "Metrics":
+    def from_json(cls, d: dict) -> Metrics:
         return cls(
             server_fps=int(d.get("serverfps", 0)),
             current_players=int(d.get("currentplayernum", 0)),
@@ -69,7 +69,7 @@ class Player:
     building_count: int
 
     @classmethod
-    def from_json(cls, d: dict) -> "Player":
+    def from_json(cls, d: dict) -> Player:
         return cls(
             name=str(d.get("name", "")),
             account_name=str(d.get("accountName", "")),
@@ -91,7 +91,7 @@ class ServerInfo:
     description: str
 
     @classmethod
-    def from_json(cls, d: dict) -> "ServerInfo":
+    def from_json(cls, d: dict) -> ServerInfo:
         return cls(
             version=str(d.get("version", "")),
             server_name=str(d.get("servername", "")),

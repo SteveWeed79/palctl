@@ -22,7 +22,7 @@ auto-restarter:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from . import procs
 from .api import PalApi
@@ -78,7 +78,7 @@ class Watchdog:
         if self._over < wd.consecutive_samples:
             return  # could be a transient spike; wait for confirmation
 
-        if self._last_restart and datetime.now(timezone.utc) - self._last_restart < COOLDOWN:
+        if self._last_restart and datetime.now(UTC) - self._last_restart < COOLDOWN:
             return  # already restarted recently; don't loop
 
         hard = stats.memory_mb >= wd.hard_limit_mb
@@ -145,7 +145,7 @@ class Watchdog:
             await procs.start_service(self._cfg.service_name)
 
             came_back = await self._api.wait_until_alive(timeout=240)
-            self._last_restart = datetime.now(timezone.utc)
+            self._last_restart = datetime.now(UTC)
             self._over = 0
             self._hold_notified = False
 

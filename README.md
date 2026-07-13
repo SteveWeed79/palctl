@@ -142,6 +142,22 @@ GUI's Config tab. Restart the daemon.
 
 ---
 
+## Development
+
+The platform-neutral core (ini parser, backups, session tracking, config,
+scheduler) is covered by tests that run on any OS — only the daemon's service
+control and the GUI actually need Windows.
+
+```
+pip install -e .[dev]
+pytest
+ruff check palctl tests
+```
+
+Both run in CI on Windows and Linux, Python 3.11 and 3.12.
+
+---
+
 ## License
 
 AGPL-3.0. Use it, fork it, run it. If you host it as a service, your changes stay

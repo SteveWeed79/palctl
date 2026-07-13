@@ -114,7 +114,7 @@ class Config:
     # ---------- persistence ----------
 
     @classmethod
-    def load(cls) -> "Config":
+    def load(cls) -> Config:
         if not CONFIG_PATH.exists():
             return cls()
         try:
