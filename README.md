@@ -170,5 +170,13 @@ Both run in CI on Windows and Linux, Python 3.11 and 3.12.
 
 ## License
 
-AGPL-3.0. Use it, fork it, run it. If you host it as a service, your changes stay
-open.
+**AGPL-3.0-or-later.** Use it, fork it, run it. If you modify it and let others
+use that modified version over a network, your changes stay open. The full text
+is in [LICENSE](LICENSE).
+
+**Commercial licensing.** If the AGPL doesn't fit — for example, you want to
+bundle palctl into a closed-source product — a separate commercial license is
+available. Open an issue or contact the maintainer.
+
+**Contributing.** palctl uses a light CLA ([CLA.md](CLA.md)) so the dual-license
+option above stays possible. See [CONTRIBUTING.md](CONTRIBUTING.md).
