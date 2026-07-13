@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from datetime import datetime, timedelta
+from pathlib import Path
 
-from . import backups, procs
+from . import backups, procs, steamcmd
 from .api import PalApi
 from .config import Config
 from .events import Event, EventBus
+from .inifile import is_blank
 
 # Announce at these marks before a scheduled restart.
 COUNTDOWN_MARKS = (600, 300, 60, 30, 10)
@@ -149,3 +152,87 @@ class Scheduler:
                 {"recovered": ok},
             )
         )
+
+    # ---------- server update (SteamCMD) ----------
+
+    async def update_server(self, *, validate: bool = True) -> None:
+        """
+        Stop the server, run SteamCMD `app_update`, and bring it back — the thing
+        that finally uses the steamcmd_path / app_id the config always stored.
+
+        The `validate` pass is what blanks PalWorldSettings.ini, so we copy the
+        ini aside first and, if Steam does wipe it, put it straight back. Losing
+        an afternoon of server tuning to an update is the exact papercut this
+        avoids.
+        """
+        cfg = self._cfg
+        steam = Path(cfg.steamcmd_path)
+        if not cfg.steamcmd_path or not steam.exists():
+            await self._bus.emit(
+                Event(
+                    "error",
+                    "Can't update: steamcmd.exe isn't set or doesn't exist. "
+                    "Set its path in Config (there's an Auto-detect button).",
+                )
+            )
+            return
+
+        await self._bus.emit(
+            Event("update", "⏬ Server update starting — saving and stopping.")
+        )
+        try:
+            try:
+                await self._api.save()
+            except Exception:
+                pass
+            await procs.stop_service(cfg.service_name)
+
+            ini = cfg.live_ini
+            ini_backup = await asyncio.to_thread(steamcmd.backup_file, ini)
+
+            latest: list[str] = []
+
+            def sink(line: str) -> None:
+                if line:
+                    latest.append(line)
+                    del latest[:-1]  # keep only the most recent line
+
+            code = await steamcmd.run_update_async(
+                cfg.steamcmd_path,
+                cfg.server_root,
+                app_id=cfg.app_id,
+                validate=validate,
+                on_line=sink,
+            )
+
+            if ini_backup and is_blank(ini):
+                await asyncio.to_thread(shutil.copy2, ini_backup, ini)
+                await self._bus.emit(
+                    Event(
+                        "update",
+                        "♻️ SteamCMD blanked PalWorldSettings.ini — restored it "
+                        "from the pre-update backup.",
+                    )
+                )
+
+            tail = f" ({latest[0]})" if latest else ""
+            await self._bus.emit(
+                Event(
+                    "update",
+                    (f"✅ SteamCMD finished (exit {code}).{tail}" if code == 0
+                     else f"⚠️ SteamCMD exited {code}.{tail}") + " Starting server.",
+                    {"exit_code": code},
+                )
+            )
+        finally:
+            await procs.start_service(cfg.service_name)
+            ok = await self._api.wait_until_alive(timeout=300)
+            await self._bus.emit(
+                Event(
+                    "update",
+                    "✅ Server back up after update."
+                    if ok
+                    else "❌ Server did not come back after the update. Needs a look.",
+                    {"recovered": ok},
+                )
+            )

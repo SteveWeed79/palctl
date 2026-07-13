@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import sys
 from collections import deque
+from collections.abc import Callable
+from pathlib import Path
 
 import httpx
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QFileDialog,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -43,6 +46,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import (
+    CONFIG_PATH,
     Config,
     get_admin_password,
     get_discord_token,
@@ -50,6 +54,12 @@ from ..config import (
     set_discord_token,
 )
 from ..daemon import DAEMON_PORT
+from ..discovery import (
+    detect_server_roots,
+    detect_steamcmd,
+    is_server_root,
+    is_steamcmd,
+)
 from .settings_editor import SettingsEditor
 
 DAEMON = f"http://127.0.0.1:{DAEMON_PORT}"
@@ -264,6 +274,7 @@ class Console(QWidget):
             ("Start", "start", False),
             ("Stop", "stop", True),
             ("Restart (countdown)", "restart", True),
+            ("Update (SteamCMD)", "update-server", True),
         ):
             btn = QPushButton(label)
             btn.clicked.connect(
@@ -298,6 +309,82 @@ class Console(QWidget):
             self.log.append(f"❌ {e}")
 
 
+class PathPicker(QWidget):
+    """
+    A path field with Browse, Auto-detect, and a live ✓/✗ validity check.
+
+    The old Config tab was four blank text boxes, and getting any of them wrong
+    quietly pointed every backup, restore, and update at the wrong folder. Browse
+    kills the typos, Auto-detect kills the guessing, and the tick tells you —
+    before you hit Save — whether the path is really a server (or a real
+    steamcmd.exe), instead of finding out when a command silently does nothing.
+    """
+
+    def __init__(
+        self,
+        value: str,
+        *,
+        pick_file: bool,
+        detect: Callable[[], list[Path]] | None = None,
+        validate: Callable[[Path], bool] | None = None,
+        file_filter: str = "All files (*.*)",
+    ) -> None:
+        super().__init__()
+        self._pick_file = pick_file
+        self._detect = detect
+        self._validate = validate
+        self._filter = file_filter
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        self.edit = QLineEdit(value)
+        row.addWidget(self.edit, 1)
+
+        self._status = QLabel()
+        if validate is not None:
+            row.addWidget(self._status)
+            self.edit.textChanged.connect(self._revalidate)
+
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse)
+        row.addWidget(browse)
+
+        if detect is not None:
+            auto = QPushButton("Auto-detect")
+            auto.clicked.connect(self._auto)
+            row.addWidget(auto)
+
+        self._revalidate()
+
+    def text(self) -> str:
+        return self.edit.text()
+
+    def _browse(self) -> None:
+        current = self.edit.text()
+        if self._pick_file:
+            path, _ = QFileDialog.getOpenFileName(self, "Select file", current, self._filter)
+        else:
+            path = QFileDialog.getExistingDirectory(self, "Select folder", current)
+        if path:
+            self.edit.setText(path)
+
+    def _auto(self) -> None:
+        found = self._detect() if self._detect else []
+        if found:
+            self.edit.setText(str(found[0]))
+        else:
+            self._status.setText("none found")
+            self._status.setStyleSheet("color:#d29922;")
+
+    def _revalidate(self, *_: object) -> None:
+        if self._validate is None:
+            return
+        text = self.edit.text().strip()
+        ok = bool(text) and self._validate(Path(text))
+        self._status.setText("✓" if ok else "✗")
+        self._status.setStyleSheet("color:#3fb950;" if ok else "color:#f85149;")
+
+
 class ConfigTab(QWidget):
     """Paths, watchdog thresholds, schedules, and secrets. All entered here."""
 
@@ -308,9 +395,20 @@ class ConfigTab(QWidget):
 
         paths = QGroupBox("Paths")
         pf = QFormLayout(paths)
-        self.server_root = QLineEdit(cfg.server_root)
-        self.steamcmd = QLineEdit(cfg.steamcmd_path)
-        self.backup_root = QLineEdit(cfg.backup_root)
+        self.server_root = PathPicker(
+            cfg.server_root,
+            pick_file=False,
+            detect=detect_server_roots,
+            validate=is_server_root,
+        )
+        self.steamcmd = PathPicker(
+            cfg.steamcmd_path,
+            pick_file=True,
+            detect=detect_steamcmd,
+            validate=is_steamcmd,
+            file_filter="steamcmd.exe (steamcmd.exe);;All files (*.*)",
+        )
+        self.backup_root = PathPicker(cfg.backup_root, pick_file=False)
         self.service = QLineEdit(cfg.service_name)
         pf.addRow("Server root", self.server_root)
         pf.addRow("steamcmd.exe", self.steamcmd)
@@ -477,6 +575,23 @@ class Main(QMainWindow):
 
         self._tray()
 
+        # First launch (no config yet): walk the user through setup rather than
+        # dropping them onto a Config tab full of blank boxes. Deferred so the
+        # main window is up before the dialog appears.
+        if not CONFIG_PATH.exists():
+            QTimer.singleShot(300, lambda: self._open_wizard(first_run=True))
+
+    def _open_wizard(self, *, first_run: bool = False) -> None:
+        from .wizard import SetupWizard
+
+        SetupWizard(self.cfg, self, first_run=first_run).exec()
+        # Paths / password may have changed; reload and push it to the daemon.
+        self.cfg = Config.load()
+        try:
+            call("/action/reload-config", {})
+        except Exception:
+            pass
+
     def _on_state(self, s: dict) -> None:
         self.dash.update_state(s)
         self.players.update_state(s)
@@ -495,9 +610,12 @@ class Main(QMainWindow):
         menu = QMenu()
         show = QAction("Show", self)
         show.triggered.connect(self.showNormal)
+        setup = QAction("Setup wizard…", self)
+        setup.triggered.connect(lambda: self._open_wizard(first_run=False))
         quit_ = QAction("Quit GUI (daemon keeps running)", self)
         quit_.triggered.connect(QApplication.quit)
         menu.addAction(show)
+        menu.addAction(setup)
         menu.addAction(quit_)
         self.tray.setContextMenu(menu)
         self.tray.setToolTip("palctl")

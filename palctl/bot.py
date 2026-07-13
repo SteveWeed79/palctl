@@ -86,6 +86,7 @@ class PalBot(discord.Client):
             "server_down": d.notify_server_up_down,
             "restart": True,
             "backup": True,
+            "update": True,
             "error": True,
         }
         if not wants.get(e.kind, False):
@@ -244,6 +245,21 @@ class PalBot(discord.Client):
             )
             # asyncio holds only weak refs to tasks; keep one for the countdown.
             task = asyncio.create_task(self._sched.restart_with_countdown(reason))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+
+        @tree.command(
+            name="update", description="Update the server via SteamCMD (stops it first)"
+        )
+        async def update(interaction: discord.Interaction) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message("Not allowed.", ephemeral=True)
+                return
+            await interaction.response.send_message(
+                "⏬ Updating the server via SteamCMD — it'll go down and I'll report "
+                "back here when it's finished."
+            )
+            task = asyncio.create_task(self._sched.update_server())
             self._bg_tasks.add(task)
             task.add_done_callback(self._bg_tasks.discard)
 
