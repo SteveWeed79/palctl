@@ -62,14 +62,19 @@ PC, which is the situation most people are trying to get out of.
 **GUI**
 - Dashboard: FPS, frame time, memory sparkline, uptime, in-game day, base camps
 - Players: level, ping, location, building count, kick/ban
-- Console: announce (real spaces — REST, not RCON), save, backup, start/stop/restart
+- Console: announce (real spaces — REST, not RCON), save, backup, start/stop/restart,
+  and **update the server** (SteamCMD, with the ini guarded across `validate`)
 - **Settings editor**: parses the one-line `OptionSettings=(...)` blob into a
   searchable, grouped, typed form. Preserves unknown keys from future patches.
   Backs up the ini on every save, because SteamCMD `validate` wipes it.
-- Config: paths, watchdog thresholds, schedules, Discord — all entered in the UI
+- Config: paths (with **Browse** and **Auto-detect**, and a live ✓/✗ that tells
+  you the path is really a server before you save), watchdog thresholds,
+  schedules, Discord — all entered in the UI
+- **First-run wizard**: finds the server and steamcmd, turns on the REST API,
+  can install the server from Steam for you, and registers both Windows services
 
 **Discord bot**
-`/status` `/players` `/playtime` `/announce` `/save` `/backup` `/restart` `/kick` `/ban`
+`/status` `/players` `/playtime` `/announce` `/save` `/backup` `/restart` `/update` `/kick` `/ban`
 plus join/leave, level-up, watchdog, and server up/down notifications.
 
 ---
@@ -91,50 +96,54 @@ Torch equivalent and there can't be one without injection.
 
 ## Setup
 
-**Requires:** Windows, Python 3.11+, a Palworld dedicated server, and RCON's
-replacement turned on.
+The fast path is the installer + the first-run wizard. The manual path still
+works if you'd rather drive it yourself.
 
-### 1. Enable the REST API
+### Option A — installer (recommended)
 
-Palworld ships `Pal\Saved\Config\WindowsServer\PalWorldSettings.ini` **empty**.
-That's normal. You must copy the contents of `DefaultPalWorldSettings.ini` (in the
-server root) into it — editing the Default file itself does nothing.
+Run `palctl-setup.exe` (build it from `packaging/`, see
+[packaging/README.md](packaging/README.md)). No Python needed. It installs both
+binaries, adds shortcuts, and offers to register the palctl background service.
+Then it opens the GUI, and the **first-run wizard** does the rest:
 
-*(palctl will detect the blank file and offer to seed it for you.)*
+- **finds** your server root and steamcmd (registry, Steam libraries, or the
+  running process) — nothing to type
+- **installs the server for you** from Steam via SteamCMD, if it isn't already
+- **enables the REST API** — seeds the blank `PalWorldSettings.ini`, sets
+  `RESTAPIEnabled=True`, the port, and your admin password
+- **registers both Windows services** (the game server *and* the palctl daemon)
+  so everything survives a reboot
 
-Then set, inside the `OptionSettings=(...)` line:
+You still need to point it at, or let it install, a Palworld **dedicated
+server** — that software comes from Steam (app `2394010`). The wizard is happy to
+fetch it; it just can't conjure it from nothing.
 
-```
-RESTAPIEnabled=True
-RESTAPIPort=8212
-AdminPassword="pick-something"
-```
+> The REST API is **not** designed to be exposed to the internet — Pocketpair
+> says so explicitly. `palctl` only ever talks to `127.0.0.1`. Don't
+> port-forward 8212.
 
-Restart the server.
+### Option B — from source
 
-> The REST API is **not** designed to be exposed to the internet — Pocketpair says
-> so explicitly. `palctl` only ever talks to `127.0.0.1`. Don't port-forward 8212.
-
-### 2. Run it
+**Requires:** Windows, Python 3.11+.
 
 ```
 run-daemon.bat      creates a venv, installs deps, starts the daemon
-run-gui.bat         opens the GUI
+run-gui.bat         opens the GUI  (first launch pops the setup wizard)
 ```
 
-Open the GUI → **Config** tab → set your paths and admin password → Save.
-Everything is entered in the UI. Secrets go into Windows Credential Manager
-(DPAPI-encrypted), never into a config file.
-
-### 3. Make the daemon permanent
+The wizard handles detection, the REST API, an optional server install, and
+service registration. Prefer to do it by hand? The **Config** tab has Browse and
+Auto-detect on every path with a live ✓/✗, and:
 
 ```
-nssm install palctl-daemon "C:\path\to\palctl\.venv\Scripts\python.exe" "-m" "palctl.daemon"
-nssm set palctl-daemon AppDirectory "C:\path\to\palctl"
-nssm start palctl-daemon
+palctl-daemon.exe install-service      # or: python -m palctl.daemon install-service
 ```
 
-### 4. Discord (optional)
+registers the daemon service without touching a terminal full of `nssm` lines.
+Secrets go into Windows Credential Manager (DPAPI-encrypted), never into a config
+file.
+
+### Discord (optional)
 
 Create an app at discord.com/developers → Bot → copy the token → invite it to your
 server with `applications.commands` and `bot` scopes. Paste the token into the
@@ -145,8 +154,9 @@ GUI's Config tab. Restart the daemon.
 ## Development
 
 The platform-neutral core (ini parser, backups, session tracking, config,
-scheduler) is covered by tests that run on any OS — only the daemon's service
-control and the GUI actually need Windows.
+scheduler, path detection, the SteamCMD argv/ini-guard, NSSM command building,
+and the REST-API bootstrap) is covered by tests that run on any OS — only the
+daemon's service control, the actual downloads, and the GUI need Windows.
 
 ```
 pip install -e .[dev]

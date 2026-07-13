@@ -40,3 +40,7 @@ select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# CI runs a bare `pytest` (not `python -m pytest`), so the repo root isn't on
+# sys.path and the in-tree `palctl` package can't be imported. Put it on the
+# path explicitly so the suite runs the same way everywhere.
+pythonpath = ["."]

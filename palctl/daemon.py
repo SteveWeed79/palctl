@@ -15,19 +15,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sys
 from dataclasses import asdict
+from pathlib import Path
 
 from aiohttp import web
 
 from . import backups, procs
 from .api import PalApi, PalApiError
 from .bot import run_bot
-from .config import Config, get_admin_password
+from .config import Config, config_dir, get_admin_password
 from .events import Event, EventBus, PlayerTracker, SessionStore
 from .scheduler import Scheduler
 from .watchdog import Watchdog
 
 DAEMON_PORT = 8830  # localhost only
+SERVICE_NAME = "palctl-daemon"  # the Windows service name NSSM registers
 
 
 class Daemon:
@@ -146,6 +149,8 @@ class Daemon:
                     await self.api.save()
                 elif what == "backup":
                     self._spawn(self.scheduler.backup_now("gui"))
+                elif what == "update-server":
+                    self._spawn(self.scheduler.update_server())
                 elif what == "kick":
                     await self.api.kick(body["user_id"], body.get("reason", ""))
                 elif what == "ban":
@@ -196,7 +201,57 @@ class Daemon:
         )
 
 
+def service_target() -> tuple[str, str, str]:
+    """
+    (exe, args, app_dir) to run *this* daemon as a Windows service — correct
+    whether we're a PyInstaller-frozen palctl-daemon.exe or `python -m
+    palctl.daemon` in a dev checkout. The installer and the wizard both register
+    the service off this, so there's one source of truth for "how do you run me".
+    """
+    if getattr(sys, "frozen", False):
+        exe = sys.executable
+        return exe, "", str(Path(exe).parent)
+    return sys.executable, "-m palctl.daemon", str(Path(__file__).resolve().parents[1])
+
+
+def install_service() -> None:
+    """Register (and start) the palctl daemon as a Windows service via NSSM."""
+    from . import winservice
+
+    nssm = winservice.ensure_nssm(config_dir() / "bin")
+    exe, args, app_dir = service_target()
+    winservice.install_service(nssm, SERVICE_NAME, exe, args, app_dir)
+    print(f"[daemon] service '{SERVICE_NAME}' installed and started.")
+
+
+def uninstall_service() -> None:
+    from . import winservice
+
+    nssm = winservice.ensure_nssm(config_dir() / "bin")
+    winservice.remove_service(nssm, SERVICE_NAME)
+    print(f"[daemon] service '{SERVICE_NAME}' removed.")
+
+
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="palctl-daemon")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="run",
+        choices=["run", "install-service", "uninstall-service"],
+        help="run the daemon (default), or (un)register it as a Windows service",
+    )
+    args = parser.parse_args()
+
+    if args.command == "install-service":
+        install_service()
+        return
+    if args.command == "uninstall-service":
+        uninstall_service()
+        return
+
     try:
         asyncio.run(Daemon().run())
     except KeyboardInterrupt:
