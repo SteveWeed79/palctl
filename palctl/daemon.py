@@ -23,7 +23,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from . import backups, leak, localauth, procs
+from . import backups, inifile, leak, localauth, procs
 from .api import PalApi, PalApiError
 from .bot import run_bot
 from .client import DAEMON_PORT
@@ -86,6 +86,27 @@ def _busy_response(current_op: str | None) -> web.Response:
     )
 
 
+def service_account_warning(username: str, cfg_dir: str) -> str | None:
+    """
+    The message to log when the daemon is running under a machine account
+    (LocalSystem shows up as 'SYSTEM', or as 'HOSTNAME$' via %USERNAME%).
+    Such an account has its own %APPDATA% and Credential Manager, so unless
+    the service was registered by palctl (which redirects APPDATA) the daemon
+    reads a DIFFERENT config and token than the user's GUI/CLI — the classic
+    symptom is the GUI stuck on 'unauthorized'. Pure, so it's testable.
+    """
+    u = username.strip().lower()
+    if u != "system" and not u.endswith("$"):
+        return None
+    return (
+        f"Running as '{username}', a machine account with its own %APPDATA% and "
+        f"Credential Manager. Config/token are being read from {cfg_dir}. If the "
+        "GUI or CLI reports 'unauthorized', or your settings don't seem to apply, "
+        "re-register the service under your account: "
+        "palctl-daemon install-service --as-user"
+    )
+
+
 def make_auth_middleware(token: str, exempt: frozenset[str] = frozenset()):
     """aiohttp middleware that rejects any request without the shared token.
     `exempt` paths skip the check — only the dashboard page itself, which
@@ -106,12 +127,14 @@ def make_auth_middleware(token: str, exempt: frozenset[str] = frozenset()):
 class Daemon:
     def __init__(self) -> None:
         self.log = setup_logging()
+        self.log.info("config dir: %s", config_dir())
+        self._warn_if_machine_account()
         self._token = localauth.get_or_create_token()
         self.cfg = Config.load()
         self.bus = EventBus()
         self.store = SessionStore()
         self.api = PalApi(
-            self.cfg.api_host, self.cfg.api_port, get_admin_password()
+            self.cfg.api_host, self.cfg.api_port, self._admin_password()
         )
         self.tracker = PlayerTracker(self.bus, self.store)
         # One lock for everything that stops the server. The scheduler, the
@@ -146,6 +169,33 @@ class Daemon:
 
         self.bus.on_any(self._persist)
         self.bus.on_any(self._log_event)
+
+    def _warn_if_machine_account(self) -> None:
+        try:
+            import getpass
+
+            warning = service_account_warning(getpass.getuser(), str(config_dir()))
+        except Exception:
+            # getuser() can fail in odd service environments; the warning is
+            # best-effort diagnostics, never worth failing startup over.
+            warning = None
+        if warning:
+            self.log.warning("%s", warning)
+
+    def _admin_password(self) -> str:
+        """Keyring first; fall back to AdminPassword in the server's own ini
+        for daemons that can't see the per-user keyring (LocalSystem service,
+        headless Linux with no keyring backend)."""
+        pw = get_admin_password()
+        if pw:
+            return pw
+        pw = inifile.read_admin_password(self.cfg.live_ini)
+        if pw:
+            self.log.info(
+                "admin password read from PalWorldSettings.ini (keyring had none "
+                "for this account)"
+            )
+        return pw
 
     def _set_bot(self, bot) -> None:
         self.bot = bot
@@ -417,7 +467,7 @@ class Daemon:
                 elif what == "reload-config":
                     self.cfg = Config.load()
                     self.api = PalApi(
-                        self.cfg.api_host, self.cfg.api_port, get_admin_password()
+                        self.cfg.api_host, self.cfg.api_port, self._admin_password()
                     )
                     # The workers hold their own cfg/api references; swap them
                     # too or the reload silently changes nothing.
@@ -514,15 +564,40 @@ def service_target() -> tuple[str, str, str]:
     return sys.executable, "-m palctl.daemon", str(Path(__file__).resolve().parents[1])
 
 
-def install_service() -> None:
+def install_service(as_user: bool = False) -> None:
     """Register (and start) the palctl daemon as a service — NSSM on Windows,
-    systemd on Linux."""
+    systemd on Linux.
+
+    On Windows the account matters (see winservice.install_commands). With
+    `as_user` we register the service under the invoking account, which shares
+    its %APPDATA% and DPAPI secrets with the GUI/CLI; otherwise we stay on
+    LocalSystem but redirect %APPDATA% to the installing user's, and the
+    daemon falls back to reading AdminPassword from the server's ini.
+    """
     exe, args, app_dir = service_target()
     if sys.platform.startswith("win"):
+        import getpass
+        import os
+
         from . import winservice
 
+        user = password = None
+        if as_user:
+            username = os.environ.get("USERNAME", "")
+            user = f".\\{username}"
+            print(
+                f"[daemon] The service will log on as {user} so it shares your\n"
+                "         config, token, and saved secrets. Windows needs your\n"
+                "         account password to register that (palctl does not\n"
+                "         store it — it goes straight to the service manager)."
+            )
+            password = getpass.getpass(f"Password for {user}: ")
+
         nssm = winservice.ensure_nssm(config_dir() / "bin")
-        winservice.install_service(nssm, SERVICE_NAME, exe, args, app_dir)
+        winservice.install_service(
+            nssm, SERVICE_NAME, exe, args, app_dir,
+            user=user, password=password, appdata=os.environ.get("APPDATA"),
+        )
     else:
         from . import systemd
 
@@ -557,10 +632,17 @@ def main() -> None:
         choices=["run", "install-service", "uninstall-service"],
         help="run the daemon (default), or (un)register it as a Windows service",
     )
+    parser.add_argument(
+        "--as-user",
+        action="store_true",
+        help="register the Windows service under your account (asks for your "
+        "Windows password) instead of LocalSystem — recommended if you use "
+        "the Discord bot or saved the admin password in the GUI",
+    )
     args = parser.parse_args()
 
     if args.command == "install-service":
-        install_service()
+        install_service(as_user=args.as_user)
         return
     if args.command == "uninstall-service":
         uninstall_service()

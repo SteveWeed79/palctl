@@ -11,6 +11,7 @@ from palctl.inifile import (
     _classify,
     _split_top_level,
     is_blank,
+    read_admin_password,
     seed_from_default,
 )
 
@@ -117,3 +118,16 @@ def test_load_handles_utf8_bom(tmp_path: Path):
     live = tmp_path / "PalWorldSettings.ini"
     live.write_bytes(b"\xef\xbb\xbf" + SAMPLE.encode("utf-8"))
     assert PalSettings.load(live).get("ServerName") == "My Server"
+
+
+def test_read_admin_password_from_live_ini(tmp_path: Path):
+    ini = tmp_path / "PalWorldSettings.ini"
+    ini.write_text(SAMPLE, encoding="utf-8")
+    assert read_admin_password(ini) == "s3cret"
+
+
+def test_read_admin_password_missing_or_blank(tmp_path: Path):
+    assert read_admin_password(tmp_path / "nope.ini") == ""
+    blank = tmp_path / "blank.ini"
+    blank.write_text("", encoding="utf-8")
+    assert read_admin_password(blank) == ""
