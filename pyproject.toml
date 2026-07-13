@@ -21,6 +21,7 @@ dev = [
 ]
 
 [project.scripts]
+palctl = "palctl.cli:main"
 palctl-daemon = "palctl.daemon:main"
 palctl-gui = "palctl.gui.main:main"
 
@@ -30,6 +31,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["palctl*"]
+
+[tool.setuptools.package-data]
+# The web dashboard the daemon serves at / — one self-contained file.
+palctl = ["dashboard.html"]
 
 [tool.ruff]
 line-length = 100

@@ -23,16 +23,17 @@ from pathlib import Path
 
 from aiohttp import web
 
-from . import backups, localauth, procs
+from . import backups, leak, localauth, procs
 from .api import PalApi, PalApiError
 from .bot import run_bot
+from .client import DAEMON_PORT
 from .config import Config, config_dir, get_admin_password
+from .control import ServerController
 from .events import Event, EventBus, PlayerTracker, SessionStore
 from .logging_setup import setup_logging
 from .scheduler import Scheduler
 from .watchdog import Watchdog
 
-DAEMON_PORT = 8830  # localhost only
 SERVICE_NAME = "palctl-daemon"  # the Windows service name NSSM registers
 
 
@@ -76,11 +77,24 @@ def should_recover_now(
     return recent_restarts < cap
 
 
-def make_auth_middleware(token: str):
-    """aiohttp middleware that rejects any request without the shared token."""
+def _busy_response(current_op: str | None) -> web.Response:
+    """409: the server is mid-operation; the client should retry, not queue.
+    Queueing a Start behind a 10-minute restart countdown surprises everyone."""
+    return web.json_response(
+        {"error": f"busy: {current_op or 'another operation'} is in progress"},
+        status=409,
+    )
+
+
+def make_auth_middleware(token: str, exempt: frozenset[str] = frozenset()):
+    """aiohttp middleware that rejects any request without the shared token.
+    `exempt` paths skip the check — only the dashboard page itself, which
+    contains no data (its /state calls still need the token)."""
 
     @web.middleware
     async def _auth(request: web.Request, handler):
+        if exempt and request.path in exempt:
+            return await handler(request)
         sent = request.headers.get(localauth.TOKEN_HEADER, "")
         if not secrets.compare_digest(sent, token):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -100,23 +114,35 @@ class Daemon:
             self.cfg.api_host, self.cfg.api_port, get_admin_password()
         )
         self.tracker = PlayerTracker(self.bus, self.store)
-        self.scheduler = Scheduler(self.cfg, self.api, self.bus)
-        self.watchdog = Watchdog(self.cfg, self.api, self.bus)
+        # One lock for everything that stops the server. The scheduler, the
+        # watchdog, and auto-recovery all share it, so a scheduled restart
+        # can't fire mid-update and a watchdog restart can't race a restore.
+        self.control = ServerController(self.cfg, self.api)
+        self.scheduler = Scheduler(self.cfg, self.api, self.bus, self.control)
+        self.watchdog = Watchdog(self.cfg, self.api, self.bus, self.control)
         self.bot = None  # set by run_bot if the Discord bot is enabled
 
         # None = haven't polled yet; don't announce "up" just because the
         # daemon (not the server) was restarted.
         self._alive: bool | None = None
         self._last_metrics = None
-        self._history: list[dict] = []  # rolling metrics, for the GUI graphs
+        # Rolling metrics for the GUI graphs and the leak forecaster. Seeded
+        # from SQLite so a daemon restart doesn't blank the graphs.
+        self._history: list[dict] = self.store.recent_metrics(720)
         self._tasks: set[asyncio.Task] = set()
 
-        # Crash/hang auto-recovery bookkeeping.
+        # Crash/hang auto-recovery bookkeeping. ("palctl is doing this on
+        # purpose" now lives in the ServerController's operation lock.)
         self._ever_alive = False           # only recover a server that WAS up
         self._desired_running = True       # user "Stop" flips this off
-        self._busy = False                 # a palctl op (restart/update/restore) is running
         self._down_polls = 0               # consecutive unreachable polls
         self._autorestart_times: list[float] = []
+
+        # Leak forecasting. _epoch_at marks the last server (re)start we saw:
+        # samples from a previous process would poison the fit, so the
+        # forecaster only looks at samples after it.
+        self._epoch_at = 0.0
+        self._predict_warned = False
 
         self.bus.on_any(self._persist)
         self.bus.on_any(self._log_event)
@@ -129,18 +155,6 @@ class Daemon:
         t = asyncio.create_task(coro)
         self._tasks.add(t)
         t.add_done_callback(self._tasks.discard)
-
-    def _spawn_op(self, coro) -> None:
-        """Spawn a palctl-initiated server operation, holding `_busy` for its
-        duration so crash auto-recovery doesn't fight an intentional stop."""
-        async def _run() -> None:
-            self._busy = True
-            try:
-                await coro
-            finally:
-                self._busy = False
-
-        self._spawn(_run())
 
     async def _persist(self, e: Event) -> None:
         await asyncio.to_thread(self.store.log_event, e)
@@ -173,6 +187,7 @@ class Daemon:
 
         if self._alive is False:
             await self.bus.emit(Event("server_up", "🟢 Server is **up**."))
+            self._epoch_at = time.time()  # fresh process; old memory samples don't apply
         self._alive = True
         self._ever_alive = True
         self._down_polls = 0
@@ -181,16 +196,17 @@ class Daemon:
 
         stats = procs.proc_stats()
         self._last_metrics = metrics
-        self._history.append(
-            {
-                "fps": metrics.server_fps,
-                "frame_time": metrics.server_frame_time,
-                "players": metrics.current_players,
-                "memory_mb": stats.memory_mb if stats else 0.0,
-                "cpu": stats.cpu_percent if stats else 0.0,
-            }
-        )
+        sample = {
+            "at": time.time(),
+            "fps": metrics.server_fps,
+            "frame_time": metrics.server_frame_time,
+            "players": metrics.current_players,
+            "memory_mb": stats.memory_mb if stats else 0.0,
+            "cpu": stats.cpu_percent if stats else 0.0,
+        }
+        self._history.append(sample)
         del self._history[:-720]  # ~2h at 10s polling
+        await asyncio.to_thread(self.store.log_metrics, sample)
 
     # ---------- crash / hang auto-recovery ----------
 
@@ -204,7 +220,7 @@ class Daemon:
         phase = autorecover_phase(
             enabled=wd.auto_restart_on_crash,
             ever_alive=self._ever_alive,
-            busy=self._busy,
+            busy=self.control.busy,
             restarting=self.watchdog.is_restarting,
             desired_running=self._desired_running,
         )
@@ -228,39 +244,110 @@ class Daemon:
 
         self._down_polls = 0
         self._autorestart_times.append(now)
-        await self.bus.emit(
-            Event(
-                "watchdog",
-                "🚑 Server unreachable and palctl didn't stop it — auto-recovering.",
-                {"action": "autorecover"},
-            )
-        )
-        self._spawn_op(self._autorecover())
+        self._spawn(self._autorecover())
 
     async def _autorecover(self) -> None:
+        op = self.control.try_operation("auto-recover")
+        if op is None:
+            return  # something else took the server in the meantime
         try:
-            # Stop first, in case it's hung rather than gone — then start clean.
-            await procs.stop_service(self.cfg.service_name)
-            await asyncio.sleep(2)
-            await procs.start_service(self.cfg.service_name)
-            ok = await self.api.wait_until_alive(timeout=240)
+            async with op:
+                await self.bus.emit(
+                    Event(
+                        "watchdog",
+                        "🚑 Server unreachable and palctl didn't stop it — "
+                        "auto-recovering.",
+                        {"action": "autorecover"},
+                    )
+                )
+                # Stop first, in case it's hung rather than gone — then start clean.
+                ok = await self.control.restart_cycle(stop_delay=2)
+                await self.bus.emit(
+                    Event(
+                        "watchdog",
+                        "✅ Server recovered."
+                        if ok
+                        else "❌ Auto-recover ran but the server is still down.",
+                        {"recovered": ok},
+                    )
+                )
+        except Exception as e:
+            await self.bus.emit(Event("error", f"Auto-recover failed: {e}"))
+
+    # ---------- leak forecasting ----------
+
+    async def _predict_loop(self) -> None:
+        while True:
+            await asyncio.sleep(300)
+            try:
+                await self._predict_tick()
+            except Exception as e:
+                self.log.warning("leak forecast failed: %s", e)
+
+    async def _predict_tick(self) -> None:
+        wd = self.cfg.watchdog
+        if not (wd.enabled and (wd.predict_notify or wd.preempt_restart)):
+            self._predict_warned = False
+            return
+        if not self._alive or self.control.busy:
+            return
+
+        samples = [
+            (s["at"], s["memory_mb"])
+            for s in self._history
+            if s.get("at", 0.0) >= self._epoch_at
+        ]
+        ttl = leak.time_to_limit_minutes(samples, wd.memory_limit_mb)
+        if ttl is None or ttl > wd.preempt_horizon_minutes:
+            self._predict_warned = False  # re-arm; a new episode gets a new warning
+            return
+
+        if wd.preempt_restart and not self.tracker.online:
+            # Empty server + limit approaching: restart NOW, on our terms,
+            # instead of at the threshold later with players mid-session.
             await self.bus.emit(
                 Event(
                     "watchdog",
-                    "✅ Server recovered."
-                    if ok
-                    else "❌ Auto-recover ran but the server is still down.",
-                    {"recovered": ok},
+                    f"🔮 Memory on pace to hit the limit in {leak.fmt_minutes(ttl)} "
+                    "and the server is empty — restarting now instead of "
+                    "mid-session later.",
+                    {"action": "preempt", "minutes_to_limit": round(ttl)},
                 )
             )
-        except Exception as e:
-            await self.bus.emit(Event("error", f"Auto-recover failed: {e}"))
+            self._predict_warned = False
+            self._spawn(
+                self.scheduler.restart_quick("Pre-emptive maintenance restart (memory)")
+            )
+        elif wd.predict_notify and not self._predict_warned:
+            self._predict_warned = True
+            await self.bus.emit(
+                Event(
+                    "watchdog",
+                    f"🔮 On the current pace, memory hits the watchdog limit "
+                    f"({wd.memory_limit_mb:,} MB) in {leak.fmt_minutes(ttl)}. "
+                    "The watchdog will handle it — but now would be a good "
+                    "moment for a restart on your terms.",
+                    {"action": "forecast", "minutes_to_limit": round(ttl)},
+                )
+            )
 
     # ---------- localhost API for the GUI ----------
 
     def _routes(self) -> web.Application:
-        # Every request must carry the shared token — see localauth.
-        app = web.Application(middlewares=[make_auth_middleware(self._token)])
+        # Every request must carry the shared token — see localauth. The one
+        # exception is "/", the dashboard page: static markup, no data.
+        app = web.Application(
+            middlewares=[make_auth_middleware(self._token, exempt=frozenset({"/"}))]
+        )
+
+        dashboard = Path(__file__).with_name("dashboard.html")
+
+        async def index(_: web.Request) -> web.Response:
+            try:
+                html = await asyncio.to_thread(dashboard.read_text, "utf-8")
+            except OSError:
+                return web.Response(status=404, text="dashboard not bundled")
+            return web.Response(text=html, content_type="text/html")
 
         async def state(_: web.Request) -> web.Response:
             stats = procs.proc_stats()
@@ -269,6 +356,8 @@ class Daemon:
                     "service": procs.service_state(self.cfg.service_name),
                     "alive": self._alive,
                     "restarting": self.watchdog.is_restarting,
+                    "operation": self.control.current_op,
+                    "memory_limit_mb": self.cfg.watchdog.memory_limit_mb,
                     "metrics": asdict(self._last_metrics) if self._last_metrics else None,
                     "process": asdict(stats) if stats else None,
                     "players": [asdict(p) for p in self.tracker.online],
@@ -286,17 +375,25 @@ class Daemon:
 
             try:
                 if what == "start":
+                    op = self.control.try_operation("start")
+                    if op is None:
+                        return _busy_response(self.control.current_op)
                     self._desired_running = True
-                    await procs.start_service(self.cfg.service_name)
+                    async with op:
+                        await self.control.start()
                 elif what == "stop":
+                    op = self.control.try_operation("stop")
+                    if op is None:
+                        return _busy_response(self.control.current_op)
                     # Intentional: don't let auto-recovery start it back up.
                     self._desired_running = False
-                    with contextlib.suppress(PalApiError):
-                        await self.api.save()
-                    await procs.stop_service(self.cfg.service_name)
+                    async with op:
+                        with contextlib.suppress(PalApiError):
+                            await self.api.save()
+                        await self.control.stop()
                 elif what == "restart":
                     self._desired_running = True
-                    self._spawn_op(
+                    self._spawn(
                         self.scheduler.restart_with_countdown(
                             body.get("reason", "Admin restart")
                         )
@@ -309,10 +406,10 @@ class Daemon:
                     self._spawn(self.scheduler.backup_now("gui"))
                 elif what == "update-server":
                     self._desired_running = True
-                    self._spawn_op(self.scheduler.update_server())
+                    self._spawn(self.scheduler.update_server())
                 elif what == "restore":
                     self._desired_running = True
-                    self._spawn_op(self.scheduler.restore_backup(body["name"]))
+                    self._spawn(self.scheduler.restore_backup(body["name"]))
                 elif what == "kick":
                     await self.api.kick(body["user_id"], body.get("reason", ""))
                 elif what == "ban":
@@ -324,6 +421,7 @@ class Daemon:
                     )
                     # The workers hold their own cfg/api references; swap them
                     # too or the reload silently changes nothing.
+                    self.control.reconfigure(self.cfg, self.api)
                     self.scheduler.reconfigure(self.cfg, self.api)
                     self.watchdog.reconfigure(self.cfg, self.api)
                     if self.bot is not None:
@@ -343,6 +441,7 @@ class Daemon:
                 [{"name": b.name, "size_mb": b.size_mb} for b in bs]
             )
 
+        app.router.add_get("/", index)
         app.router.add_get("/state", state)
         app.router.add_get("/backups", list_backups)
         app.router.add_post("/action/{what}", action)
@@ -365,6 +464,7 @@ class Daemon:
             self._poll_loop(),
             self.watchdog.run(),
             self.scheduler.run(),
+            self._predict_loop(),
             self._update_check_loop(),
             run_bot(
                 self.cfg, self.api, self.bus, self.store, self.scheduler,

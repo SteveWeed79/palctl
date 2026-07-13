@@ -130,3 +130,30 @@ def test_log_event_roundtrip(tmp_path: Path):
     store.log_event(Event("watchdog", "msg", {"memory_mb": 12345.0}))
     row = store._db.execute("SELECT kind, message FROM events").fetchone()
     assert row == ("watchdog", "msg")
+
+
+def test_metrics_roundtrip_survives_daemon_restart(tmp_path: Path):
+    db = tmp_path / "s.db"
+    store = SessionStore(db)
+    for i in range(5):
+        store.log_metrics(
+            {"at": 1000.0 + i, "fps": 60, "frame_time": 16.6,
+             "players": 2, "memory_mb": 8000.0 + i, "cpu": 40.0}
+        )
+    # A "new daemon" reads the same samples back, oldest first.
+    got = SessionStore(db).recent_metrics(720)
+    assert [s["at"] for s in got] == [1000.0, 1001.0, 1002.0, 1003.0, 1004.0]
+    assert got[-1]["memory_mb"] == 8004.0
+
+
+def test_metrics_limit_and_retention(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    store.log_metrics({"at": 100.0, "memory_mb": 1.0})
+    # A sample 8 days later prunes the ancient one on the way in.
+    later = 100.0 + 8 * 24 * 3600
+    store.log_metrics({"at": later, "memory_mb": 2.0})
+    got = store.recent_metrics(720)
+    assert [s["at"] for s in got] == [later]
+    # And LIMIT returns the newest n, still oldest-first.
+    store.log_metrics({"at": later + 1, "memory_mb": 3.0})
+    assert [s["memory_mb"] for s in store.recent_metrics(1)] == [3.0]

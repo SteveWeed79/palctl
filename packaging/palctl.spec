@@ -30,6 +30,9 @@ daemon_a = Analysis(
     ["daemon_entry.py"],
     pathex=[".."],
     hiddenimports=hiddenimports,
+    # The web dashboard the daemon serves at /; daemon.py resolves it next to
+    # its own module, so it must land inside the frozen palctl/ package dir.
+    datas=[("../palctl/dashboard.html", "palctl")],
     noarchive=False,
 )
 gui_a = Analysis(

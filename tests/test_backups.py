@@ -54,6 +54,22 @@ def test_restore_and_delete_reject_traversal(tmp_path: Path, name: str):
         backups.delete(root, name)
 
 
+def test_mirror_copies_backup_and_is_idempotent(tmp_path: Path):
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+    b = backups.create(sg, root, "manual")
+
+    mirror_root = tmp_path / "mirror"
+    dest = backups.mirror(b.path, mirror_root)
+    assert dest == mirror_root / b.name
+    assert (dest / "0" / "world" / "Level.sav").read_bytes() == b"x" * 1024
+
+    # A retry must not blow up on the existing copy.
+    assert backups.mirror(b.path, mirror_root) == dest
+    # Same layout as backup_root, so listing/prune work on the mirror too.
+    assert [x.name for x in backups.listing(mirror_root)] == [b.name]
+
+
 def test_prune_keeps_newest_and_pre_restore(tmp_path: Path):
     root = tmp_path / "backups"
     root.mkdir()

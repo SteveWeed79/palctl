@@ -24,19 +24,27 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 
-from . import procs
+from . import procs  # noqa: F401  (tests patch service control through this module)
 from .api import PalApi
 from .config import Config
+from .control import ServerController
 from .events import Event, EventBus
 
 COOLDOWN = timedelta(minutes=20)
 
 
 class Watchdog:
-    def __init__(self, cfg: Config, api: PalApi, bus: EventBus) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        api: PalApi,
+        bus: EventBus,
+        control: ServerController | None = None,
+    ) -> None:
         self._cfg = cfg
         self._api = api
         self._bus = bus
+        self._control = control or ServerController(cfg, api)
         self._over = 0
         self._last_restart: datetime | None = None
         self._restarting = False
@@ -49,6 +57,7 @@ class Watchdog:
     def reconfigure(self, cfg: Config, api: PalApi) -> None:
         self._cfg = cfg
         self._api = api
+        self._control.reconfigure(cfg, api)
 
     async def run(self) -> None:
         while True:
@@ -133,11 +142,26 @@ class Watchdog:
         await self._restart(stats.memory_mb, len(players or []), hard)
 
     async def _restart(self, memory_mb: float, player_count: int, hard: bool) -> None:
+        op = self._control.try_operation("watchdog-restart")
+        if op is None:
+            # Another operation (update, restore, scheduled restart) owns the
+            # server. Skip — memory is still over the line, so the next tick
+            # re-evaluates once the server is free.
+            return
+
         self._restarting = True
         wd = self._cfg.watchdog
         warn = wd.warn_seconds if player_count else 5
 
         try:
+            await self._locked_restart(op, memory_mb, player_count, hard, warn)
+        finally:
+            self._restarting = False
+
+    async def _locked_restart(
+        self, op, memory_mb: float, player_count: int, hard: bool, warn: int
+    ) -> None:
+        async with op:
             await self._bus.emit(
                 Event(
                     "watchdog",
@@ -149,10 +173,7 @@ class Watchdog:
                 )
             )
 
-            try:
-                await self._api.save()
-            except Exception:
-                pass
+            await self._control.save_best_effort()
 
             # Graceful: the game warns players and counts down, then exits cleanly.
             try:
@@ -163,11 +184,7 @@ class Watchdog:
                 pass
 
             await asyncio.sleep(warn + 15)
-            await procs.stop_service(self._cfg.service_name)
-            await asyncio.sleep(3)
-            await procs.start_service(self._cfg.service_name)
-
-            came_back = await self._api.wait_until_alive(timeout=240)
+            came_back = await self._control.restart_cycle()
             self._last_restart = datetime.now(UTC)
             self._over = 0
             self._hold_notified = False
@@ -182,5 +199,3 @@ class Watchdog:
                     {"recovered": came_back, "action": "restarted"},
                 )
             )
-        finally:
-            self._restarting = False

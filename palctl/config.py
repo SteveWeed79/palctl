@@ -62,6 +62,12 @@ class WatchdogConfig:
     crash_confirm_polls: int = 3
     crash_restart_max_per_hour: int = 3
 
+    # Leak forecasting: fit the recent memory growth and act *before* the
+    # limit, instead of reacting at the threshold with players mid-session.
+    predict_notify: bool = True  # warn once when the limit is < horizon away
+    preempt_restart: bool = False  # opt-in: restart early while the server is empty
+    preempt_horizon_minutes: int = 90
+
 
 @dataclass
 class ScheduleConfig:
@@ -99,6 +105,9 @@ class Config:
     server_root: str = r"C:\steamcmd\steamapps\common\PalServer"
     steamcmd_path: str = r"C:\steamcmd\steamcmd.exe"
     backup_root: str = r"D:\PalworldBackups"
+    # Optional second copy of every backup — another disk or a network share.
+    # Backups on the server's own disk don't survive the disk. Empty = off.
+    backup_mirror: str = ""
     service_name: str = "PalServer"
     app_id: str = "2394010"
 
