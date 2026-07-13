@@ -87,3 +87,12 @@ def test_auth_middleware_rejects_missing_and_wrong_token():
         req = types.SimpleNamespace(headers=headers)
         res = asyncio.run(mw(req, _ok_handler))
         assert res.status == 401
+
+
+def test_auth_middleware_exempts_only_the_named_paths():
+    # "/" serves the dashboard page (no data); everything else keeps the gate.
+    mw = make_auth_middleware("s3cret", exempt=frozenset({"/"}))
+    page = types.SimpleNamespace(headers={}, path="/")
+    assert asyncio.run(mw(page, _ok_handler)) == "OK"
+    data = types.SimpleNamespace(headers={}, path="/state")
+    assert asyncio.run(mw(data, _ok_handler)).status == 401

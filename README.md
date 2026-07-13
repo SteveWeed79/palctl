@@ -54,14 +54,23 @@ PC, which is the situation most people are trying to get out of.
 
 **Daemon**
 - Memory-leak watchdog (consecutive-sample confirmation, player hold-off, hard limit, cooldown)
-- Scheduled restarts with in-game countdown, autosave, rotating backups
+- Leak **forecasting**: fits the actual memory growth curve and warns *before*
+  the limit — and, opt-in, restarts early at a moment the server happens to be
+  empty, instead of at the threshold later with players mid-session
+- Scheduled restarts with in-game countdown, autosave, rotating backups —
+  optionally **mirrored** to a second disk or network share (backups on the
+  server's own disk don't survive the disk)
 - Opt-in scheduled auto-update (Palworld patches constantly) — the same
-  save → backup → SteamCMD → restart flow as a manual update
+  save → backup → SteamCMD → restart flow as a manual update, world backup
+  included (updates are exactly when saves get eaten)
+- One **operation lock**: scheduled restarts, watchdog restarts, updates,
+  restores, and crash recovery can't fire into the middle of each other
 - Notifies when a newer server build is available, or a newer palctl release
 - Opt-in crash/hang auto-recovery: if the API stops answering while palctl didn't
   stop the server, it brings it back — rate-limited so a crash-loop isn't hammered
 - Join / leave / level-up events, synthesised by diffing the player list
 - Session + playtime tracking in SQLite (Palworld remembers none of this)
+- Metrics history in SQLite too, so the graphs survive a daemon restart
 - Server up/down detection
 - Rotating log file in `%APPDATA%/palctl/logs` (Palworld ships none)
 - Localhost control API gated by a per-user token, so only you (not any local
@@ -85,6 +94,22 @@ PC, which is the situation most people are trying to get out of.
   turns on the REST API, can install the server from Steam for you, registers both
   Windows services, then **starts the server and confirms the REST API answers** —
   and prints the address your friends connect to (with the port-forward reminder)
+
+**CLI** — `palctl`
+```
+palctl status | players | events | start | stop | restart | save
+       backup | backups | restore NAME | update | announce MSG | kick NAME | ban NAME | ui
+```
+Talks to the daemon's token-gated localhost API, so it works anywhere the
+daemon runs — ssh sessions, cron jobs, and the headless-Linux setup the GUI
+can't serve. `palctl kick zoe` resolves the name to a user ID for you.
+
+**Web dashboard** — `palctl ui`
+The daemon serves a read-only dashboard at `http://127.0.0.1:8830` (localhost
+only, like everything else): live status, FPS, players, a memory sparkline with
+the watchdog limit drawn in, and recent events. The page is static; the data
+calls need your per-user token, which `palctl ui` puts in the URL fragment —
+fragments never leave the browser.
 
 **Discord bot**
 `/status` `/players` `/playtime` `/announce` `/save` `/backup` `/backups` `/restore` `/restart` `/update` `/kick` `/ban`
@@ -176,8 +201,10 @@ and paths resolve under `~/.steam` / `LinuxServer/`. Register the daemon with:
 python -m palctl.daemon install-service   # writes a systemd unit, enables it
 ```
 
-The desktop GUI/wizard are Windows-first; on a headless Linux host you drive the
-daemon via its config, the Discord bot, and the service CLI.
+The desktop GUI/wizard are Windows-first; on a headless Linux host you drive
+the daemon with the **`palctl` CLI**, the **web dashboard** (`palctl ui`
+prints the tokened URL — open it in a local browser or over an ssh tunnel),
+the Discord bot, and the service CLI.
 
 ### winget
 
@@ -197,8 +224,10 @@ GUI's Config tab. Restart the daemon.
 
 The platform-neutral core (ini parser, backups, session tracking, config,
 scheduler, path detection, the SteamCMD argv/ini-guard, NSSM command building,
-and the REST-API bootstrap) is covered by tests that run on any OS — only the
-daemon's service control, the actual downloads, and the GUI need Windows.
+the REST-API bootstrap, the server-operation lock, the memory watchdog's
+hold-off logic, the leak forecaster, and the CLI) is covered by tests that run
+on any OS — only the daemon's service control, the actual downloads, and the
+GUI need Windows.
 
 ```
 pip install -e .[dev]

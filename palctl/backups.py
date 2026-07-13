@@ -66,6 +66,22 @@ def restore(backup_root: Path, name: str, savegames: Path) -> None:
     shutil.copytree(src, savegames)
 
 
+def mirror(backup_path: Path, mirror_root: Path) -> Path:
+    """
+    Copy a finished backup to a second location — ideally another disk or a
+    network share. Rotating backups onto the same disk as the server protect
+    against a bad update, not a dead drive; this is the honest half of the
+    backup story. Same layout as backup_root, so listing() and prune() work
+    on the mirror too.
+    """
+    mirror_root.mkdir(parents=True, exist_ok=True)
+    dest = mirror_root / backup_path.name
+    if dest.exists():
+        return dest  # already mirrored (e.g. a retry)
+    shutil.copytree(backup_path, dest)
+    return dest
+
+
 def delete(backup_root: Path, name: str) -> None:
     target = backup_root / name
     if not target.is_dir() or ".." in name or "/" in name or "\\" in name:

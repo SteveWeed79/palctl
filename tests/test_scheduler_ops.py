@@ -107,6 +107,66 @@ def test_update_server_restores_blanked_ini(tmp_path, monkeypatch):
     assert any("restored it" in e.message for e in events)
 
 
+def test_update_server_takes_pre_update_backup(tmp_path, monkeypatch):
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path / "server")
+    cfg.backup_root = str(tmp_path / "backups")
+    # A real SaveGames to back up — updates are when saves get eaten.
+    sg = cfg.savegames_dir
+    sg.mkdir(parents=True)
+    (sg / "Level.sav").write_bytes(b"world")
+
+    _patch_service(monkeypatch, [])
+
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+        return 0
+
+    monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
+    monkeypatch.setattr(sched_mod.steamcmd, "backup_file", lambda p: None)
+    monkeypatch.setattr(sched_mod, "is_blank", lambda p: False)
+
+    bus = EventBus()
+    events = _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+
+    made = [d.name for d in Path(cfg.backup_root).iterdir()]
+    assert len(made) == 1 and made[0].endswith("-pre-update")
+    assert not any("Pre-update backup failed" in e.message for e in events)
+
+
+def test_update_server_mirrors_backup_when_configured(tmp_path, monkeypatch):
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path / "server")
+    cfg.backup_root = str(tmp_path / "backups")
+    cfg.backup_mirror = str(tmp_path / "mirror")
+    sg = cfg.savegames_dir
+    sg.mkdir(parents=True)
+    (sg / "Level.sav").write_bytes(b"world")
+
+    _patch_service(monkeypatch, [])
+
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+        return 0
+
+    monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
+    monkeypatch.setattr(sched_mod.steamcmd, "backup_file", lambda p: None)
+    monkeypatch.setattr(sched_mod, "is_blank", lambda p: False)
+
+    bus = EventBus()
+    _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+
+    primary = [d.name for d in Path(cfg.backup_root).iterdir()]
+    mirrored = [d.name for d in Path(cfg.backup_mirror).iterdir()]
+    assert primary == mirrored and len(mirrored) == 1
+
+
 def test_update_server_aborts_without_steamcmd(tmp_path, monkeypatch):
     cfg = Config()
     cfg.steamcmd_path = str(tmp_path / "missing-steamcmd.exe")

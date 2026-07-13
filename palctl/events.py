@@ -109,6 +109,21 @@ class SessionStore:
             )
             """
         )
+        # One row per poll. This is what lets GUI graphs survive a daemon
+        # restart, and what the leak forecaster fits its line to.
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS metrics (
+                at         REAL NOT NULL,
+                fps        INTEGER,
+                frame_time REAL,
+                players    INTEGER,
+                memory_mb  REAL,
+                cpu        REAL
+            )
+            """
+        )
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_metrics_at ON metrics(at)")
         # Sessions a previous daemon run never closed can't be closed correctly
         # (we don't know when the player left), and they'd shadow the player's
         # next real session in close_session(). Close them at zero length.
@@ -155,6 +170,43 @@ class SessionStore:
                 datetime.fromisoformat(left) - datetime.fromisoformat(joined)
             ).total_seconds() / 60
         return total
+
+    METRICS_RETAIN_SECONDS = 7 * 24 * 3600
+
+    def log_metrics(self, s: dict) -> None:
+        """Persist one poll sample (a dict with at/fps/frame_time/players/
+        memory_mb/cpu). Prunes anything past retention on the way in — at one
+        row per poll the delete is cheap and the table stays ~60k rows."""
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO metrics (at, fps, frame_time, players, memory_mb, cpu) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    s.get("at", 0.0),
+                    s.get("fps", 0),
+                    s.get("frame_time", 0.0),
+                    s.get("players", 0),
+                    s.get("memory_mb", 0.0),
+                    s.get("cpu", 0.0),
+                ),
+            )
+            self._db.execute(
+                "DELETE FROM metrics WHERE at < ?",
+                (s.get("at", 0.0) - self.METRICS_RETAIN_SECONDS,),
+            )
+            self._db.commit()
+
+    def recent_metrics(self, n: int = 720) -> list[dict]:
+        """The newest `n` samples, oldest first — the shape the daemon keeps
+        in memory and serves to the GUI."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT at, fps, frame_time, players, memory_mb, cpu "
+                "FROM metrics ORDER BY at DESC LIMIT ?",
+                (n,),
+            ).fetchall()
+        keys = ("at", "fps", "frame_time", "players", "memory_mb", "cpu")
+        return [dict(zip(keys, r, strict=True)) for r in reversed(rows)]
 
     def log_event(self, e: Event) -> None:
         with self._lock:

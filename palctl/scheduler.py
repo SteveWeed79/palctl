@@ -7,9 +7,10 @@ import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import backups, procs, steamcmd
+from . import backups, procs, steamcmd  # noqa: F401  (procs: tests patch service ctl here)
 from .api import PalApi
 from .config import Config
+from .control import ServerController
 from .events import Event, EventBus
 from .inifile import is_blank
 
@@ -31,14 +32,25 @@ def next_daily(now: datetime, time_str: str, fallback_hour: int = 6) -> datetime
 
 
 class Scheduler:
-    def __init__(self, cfg: Config, api: PalApi, bus: EventBus) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        api: PalApi,
+        bus: EventBus,
+        control: ServerController | None = None,
+    ) -> None:
         self._cfg = cfg
         self._api = api
         self._bus = bus
+        # The daemon passes its shared controller so scheduled restarts,
+        # updates, restores, the watchdog, and auto-recovery all serialise on
+        # one lock. Standalone construction (tests) gets a private one.
+        self._control = control or ServerController(cfg, api)
 
     def reconfigure(self, cfg: Config, api: PalApi) -> None:
         self._cfg = cfg
         self._api = api
+        self._control.reconfigure(cfg, api)
 
     async def run(self) -> None:
         await asyncio.gather(
@@ -72,15 +84,16 @@ class Scheduler:
             await self.backup_now("scheduled")
 
     async def backup_now(self, label: str = "manual") -> None:
-        from pathlib import Path
+        # Under the op lock: a backup mid-restore would copy a half-swapped
+        # SaveGames. update/restore call _do_backup directly from inside their
+        # own operation instead (the lock is not reentrant).
+        async with self._control.operation("backup"):
+            await self._do_backup(label)
 
+    async def _do_backup(self, label: str = "manual") -> backups.Backup | None:
         try:
             # Flush the world to disk first, or the backup is a few minutes stale.
-            try:
-                await self._api.save()
-                await asyncio.sleep(3)
-            except Exception:
-                pass
+            await self._control.save_best_effort(settle=3)
 
             b = await asyncio.to_thread(
                 backups.create,
@@ -92,16 +105,39 @@ class Scheduler:
                 backups.prune, Path(self._cfg.backup_root),
                 self._cfg.schedule.backup_retain,
             )
+            mirrored = await self._mirror(b)
             await self._bus.emit(
                 Event(
                     "backup",
                     f"📦 Backup `{b.name}` ({b.size_mb:.0f} MB)"
-                    + (f", pruned {len(pruned)}" if pruned else ""),
-                    {"name": b.name, "size_mb": b.size_mb},
+                    + (f", pruned {len(pruned)}" if pruned else "")
+                    + (", mirrored" if mirrored else ""),
+                    {"name": b.name, "size_mb": b.size_mb, "mirrored": mirrored},
                 )
             )
+            return b
         except Exception as e:
             await self._bus.emit(Event("error", f"Backup failed: {e}"))
+            return None
+
+    async def _mirror(self, b: backups.Backup) -> bool:
+        """Second copy onto another disk/share, if configured. A mirror failure
+        must not fail the backup — the primary copy already exists."""
+        root = self._cfg.backup_mirror
+        if not root:
+            return False
+        try:
+            await asyncio.to_thread(backups.mirror, b.path, Path(root))
+            await asyncio.to_thread(
+                backups.prune, Path(root), self._cfg.schedule.backup_retain
+            )
+            return True
+        except Exception as e:
+            await self._bus.emit(
+                Event("error", f"Backup mirror to {root} failed: {e} "
+                               "(the primary backup is fine).")
+            )
+            return False
 
     # ---------- daily restart ----------
 
@@ -166,39 +202,48 @@ class Scheduler:
         return False
 
     async def restart_with_countdown(self, reason: str) -> None:
-        """Announce, count down, save, restart. Also used by the GUI/bot buttons."""
-        await self._bus.emit(Event("restart", f"🔁 {reason} — counting down."))
+        """Announce, count down, save, restart. Also used by the GUI/bot buttons.
 
-        prev = COUNTDOWN_MARKS[0]
-        for mark in COUNTDOWN_MARKS:
-            await asyncio.sleep(max(0, prev - mark))
-            prev = mark
-            label = f"{mark // 60} minute(s)" if mark >= 60 else f"{mark} seconds"
-            try:
-                await self._api.announce(f"{reason} in {label}.")
-            except Exception:
-                pass
+        Holds the op lock for the whole countdown, so an update or a watchdog
+        restart can't fire into the middle of it."""
+        async with self._control.operation("restart"):
+            await self._bus.emit(Event("restart", f"🔁 {reason} — counting down."))
 
-        await asyncio.sleep(prev)
+            prev = COUNTDOWN_MARKS[0]
+            for mark in COUNTDOWN_MARKS:
+                await asyncio.sleep(max(0, prev - mark))
+                prev = mark
+                label = f"{mark // 60} minute(s)" if mark >= 60 else f"{mark} seconds"
+                try:
+                    await self._api.announce(f"{reason} in {label}.")
+                except Exception:
+                    pass
 
-        try:
-            await self._api.save()
-            await asyncio.sleep(3)
-        except Exception:
-            pass
-
-        await procs.stop_service(self._cfg.service_name)
-        await asyncio.sleep(3)
-        await procs.start_service(self._cfg.service_name)
-
-        ok = await self._api.wait_until_alive(timeout=240)
-        await self._bus.emit(
-            Event(
-                "restart",
-                "✅ Server back up." if ok else "❌ Server did not come back up.",
-                {"recovered": ok},
+            await asyncio.sleep(prev)
+            await self._control.save_best_effort(settle=3)
+            ok = await self._control.restart_cycle()
+            await self._bus.emit(
+                Event(
+                    "restart",
+                    "✅ Server back up." if ok else "❌ Server did not come back up.",
+                    {"recovered": ok},
+                )
             )
-        )
+
+    async def restart_quick(self, reason: str) -> None:
+        """Save and restart with no countdown. For moments when there's nobody
+        to warn — the leak forecaster's empty-server pre-emptive restart."""
+        async with self._control.operation("restart"):
+            await self._bus.emit(Event("restart", f"🔁 {reason}"))
+            await self._control.save_best_effort(settle=3)
+            ok = await self._control.restart_cycle()
+            await self._bus.emit(
+                Event(
+                    "restart",
+                    "✅ Server back up." if ok else "❌ Server did not come back up.",
+                    {"recovered": ok},
+                )
+            )
 
     # ---------- restore ----------
 
@@ -217,35 +262,33 @@ class Scheduler:
             await self._bus.emit(Event("error", f"Restore aborted: no such backup '{name}'."))
             return
 
-        await self._bus.emit(
-            Event("restore", f"♻️ Restoring backup `{name}` — stopping the server.")
-        )
-        try:
+        async with self._control.operation("restore"):
+            await self._bus.emit(
+                Event("restore", f"♻️ Restoring backup `{name}` — stopping the server.")
+            )
             try:
-                await self._api.save()
-            except Exception:
-                pass
-            await procs.stop_service(cfg.service_name)
-            await asyncio.to_thread(
-                backups.restore, Path(cfg.backup_root), name, cfg.savegames_dir
-            )
-            await self._bus.emit(
-                Event("restore", f"📥 Restored `{name}`. Starting the server.")
-            )
-        except Exception as e:
-            await self._bus.emit(Event("error", f"Restore failed: {e}"))
-        finally:
-            await procs.start_service(cfg.service_name)
-            ok = await self._api.wait_until_alive(timeout=240)
-            await self._bus.emit(
-                Event(
-                    "restore",
-                    "✅ Server back up after restore."
-                    if ok
-                    else "❌ Server did not come back after the restore. Needs a look.",
-                    {"recovered": ok},
+                await self._control.save_best_effort()
+                await self._control.stop()
+                await asyncio.to_thread(
+                    backups.restore, Path(cfg.backup_root), name, cfg.savegames_dir
                 )
-            )
+                await self._bus.emit(
+                    Event("restore", f"📥 Restored `{name}`. Starting the server.")
+                )
+            except Exception as e:
+                await self._bus.emit(Event("error", f"Restore failed: {e}"))
+            finally:
+                await self._control.start()
+                ok = await self._api.wait_until_alive(timeout=240)
+                await self._bus.emit(
+                    Event(
+                        "restore",
+                        "✅ Server back up after restore."
+                        if ok
+                        else "❌ Server did not come back after the restore. Needs a look.",
+                        {"recovered": ok},
+                    )
+                )
 
     # ---------- server update (SteamCMD) ----------
 
@@ -271,15 +314,26 @@ class Scheduler:
             )
             return
 
+        async with self._control.operation("update"):
+            await self._update_locked(cfg, validate=validate)
+
+    async def _update_locked(self, cfg: Config, *, validate: bool) -> None:
         await self._bus.emit(
-            Event("update", "⏬ Server update starting — saving and stopping.")
+            Event("update", "⏬ Server update starting — backing up, saving, stopping.")
         )
         try:
-            try:
-                await self._api.save()
-            except Exception:
-                pass
-            await procs.stop_service(cfg.service_name)
+            # Game updates are exactly when save migration or corruption
+            # happens; a world backup first makes a bad update undoable.
+            b = await self._do_backup("pre-update")
+            if b is None:
+                await self._bus.emit(
+                    Event(
+                        "update",
+                        "⚠️ Pre-update backup failed (see the error above) — "
+                        "continuing with the update anyway.",
+                    )
+                )
+            await self._control.stop()
 
             ini = cfg.live_ini
             ini_backup = await asyncio.to_thread(steamcmd.backup_file, ini)
@@ -319,7 +373,7 @@ class Scheduler:
                 )
             )
         finally:
-            await procs.start_service(cfg.service_name)
+            await self._control.start()
             ok = await self._api.wait_until_alive(timeout=300)
             await self._bus.emit(
                 Event(
