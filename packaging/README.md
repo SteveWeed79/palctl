@@ -8,8 +8,8 @@ and isn't run by CI.
 
 | File | Purpose |
 |------|---------|
-| `daemon_entry.py`, `gui_entry.py` | PyInstaller entry points. Thin wrappers so the frozen exes import `palctl` as a package (relative imports break if you point PyInstaller straight at `palctl/daemon.py`). |
-| `palctl.spec` | PyInstaller spec. Builds `palctl-daemon.exe` (console) and `palctl-gui.exe` (windowed) into one `dist\palctl\` folder. |
+| `daemon_entry.py`, `gui_entry.py`, `cli_entry.py` | PyInstaller entry points. Thin wrappers so the frozen exes import `palctl` as a package (relative imports break if you point PyInstaller straight at `palctl/daemon.py`). |
+| `palctl.spec` | PyInstaller spec. Builds `palctl-daemon.exe` (console), `palctl-gui.exe` (windowed), and `palctl.exe` (the CLI) into one `dist\palctl\` folder. |
 | `installer.iss` | Inno Setup script. Installs the binaries, adds Start-Menu shortcuts, and optionally registers the palctl background service. |
 | `build.ps1` | Does both steps end to end. |
 
@@ -28,8 +28,10 @@ The installer lands in `packaging\Output\palctl-setup.exe`.
 
 ## What the installer does (and doesn't)
 
-- Installs `palctl-daemon.exe` + `palctl-gui.exe` to `Program Files\palctl`.
-- Adds Start-Menu (and optional desktop) shortcuts.
+- Installs `palctl-daemon.exe`, `palctl-gui.exe`, and the `palctl.exe` CLI to
+  `Program Files\palctl`.
+- Adds Start-Menu (and optional desktop) shortcuts, and can optionally add the
+  install dir to the PATH so `palctl` works in any terminal.
 - Optionally runs `palctl-daemon.exe install-service`, which downloads NSSM and
   registers **palctl-daemon** as an always-on Windows service.
 - Launches the GUI, whose **first-run wizard** finishes the job: auto-detect the

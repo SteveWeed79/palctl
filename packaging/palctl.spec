@@ -41,6 +41,15 @@ gui_a = Analysis(
     hiddenimports=hiddenimports,
     noarchive=False,
 )
+# The command-line client. It only needs httpx + keyring, but it shares the
+# full hiddenimports list — COLLECT de-duplicates against the daemon anyway,
+# and one list means one place to fix a missing module.
+cli_a = Analysis(
+    ["cli_entry.py"],
+    pathex=[".."],
+    hiddenimports=hiddenimports,
+    noarchive=False,
+)
 
 daemon_pyz = PYZ(daemon_a.pure)
 daemon_exe = EXE(
@@ -62,6 +71,16 @@ gui_exe = EXE(
     console=False,  # windowed
 )
 
+cli_pyz = PYZ(cli_a.pure)
+cli_exe = EXE(
+    cli_pyz,
+    cli_a.scripts,
+    [],
+    exclude_binaries=True,
+    name="palctl",
+    console=True,   # it IS a console program
+)
+
 # One folder with both exes; COLLECT de-duplicates the shared Qt / Python runtime.
 COLLECT(
     daemon_exe,
@@ -72,5 +91,9 @@ COLLECT(
     gui_a.binaries,
     gui_a.zipfiles,
     gui_a.datas,
+    cli_exe,
+    cli_a.binaries,
+    cli_a.zipfiles,
+    cli_a.datas,
     name="palctl",
 )
