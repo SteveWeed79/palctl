@@ -55,3 +55,17 @@ def test_corrupt_config_quarantined_not_fatal(cfg_path: Path):
     assert loaded.api_port == 8212  # defaults
     assert not cfg_path.exists()
     assert cfg_path.with_suffix(".json.broken").exists()
+
+
+def test_secret_reads_survive_missing_keyring_backend(monkeypatch: pytest.MonkeyPatch):
+    # Headless Linux often has no keyring backend; keyring raises instead of
+    # returning None. A secret read must degrade to "" — not crash-loop the
+    # daemon at startup under systemd.
+    import keyring
+
+    def explode(service, name):
+        raise keyring.errors.NoKeyringError("no backend")
+
+    monkeypatch.setattr(config_mod.keyring, "get_password", explode)
+    assert config_mod.get_admin_password() == ""
+    assert config_mod.get_discord_token() == ""

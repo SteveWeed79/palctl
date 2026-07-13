@@ -179,6 +179,19 @@ class Config:
 
 # ---------------- secrets ----------------
 # Stored in Windows Credential Manager (DPAPI). Never written to config.json.
+#
+# Reads must never crash the daemon: a headless Linux box often has no keyring
+# backend at all (no DBus/SecretService), and keyring raises NoKeyringError
+# rather than returning nothing. Missing secret == empty string; the REST API
+# then rejects the empty password, which is a visible, recoverable failure.
+# Writes still raise — someone actively saving a secret must see the error.
+
+
+def _get_secret(name: str) -> str:
+    try:
+        return keyring.get_password(SERVICE_ID, name) or ""
+    except keyring.errors.KeyringError:
+        return ""
 
 
 def set_admin_password(password: str) -> None:
@@ -186,7 +199,7 @@ def set_admin_password(password: str) -> None:
 
 
 def get_admin_password() -> str:
-    return keyring.get_password(SERVICE_ID, "admin_password") or ""
+    return _get_secret("admin_password")
 
 
 def set_discord_token(token: str) -> None:
@@ -194,11 +207,12 @@ def set_discord_token(token: str) -> None:
 
 
 def get_discord_token() -> str:
-    return keyring.get_password(SERVICE_ID, "discord_token") or ""
+    return _get_secret("discord_token")
 
 
 def clear_secret(name: str) -> None:
     try:
         keyring.delete_password(SERVICE_ID, name)
-    except keyring.errors.PasswordDeleteError:
+    except keyring.errors.KeyringError:
+        # Covers both "no such secret" and "no keyring backend at all".
         pass
