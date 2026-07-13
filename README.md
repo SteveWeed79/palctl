@@ -129,6 +129,13 @@ fetch it; it just can't conjure it from nothing.
 > says so explicitly. `palctl` only ever talks to `127.0.0.1`. Don't
 > port-forward 8212.
 
+> **The installer isn't code-signed.** palctl is free and hasn't bought a
+> certificate, so Windows SmartScreen shows a one-time *"Windows protected your
+> PC"* prompt — click **More info → Run anyway**. Every release ships a
+> `SHA256SUMS.txt` so you can confirm the download matches what CI built. Removing
+> the prompt for free is on the roadmap via SignPath Foundation's open-source
+> code-signing program.
+
 ### Option B — from source
 
 **Requires:** Windows, Python 3.11+.

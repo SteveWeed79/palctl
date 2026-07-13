@@ -44,6 +44,25 @@ jobs:
       - name: Package the portable build
         run: Compress-Archive -Path dist\palctl\* -DestinationPath palctl-portable.zip
 
+      # --- Optional code signing goes here ---------------------------------
+      # palctl ships unsigned, so Windows SmartScreen shows a one-time
+      # "More info -> Run anyway" prompt. To remove it WITHOUT paying, sign with
+      # SignPath Foundation (free for open-source projects). Add its signing
+      # action after this line and before the checksum step, then the published
+      # hashes will cover the signed binaries. (Azure Trusted Signing, ~$10/mo,
+      # is the paid alternative — same spot.)
+      # --------------------------------------------------------------------
+
+      - name: Generate SHA256 checksums
+        # Free integrity check: users can confirm the download matches what CI
+        # built, whether or not it's signed.
+        run: |
+          $items = "packaging\Output\palctl-setup.exe", "palctl-portable.zip"
+          $items | ForEach-Object {
+            (Get-FileHash $_ -Algorithm SHA256).Hash + "  " + (Split-Path $_ -Leaf)
+          } | Set-Content SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+
       - name: Attach artifacts to a draft release
         uses: softprops/action-gh-release@v2
         with:
@@ -51,3 +70,4 @@ jobs:
           files: |
             packaging/Output/palctl-setup.exe
             palctl-portable.zip
+            SHA256SUMS.txt
