@@ -42,11 +42,20 @@ class Daemon:
         self.scheduler = Scheduler(self.cfg, self.api, self.bus)
         self.watchdog = Watchdog(self.cfg, self.api, self.bus)
 
-        self._alive = False
+        # None = haven't polled yet; don't announce "up" just because the
+        # daemon (not the server) was restarted.
+        self._alive: bool | None = None
         self._last_metrics = None
         self._history: list[dict] = []  # rolling metrics, for the GUI graphs
+        self._tasks: set[asyncio.Task] = set()
 
         self.bus.on_any(self._persist)
+
+    def _spawn(self, coro) -> None:
+        # asyncio holds only weak refs to tasks; keep one or it can be GC'd mid-run.
+        t = asyncio.create_task(coro)
+        self._tasks.add(t)
+        t.add_done_callback(self._tasks.discard)
 
     async def _persist(self, e: Event) -> None:
         await asyncio.to_thread(self.store.log_event, e)
@@ -67,14 +76,14 @@ class Daemon:
             players = await self.api.players()
         except PalApiError:
             if self._alive:
-                self._alive = False
                 await self.tracker.handle_server_down()
                 await self.bus.emit(Event("server_down", "🔴 Server is **down**."))
+            self._alive = False
             return
 
-        if not self._alive:
-            self._alive = True
+        if self._alive is False:
             await self.bus.emit(Event("server_up", "🟢 Server is **up**."))
+        self._alive = True
 
         await self.tracker.update(players)
 
@@ -126,7 +135,7 @@ class Daemon:
                         await self.api.save()
                     await procs.stop_service(self.cfg.service_name)
                 elif what == "restart":
-                    asyncio.create_task(
+                    self._spawn(
                         self.scheduler.restart_with_countdown(
                             body.get("reason", "Admin restart")
                         )
@@ -136,7 +145,7 @@ class Daemon:
                 elif what == "save":
                     await self.api.save()
                 elif what == "backup":
-                    asyncio.create_task(self.scheduler.backup_now("gui"))
+                    self._spawn(self.scheduler.backup_now("gui"))
                 elif what == "kick":
                     await self.api.kick(body["user_id"], body.get("reason", ""))
                 elif what == "ban":
@@ -146,6 +155,10 @@ class Daemon:
                     self.api = PalApi(
                         self.cfg.api_host, self.cfg.api_port, get_admin_password()
                     )
+                    # The workers hold their own cfg/api references; swap them
+                    # too or the reload silently changes nothing.
+                    self.scheduler.reconfigure(self.cfg, self.api)
+                    self.watchdog.reconfigure(self.cfg, self.api)
                 else:
                     return web.json_response({"error": f"unknown action {what}"}, status=400)
             except Exception as e:

@@ -20,6 +20,10 @@ class Scheduler:
         self._api = api
         self._bus = bus
 
+    def reconfigure(self, cfg: Config, api: PalApi) -> None:
+        self._cfg = cfg
+        self._api = api
+
     async def run(self) -> None:
         await asyncio.gather(
             self._autosave_loop(),
@@ -85,11 +89,14 @@ class Scheduler:
     # ---------- daily restart ----------
 
     def _next_restart(self) -> datetime:
-        hh, _, mm = self._cfg.schedule.daily_restart_at.partition(":")
-        target = datetime.now().replace(
-            hour=int(hh), minute=int(mm or 0), second=0, microsecond=0
-        )
-        if target <= datetime.now():
+        now = datetime.now()
+        try:
+            hh, _, mm = self._cfg.schedule.daily_restart_at.partition(":")
+            target = now.replace(hour=int(hh), minute=int(mm or 0), second=0, microsecond=0)
+        except ValueError:
+            # A malformed time in config.json must not kill the daemon.
+            target = now.replace(hour=6, minute=0, second=0, microsecond=0)
+        if target <= now:
             target += timedelta(days=1)
         return target
 

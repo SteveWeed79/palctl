@@ -53,6 +53,7 @@ class PalBot(discord.Client):
         self._bus = bus
         self._store = store
         self._sched = scheduler
+        self._bg_tasks: set[asyncio.Task] = set()
         self._register()
         bus.on_any(self._on_event)
 
@@ -63,6 +64,12 @@ class PalBot(discord.Client):
         if not cid:
             return None
         ch = self.get_channel(cid)
+        if ch is None:
+            # Not in the cache yet (e.g. right after connect) — ask the API.
+            try:
+                ch = await self.fetch_channel(cid)
+            except discord.DiscordException:
+                return None
         return ch if isinstance(ch, discord.abc.Messageable) else None
 
     async def _on_event(self, e: Event) -> None:
@@ -235,7 +242,10 @@ class PalBot(discord.Client):
             await interaction.response.send_message(
                 f"🔁 Restarting with countdown — *{reason}*. I'll report back."
             )
-            asyncio.create_task(self._sched.restart_with_countdown(reason))
+            # asyncio holds only weak refs to tasks; keep one for the countdown.
+            task = asyncio.create_task(self._sched.restart_with_countdown(reason))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
 
         @tree.command(name="kick", description="Kick a player")
         async def kick(
@@ -299,3 +309,7 @@ async def run_bot(cfg: Config, api: PalApi, bus: EventBus, store: SessionStore, 
         await bus.emit(
             Event("error", "Discord token rejected. Re-enter it in palctl Settings.")
         )
+    except Exception as e:
+        # The bot is optional; it must never take the watchdog and scheduler
+        # down with it (they all run in the same asyncio.gather).
+        await bus.emit(Event("error", f"Discord bot stopped: {e}"))

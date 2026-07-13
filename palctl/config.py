@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 import keyring
@@ -31,6 +31,12 @@ def config_dir() -> Path:
 
 
 CONFIG_PATH = config_dir() / "config.json"
+
+
+def _known(cls: type, raw: dict, exclude: tuple[str, ...] = ()) -> dict:
+    """Drop keys written by a different palctl version that this one doesn't know."""
+    names = {f.name for f in fields(cls)} - set(exclude)  # type: ignore[arg-type]
+    return {k: v for k, v in raw.items() if k in names}
 
 
 @dataclass
@@ -111,16 +117,21 @@ class Config:
     def load(cls) -> "Config":
         if not CONFIG_PATH.exists():
             return cls()
-        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        return cls(
-            **{
-                **{k: v for k, v in raw.items()
-                   if k not in ("watchdog", "schedule", "discord")},
-                "watchdog": WatchdogConfig(**raw.get("watchdog", {})),
-                "schedule": ScheduleConfig(**raw.get("schedule", {})),
-                "discord": DiscordConfig(**raw.get("discord", {})),
-            }
-        )
+        try:
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            return cls(
+                **{
+                    **_known(cls, raw, exclude=("watchdog", "schedule", "discord")),
+                    "watchdog": WatchdogConfig(**_known(WatchdogConfig, raw.get("watchdog", {}))),
+                    "schedule": ScheduleConfig(**_known(ScheduleConfig, raw.get("schedule", {}))),
+                    "discord": DiscordConfig(**_known(DiscordConfig, raw.get("discord", {}))),
+                }
+            )
+        except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+            # A corrupt config must not crash-loop the daemon under NSSM.
+            # Set the file aside so the values can still be recovered by hand.
+            CONFIG_PATH.replace(CONFIG_PATH.with_suffix(".json.broken"))
+            return cls()
 
     def save(self) -> None:
         CONFIG_PATH.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")

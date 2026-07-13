@@ -417,8 +417,17 @@ class ConfigTab(QWidget):
         c.schedule.backup_hours = self.sch_backup.value()
 
         c.discord.enabled = self.dc_enabled.isChecked()
-        c.discord.channel_id = int(self.dc_channel.text() or 0)
-        c.discord.admin_role_id = int(self.dc_role.text() or 0)
+        try:
+            c.discord.channel_id = int(self.dc_channel.text().strip() or 0)
+            c.discord.admin_role_id = int(self.dc_role.text().strip() or 0)
+        except ValueError:
+            QMessageBox.warning(
+                self, "Invalid ID",
+                "Channel ID and Admin role ID must be numbers.\n"
+                "In Discord: Settings → Advanced → Developer Mode, then "
+                "right-click the channel/role → Copy ID.",
+            )
+            return
 
         c.save()
         set_admin_password(self.admin_pw.text())

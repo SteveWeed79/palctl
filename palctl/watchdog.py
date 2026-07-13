@@ -40,14 +40,20 @@ class Watchdog:
         self._over = 0
         self._last_restart: datetime | None = None
         self._restarting = False
+        self._hold_notified = False
 
     @property
     def is_restarting(self) -> bool:
         return self._restarting
 
+    def reconfigure(self, cfg: Config, api: PalApi) -> None:
+        self._cfg = cfg
+        self._api = api
+
     async def run(self) -> None:
-        wd = self._cfg.watchdog
         while True:
+            # Re-read every cycle so a config reload takes effect immediately.
+            wd = self._cfg.watchdog
             try:
                 if wd.enabled and not self._restarting:
                     await self._tick()
@@ -65,6 +71,7 @@ class Watchdog:
 
         if stats.memory_mb < wd.memory_limit_mb:
             self._over = 0
+            self._hold_notified = False
             return
 
         self._over += 1
@@ -83,18 +90,21 @@ class Watchdog:
             pass
 
         if players and wd.skip_if_players_online and not hard:
-            await self._bus.emit(
-                Event(
-                    "watchdog",
-                    f"⚠️ Memory at **{stats.memory_mb:,.0f} MB** (limit "
-                    f"{wd.memory_limit_mb:,}) but {len(players)} player(s) online — "
-                    f"holding off. Will force a restart above "
-                    f"{wd.hard_limit_mb:,} MB.",
-                    {"memory_mb": stats.memory_mb, "players": len(players),
-                     "action": "deferred"},
+            # Keep _over as-is: the moment the last player leaves (or memory
+            # crosses the hard limit) the restart fires without re-confirming.
+            if not self._hold_notified:
+                await self._bus.emit(
+                    Event(
+                        "watchdog",
+                        f"⚠️ Memory at **{stats.memory_mb:,.0f} MB** (limit "
+                        f"{wd.memory_limit_mb:,}) but {len(players)} player(s) online — "
+                        f"holding off. Will force a restart above "
+                        f"{wd.hard_limit_mb:,} MB.",
+                        {"memory_mb": stats.memory_mb, "players": len(players),
+                         "action": "deferred"},
+                    )
                 )
-            )
-            self._over = 0  # re-arm; don't spam every poll
+                self._hold_notified = True
             return
 
         await self._restart(stats.memory_mb, len(players), hard)
@@ -137,6 +147,7 @@ class Watchdog:
             came_back = await self._api.wait_until_alive(timeout=240)
             self._last_restart = datetime.now(timezone.utc)
             self._over = 0
+            self._hold_notified = False
 
             await self._bus.emit(
                 Event(

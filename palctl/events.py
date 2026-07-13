@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -85,6 +86,9 @@ class SessionStore:
 
     def __init__(self, path: Path = DB_PATH) -> None:
         self._db = sqlite3.connect(path, check_same_thread=False)
+        # log_event runs on worker threads (asyncio.to_thread) while the loop
+        # thread reads/writes sessions; one lock serialises all access.
+        self._lock = threading.Lock()
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS sessions (
@@ -107,39 +111,46 @@ class SessionStore:
             )
             """
         )
+        # Sessions a previous daemon run never closed can't be closed correctly
+        # (we don't know when the player left), and they'd shadow the player's
+        # next real session in close_session(). Close them at zero length.
+        self._db.execute("UPDATE sessions SET left_at = joined_at WHERE left_at IS NULL")
         self._db.commit()
 
     def open_session(self, p: Player) -> None:
-        self._db.execute(
-            "INSERT INTO sessions (user_id, name, joined_at, level_start) VALUES (?,?,?,?)",
-            (p.user_id, p.name, datetime.now(timezone.utc).isoformat(), p.level),
-        )
-        self._db.commit()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO sessions (user_id, name, joined_at, level_start) VALUES (?,?,?,?)",
+                (p.user_id, p.name, datetime.now(timezone.utc).isoformat(), p.level),
+            )
+            self._db.commit()
 
     def close_session(self, user_id: str, level: int) -> float:
         """Returns session length in minutes."""
-        row = self._db.execute(
-            "SELECT rowid, joined_at FROM sessions "
-            "WHERE user_id=? AND left_at IS NULL ORDER BY rowid DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        if not row:
-            return 0.0
+        with self._lock:
+            row = self._db.execute(
+                "SELECT rowid, joined_at FROM sessions "
+                "WHERE user_id=? AND left_at IS NULL ORDER BY rowid DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if not row:
+                return 0.0
 
-        rowid, joined_at = row
-        now = datetime.now(timezone.utc)
-        self._db.execute(
-            "UPDATE sessions SET left_at=?, level_end=? WHERE rowid=?",
-            (now.isoformat(), level, rowid),
-        )
-        self._db.commit()
-        return (now - datetime.fromisoformat(joined_at)).total_seconds() / 60
+            rowid, joined_at = row
+            now = datetime.now(timezone.utc)
+            self._db.execute(
+                "UPDATE sessions SET left_at=?, level_end=? WHERE rowid=?",
+                (now.isoformat(), level, rowid),
+            )
+            self._db.commit()
+            return (now - datetime.fromisoformat(joined_at)).total_seconds() / 60
 
     def total_playtime_minutes(self, user_id: str) -> float:
-        rows = self._db.execute(
-            "SELECT joined_at, left_at FROM sessions WHERE user_id=? AND left_at IS NOT NULL",
-            (user_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT joined_at, left_at FROM sessions WHERE user_id=? AND left_at IS NOT NULL",
+                (user_id,),
+            ).fetchall()
         total = 0.0
         for joined, left in rows:
             total += (
@@ -148,11 +159,12 @@ class SessionStore:
         return total
 
     def log_event(self, e: Event) -> None:
-        self._db.execute(
-            "INSERT INTO events (at, kind, message, data) VALUES (?,?,?,?)",
-            (e.at.isoformat(), e.kind, e.message, json.dumps(e.data)),
-        )
-        self._db.commit()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO events (at, kind, message, data) VALUES (?,?,?,?)",
+                (e.at.isoformat(), e.kind, e.message, json.dumps(e.data)),
+            )
+            self._db.commit()
 
 
 # ---------------- the differ ----------------

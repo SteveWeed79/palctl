@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import time
 from dataclasses import dataclass
 
 import psutil
@@ -59,7 +60,7 @@ def proc_stats() -> ProcStats | None:
                 memory_mb=mem,
                 cpu_percent=cpu,
                 threads=p.num_threads(),
-                uptime_seconds=max(0.0, psutil.time.time() - p.create_time()),
+                uptime_seconds=max(0.0, time.time() - p.create_time()),
             )
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return None
