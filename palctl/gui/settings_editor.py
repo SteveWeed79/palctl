@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..inifile import PalSettings, ValueKind, is_blank, seed_from_default
+from .widgets import NoScrollDoubleSpinBox, NoScrollSpinBox
 
 # Grouping is cosmetic but it's the difference between usable and a wall of 200
 # fields. Anything unmatched falls into "Other settings" and stays editable.
@@ -233,13 +234,13 @@ class SettingsEditor(QWidget):
             return w
 
         if kind == ValueKind.INT:
-            w = QSpinBox()
+            w = NoScrollSpinBox()
             w.setRange(int(lo) if lo is not None else -1, int(hi) if hi is not None else 1_000_000)
             w.setValue(int(value))  # type: ignore[arg-type]
             return w
 
         if kind == ValueKind.FLOAT:
-            w = QDoubleSpinBox()
+            w = NoScrollDoubleSpinBox()
             w.setDecimals(6)
             w.setSingleStep(0.1)
             w.setRange(float(lo) if lo is not None else -1.0,

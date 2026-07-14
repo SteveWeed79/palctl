@@ -7,3 +7,5 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+# Written by setuptools-scm at build/install time from the git tag.
+palctl/_version.py

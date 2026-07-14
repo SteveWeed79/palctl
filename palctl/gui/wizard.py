@@ -29,7 +29,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -42,6 +41,7 @@ from ..config import (
 )
 from ..discovery import detect_server_roots, detect_steamcmd, is_server_root, is_steamcmd
 from .main import PathPicker
+from .widgets import NoScrollSpinBox
 
 # Widely-recommended launch flags for the Palworld dedicated server.
 PALSERVER_ARGS = "-useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS"
@@ -292,7 +292,7 @@ class SetupWizard(QDialog):
 
         api = QGroupBox("REST API")
         af = QFormLayout(api)
-        self.port = QSpinBox()
+        self.port = NoScrollSpinBox()
         self.port.setRange(1, 65535)
         self.port.setValue(cfg.api_port)
         self.password = QLineEdit()

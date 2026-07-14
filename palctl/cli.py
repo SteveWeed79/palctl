@@ -97,6 +97,9 @@ def main(argv: list[str] | None = None) -> int:
         description="Drive the palctl daemon from a terminal. The daemon must be "
         "running (as your user) on this machine.",
     )
+    from . import __version__
+
+    p.add_argument("--version", action="version", version=f"palctl {__version__}")
     p.add_argument("--port", type=int, default=DAEMON_PORT, help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd", required=True)
 

@@ -27,31 +27,28 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # setuptools-scm reads the tag/history for the version
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Check the tag matches the project version
-        # The version lives in exactly one place: palctl/__init__.py (pyproject
-        # and the installer both derive from it). A tag that doesn't match it
-        # fails HERE, before anything builds — so a release can never again
-        # ship binaries that report a different version than their tag.
-        shell: pwsh
-        run: |
-          $tag = "${{ github.event.inputs.tag || github.ref_name }}".TrimStart("v")
-          $ver = python -c "import palctl; print(palctl.__version__)"
-          if ($tag -ne $ver) {
-            Write-Error "Tag '$tag' does not match palctl.__version__ '$ver'. Bump palctl/__init__.py and re-tag."
-            exit 1
-          }
-          echo "PALCTL_VERSION=$ver" >> $env:GITHUB_ENV
-
       - name: Install palctl and PyInstaller
+        # This writes palctl/_version.py from the git tag (setuptools-scm), so
+        # the built binaries report the tag's version — no code to bump, nothing
+        # to keep in sync, so the version can't disagree with the tag.
         run: |
           python -m pip install --upgrade pip
           pip install -e .
           pip install pyinstaller
+
+      - name: Resolve version from the tag
+        shell: pwsh
+        run: |
+          $ver = python -c "import palctl; print(palctl.__version__)"
+          Write-Host "Building palctl $ver"
+          echo "PALCTL_VERSION=$ver" >> $env:GITHUB_ENV
 
       - name: Build binaries
         working-directory: packaging

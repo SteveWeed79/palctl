@@ -637,7 +637,10 @@ def uninstall_service() -> None:
 def main() -> None:
     import argparse
 
+    from . import __version__
+
     parser = argparse.ArgumentParser(prog="palctl-daemon")
+    parser.add_argument("--version", action="version", version=f"palctl {__version__}")
     parser.add_argument(
         "command",
         nargs="?",

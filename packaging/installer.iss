@@ -22,6 +22,11 @@
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
+; A fixed AppId is what makes re-running the installer a clean in-place UPGRADE
+; rather than a second parallel install: Inno recognises the existing palctl,
+; installs to the same folder, and leaves the user's %APPDATA% config alone.
+; Never change this GUID once released.
+AppId={{8F2A6B14-3C9E-4D7A-BE85-1F0C6D9A2E37}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 OutputBaseFilename=palctl-setup
@@ -33,6 +38,9 @@ PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64compatible
 DisableProgramGroupPage=yes
 WizardStyle=modern
+; On upgrade, let Restart Manager close the GUI if it's holding a file.
+CloseApplications=yes
+RestartApplications=no
 
 [Files]
 ; The whole PyInstaller onedir output.
@@ -71,6 +79,18 @@ begin
   end;
   { Look for the dir bracketed by semicolons, case-insensitively. }
   Result := Pos(';' + Uppercase(Param) + ';', ';' + Uppercase(OrigPath) + ';') = 0;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  { On an upgrade the palctl-daemon service holds palctl-daemon.exe open, which
+    would block the file copy. Stop it first (best-effort — fine if it isn't
+    registered); the daemonservice [Run] step starts it again afterward. }
+  Exec(ExpandConstant('{sys}\net.exe'), 'stop palctl-daemon', '',
+    SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := '';
 end;
 
 [Run]
