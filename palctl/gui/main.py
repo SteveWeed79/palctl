@@ -548,6 +548,19 @@ class ConfigTab(QWidget):
         self.dc_role = QLineEdit(str(cfg.discord.admin_role_id or ""))
         df.addRow("Enabled", self.dc_enabled)
         df.addRow("Bot token", self.dc_token)
+        # A clickable path to the token, so nobody has to hunt for the portal.
+        # Discord tokens aren't scope-parameterised like a GitHub PAT URL, so we
+        # link the page and spell out the two scopes the invite needs.
+        token_help = QLabel(
+            'No token yet? <a href="https://discord.com/developers/applications">'
+            "Open the Discord Developer Portal</a> → <b>New Application</b> → "
+            "<b>Bot</b> → <b>Reset Token</b> → Copy it here. Then invite the bot "
+            "to your server with the <b>bot</b> and <b>applications.commands</b> "
+            "scopes."
+        )
+        token_help.setOpenExternalLinks(True)
+        token_help.setWordWrap(True)
+        df.addRow(token_help)
         df.addRow("Channel ID", self.dc_channel)
         df.addRow("Admin role ID", self.dc_role)
         df.addRow(
