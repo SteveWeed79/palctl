@@ -34,13 +34,12 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
-    QSpinBox,
+    QScrollArea,
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
     QTextEdit,
-    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -62,6 +61,7 @@ from ..discovery import (
 )
 from ..localauth import TOKEN_HEADER, get_or_create_token
 from .settings_editor import SettingsEditor
+from .widgets import NoScrollSpinBox, NoScrollTimeEdit
 
 DAEMON = f"http://127.0.0.1:{DAEMON_PORT}"
 
@@ -469,7 +469,16 @@ class ConfigTab(QWidget):
     def __init__(self, cfg: Config) -> None:
         super().__init__()
         self._cfg = cfg
-        v = QVBoxLayout(self)
+        # Everything lives inside a scroll area so the tab doesn't force a huge
+        # minimum window size (the "rigid, won't resize" complaint) and scrolls
+        # cleanly on small screens.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(widgetResizable=True)
+        outer.addWidget(scroll)
+        inner = QWidget()
+        scroll.setWidget(inner)
+        v = QVBoxLayout(inner)
 
         paths = QGroupBox("Paths")
         pf = QFormLayout(paths)
@@ -496,7 +505,7 @@ class ConfigTab(QWidget):
 
         api = QGroupBox("REST API")
         af = QFormLayout(api)
-        self.api_port = QSpinBox()
+        self.api_port = NoScrollSpinBox()
         self.api_port.setRange(1, 65535)
         self.api_port.setValue(cfg.api_port)
         self.admin_pw = QLineEdit(get_admin_password())
@@ -515,11 +524,11 @@ class ConfigTab(QWidget):
         wd = QGroupBox("Memory-leak watchdog")
         wf = QFormLayout(wd)
         self.wd_enabled = QCheckBox(checked=cfg.watchdog.enabled)
-        self.wd_limit = QSpinBox()
+        self.wd_limit = NoScrollSpinBox()
         self.wd_limit.setRange(1000, 64000)
         self.wd_limit.setSuffix(" MB")
         self.wd_limit.setValue(cfg.watchdog.memory_limit_mb)
-        self.wd_hard = QSpinBox()
+        self.wd_hard = NoScrollSpinBox()
         self.wd_hard.setRange(1000, 64000)
         self.wd_hard.setSuffix(" MB")
         self.wd_hard.setValue(cfg.watchdog.hard_limit_mb)
@@ -536,12 +545,12 @@ class ConfigTab(QWidget):
         sf = QFormLayout(sch)
         self.sch_enabled = QCheckBox(checked=cfg.schedule.enabled)
         self.sch_restart = QCheckBox(checked=cfg.schedule.daily_restart)
-        self.sch_time = QTimeEdit()
+        self.sch_time = NoScrollTimeEdit()
         from PySide6.QtCore import QTime
 
         hh, _, mm = cfg.schedule.daily_restart_at.partition(":")
         self.sch_time.setTime(QTime(int(hh), int(mm or 0)))
-        self.sch_backup = QSpinBox()
+        self.sch_backup = NoScrollSpinBox()
         self.sch_backup.setRange(1, 48)
         self.sch_backup.setSuffix(" h")
         self.sch_backup.setValue(cfg.schedule.backup_hours)
