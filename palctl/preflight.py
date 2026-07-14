@@ -73,12 +73,34 @@ def check_disk_space(server_root: str | Path, need_gb: float = DEFAULT_NEED_GB) 
     )
 
 
+def _palworld_server_running() -> bool:
+    """Best-effort: is a Palworld dedicated server process up? Lets us tell an
+    *expected* REST-port holder (the server palctl will manage) apart from a
+    genuine conflict."""
+    try:
+        from . import procs
+
+        return bool(procs.shipping_processes())
+    except Exception:
+        return False
+
+
 def check_port_free(port: int, host: str = "127.0.0.1") -> Check:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind((host, port))
         return Check(f"Port {port} free", True, "available")
     except OSError:
+        if _palworld_server_running():
+            # The most common adoption path: palctl is pointed at a server that's
+            # already running, so it legitimately holds the REST port. A red ✗
+            # telling the user to change the port would break their working
+            # config — RESTAPIPort *should* match it.
+            return Check(
+                f"Port {port} free", True,
+                "in use by your running Palworld server — expected; palctl "
+                "will manage it",
+            )
         return Check(
             f"Port {port} free", False, f"{host}:{port} is already in use",
             fix="Another program (maybe a server already running) holds it. "
@@ -186,7 +208,9 @@ def install_vcredist(on_line=None) -> int:
     try:
         if on_line:
             on_line("Downloading the Visual C++ runtime…")
-        with urllib.request.urlopen(VCREDIST_URL) as resp, path.open("wb") as f:
+        # Timeout so a hung CDN can't stall the wizard indefinitely. Integrity
+        # relies on the TLS connection to Microsoft's aka.ms host.
+        with urllib.request.urlopen(VCREDIST_URL, timeout=120) as resp, path.open("wb") as f:
             shutil.copyfileobj(resp, f)
         if on_line:
             on_line("Installing the Visual C++ runtime…")

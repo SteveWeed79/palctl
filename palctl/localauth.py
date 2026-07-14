@@ -14,6 +14,7 @@ between "my user" and "anyone logged in".
 
 from __future__ import annotations
 
+import os
 import secrets
 
 from .config import config_dir
@@ -37,18 +38,30 @@ def get_or_create_token() -> str:
         pass
 
     token = secrets.token_urlsafe(32)
+    # Create with 0o600 from the outset (O_EXCL) rather than write_text + chmod,
+    # which leaves a brief window where another local user could read the token.
+    # On POSIX the mode is applied at creation (minus umask, which never adds
+    # group/other bits here); on Windows mode is ignored but the per-user config
+    # dir is the real boundary anyway.
     try:
-        path.write_text(token, encoding="utf-8")
-        # Best-effort tighten on POSIX; on Windows the per-user config dir is the
-        # boundary that matters and chmod is a no-op.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Another process created it between our read above and now — prefer the
+        # persisted value so the daemon and GUI agree.
         try:
-            import os
-
-            os.chmod(path, 0o600)
+            existing = path.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
         except OSError:
             pass
+        return token
     except OSError:
-        # If we can't persist it, the daemon and GUI can't agree on a token and
-        # the GUI will get 401s — a safe (closed) failure, not an open one.
+        # Can't persist it: the daemon and GUI can't agree on a token and the
+        # GUI gets 401s — a safe (closed) failure, not an open one.
+        return token
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(token)
+    except OSError:
         pass
     return token

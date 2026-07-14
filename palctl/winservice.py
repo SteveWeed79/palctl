@@ -72,6 +72,11 @@ def install_commands(
         the AdminPassword already sitting in PalWorldSettings.ini).
     """
     cmds: list[list[str]] = [[str(nssm), "install", name, str(exe)]]
+    # `nssm install` no-ops when the service already exists, freezing the exe
+    # path at whatever the first install set — so a re-install could never
+    # repair a service registered at the wrong exe (the documented palctl-gui.exe
+    # bug). An explicit, idempotent `set Application` always corrects it.
+    cmds.append([str(nssm), "set", name, "Application", str(exe)])
     if args:
         cmds.append([str(nssm), "set", name, "AppParameters", args])
     if app_dir:
@@ -140,7 +145,9 @@ def ensure_nssm(cache_dir: Path, *, url: str = NSSM_URL, win64: bool = True) -> 
     with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
         tmp_path = Path(tmp.name)
     try:
-        with urllib.request.urlopen(url) as resp, tmp_path.open("wb") as f:
+        # Timeout so a hung/blocked CDN can't stall setup (or an uninstall)
+        # indefinitely. Integrity relies on the TLS connection to nssm.cc.
+        with urllib.request.urlopen(url, timeout=60) as resp, tmp_path.open("wb") as f:
             shutil.copyfileobj(resp, f)
         with tempfile.TemporaryDirectory() as td:
             with zipfile.ZipFile(tmp_path) as z:

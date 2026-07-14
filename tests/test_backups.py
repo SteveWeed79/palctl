@@ -54,6 +54,31 @@ def test_restore_and_delete_reject_traversal(tmp_path: Path, name: str):
         backups.delete(root, name)
 
 
+@pytest.mark.parametrize("name", ["", " ", "."])
+def test_restore_and_delete_reject_empty_and_dot(tmp_path: Path, name: str):
+    # "" and "." both collapse to backup_root itself; without the guard restore
+    # would copy the whole backups folder over the world and delete would rmtree
+    # every backup at once.
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+    backups.create(sg, root, "manual")
+    with pytest.raises(ValueError):
+        backups.restore(root, name, sg)
+    with pytest.raises(ValueError):
+        backups.delete(root, name)
+    # The guard must not have touched anything.
+    assert (sg / "0" / "world" / "Level.sav").exists()
+    assert len([d for d in root.iterdir() if d.is_dir()]) == 1
+
+
+def test_is_restorable(tmp_path: Path):
+    root = tmp_path / "backups"
+    (root / "2026-01-01_00-00-00-manual").mkdir(parents=True)
+    assert backups.is_restorable(root, "2026-01-01_00-00-00-manual") is True
+    for bad in ("", " ", ".", "..", "nope", "../etc", "a/b"):
+        assert backups.is_restorable(root, bad) is False
+
+
 def test_mirror_copies_backup_and_is_idempotent(tmp_path: Path):
     sg = make_savegames(tmp_path)
     root = tmp_path / "backups"
@@ -68,6 +93,15 @@ def test_mirror_copies_backup_and_is_idempotent(tmp_path: Path):
     assert backups.mirror(b.path, mirror_root) == dest
     # Same layout as backup_root, so listing/prune work on the mirror too.
     assert [x.name for x in backups.listing(mirror_root)] == [b.name]
+
+
+def test_listing_ignores_partial_copies(tmp_path: Path):
+    # A mirror mid-copy leaves a "<name>.partial" dir; it must not be listed (or
+    # restored/pruned) as if it were a finished backup.
+    root = tmp_path / "backups"
+    (root / "2026-01-02_00-00-00-manual").mkdir(parents=True)
+    (root / "2026-01-01_00-00-00-manual.partial").mkdir()
+    assert [b.name for b in backups.listing(root)] == ["2026-01-02_00-00-00-manual"]
 
 
 def test_prune_keeps_newest_and_pre_restore(tmp_path: Path):

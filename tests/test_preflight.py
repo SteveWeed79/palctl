@@ -50,6 +50,23 @@ def test_port_free_reports_available():
     assert preflight.check_port_free(port).ok is True
 
 
+def test_port_in_use_by_managed_server_is_not_a_conflict(monkeypatch):
+    # Adopting palctl onto an already-running server: the server legitimately
+    # holds the REST port, so this must be OK, not a red ✗ telling the user to
+    # change the port (which would break their working config).
+    monkeypatch.setattr(preflight, "_palworld_server_running", lambda: True)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    try:
+        c = preflight.check_port_free(port)
+        assert c.ok is True
+        assert "expected" in c.detail.lower()
+        assert not c.fix  # no "change the port" advice
+    finally:
+        s.close()
+
+
 def test_windows_checks_are_none_off_windows():
     if sys.platform.startswith("win"):
         return  # on Windows these return real True/False; nothing to assert here

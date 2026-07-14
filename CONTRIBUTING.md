@@ -39,8 +39,8 @@ daemon's actual service control, the real network downloads, and the PySide6 GUI
 need Windows and aren't in CI, so exercise those by hand on a Windows box when
 you touch them.
 
-CI runs `pytest` and `ruff` on Windows and Linux for Python 3.11 and 3.12; keep
-both green.
+CI runs `pytest` on Windows and Linux for Python 3.11 and 3.12, and `ruff` on
+Linux (Python 3.11); keep both green.
 
 ## Style
 
@@ -53,9 +53,10 @@ elsewhere.
 
 ## Good first areas
 
-- Tests for the async orchestration (`scheduler.update_server`) with a faked
-  SteamCMD.
-- Exposing backup **restore** in the GUI and Discord bot (the logic already
-  exists in `backups.restore`).
-- A Linux server-control backend (systemd) behind the same interface as the
-  Windows service layer.
+- Fleet / multi-server management built on the `profiles` module groundwork
+  (named Config snapshots and an active-profile pointer already exist).
+- Integrity verification for the downloaded binaries — a pinned checksum or
+  Authenticode check for SteamCMD, NSSM, and the VC++ redistributable (today
+  they're fetched over TLS with no post-download verification).
+- Broader tests around the daemon's leak-forecaster and crash-auto-recovery
+  decision helpers (`autorecover_phase` / `should_recover_now` are pure).

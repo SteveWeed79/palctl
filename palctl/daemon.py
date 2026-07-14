@@ -141,7 +141,13 @@ class Daemon:
         # watchdog, and auto-recovery all share it, so a scheduled restart
         # can't fire mid-update and a watchdog restart can't race a restore.
         self.control = ServerController(self.cfg, self.api)
-        self.scheduler = Scheduler(self.cfg, self.api, self.bus, self.control)
+        # `intent_running` lets the scheduler see the admin's Stop intent so a
+        # time-triggered restart/update won't resurrect a deliberately-stopped
+        # server. Read lazily (lambda) — `_desired_running` is set just below.
+        self.scheduler = Scheduler(
+            self.cfg, self.api, self.bus, self.control,
+            intent_running=lambda: self._desired_running,
+        )
         self.watchdog = Watchdog(self.cfg, self.api, self.bus, self.control)
         self.bot = None  # set by run_bot if the Discord bot is enabled
 
@@ -221,7 +227,9 @@ class Daemon:
                 await self._poll()
             except Exception as e:
                 await self.bus.emit(Event("error", f"Poll failed: {e}"))
-            await asyncio.sleep(self.cfg.poll_seconds)
+            # Clamp: a hand-edited 0/negative poll_seconds would tight-loop the
+            # REST API and process enumeration (the scheduler clamps likewise).
+            await asyncio.sleep(max(1, self.cfg.poll_seconds))
 
     async def _poll(self) -> None:
         try:
@@ -235,6 +243,7 @@ class Daemon:
             await self._maybe_autorecover()
             return
 
+        first_poll = self._alive is None
         if self._alive is False:
             await self.bus.emit(Event("server_up", "🟢 Server is **up**."))
             self._epoch_at = time.time()  # fresh process; old memory samples don't apply
@@ -244,8 +253,17 @@ class Daemon:
 
         await self.tracker.update(players)
 
-        stats = procs.proc_stats()
+        stats = await asyncio.to_thread(procs.proc_stats)  # psutil enumeration off the loop
         self._last_metrics = metrics
+
+        if first_poll:
+            # Daemon (re)started while the server was already up: `_history` was
+            # seeded from SQLite and may span a *previous* server process whose
+            # restart drop would flatten the leak fit. Anchor the forecaster to
+            # this server process's start so those older samples are excluded
+            # (fall back to now if we can't read the process — safe, just
+            # discards the seeded history for forecasting).
+            self._epoch_at = time.time() - (stats.uptime_seconds if stats else 0.0)
         sample = {
             "at": time.time(),
             "fps": metrics.server_fps,
@@ -400,10 +418,13 @@ class Daemon:
             return web.Response(text=html, content_type="text/html")
 
         async def state(_: web.Request) -> web.Response:
-            stats = procs.proc_stats()
+            # Both of these block (psutil enumeration; an sc.exe subprocess), so
+            # keep them off the event loop — the GUI polls /state every ~2s.
+            stats = await asyncio.to_thread(procs.proc_stats)
+            service = await asyncio.to_thread(procs.service_state, self.cfg.service_name)
             return web.json_response(
                 {
-                    "service": procs.service_state(self.cfg.service_name),
+                    "service": service,
                     "alive": self._alive,
                     "restarting": self.watchdog.is_restarting,
                     "operation": self.control.current_op,
@@ -442,6 +463,8 @@ class Daemon:
                             await self.api.save()
                         await self.control.stop()
                 elif what == "restart":
+                    if self.control.busy:
+                        return _busy_response(self.control.current_op)
                     self._desired_running = True
                     self._spawn(
                         self.scheduler.restart_with_countdown(
@@ -453,11 +476,17 @@ class Daemon:
                 elif what == "save":
                     await self.api.save()
                 elif what == "backup":
+                    if self.control.busy:
+                        return _busy_response(self.control.current_op)
                     self._spawn(self.scheduler.backup_now("gui"))
                 elif what == "update-server":
+                    if self.control.busy:
+                        return _busy_response(self.control.current_op)
                     self._desired_running = True
                     self._spawn(self.scheduler.update_server())
                 elif what == "restore":
+                    if self.control.busy:
+                        return _busy_response(self.control.current_op)
                     self._desired_running = True
                     self._spawn(self.scheduler.restore_backup(body["name"]))
                 elif what == "kick":
@@ -638,6 +667,12 @@ def uninstall_service() -> None:
     if sys.platform.startswith("win"):
         from . import winservice
 
+        # Don't download NSSM just to uninstall: if the service was never
+        # registered and there's no cached nssm.exe, there's nothing to remove.
+        cached = config_dir() / "bin" / "nssm.exe"
+        if not cached.exists() and not winservice.service_exists(SERVICE_NAME):
+            print(f"[daemon] service '{SERVICE_NAME}' is not registered; nothing to remove.")
+            return
         nssm = winservice.ensure_nssm(config_dir() / "bin")
         winservice.remove_service(nssm, SERVICE_NAME)
     else:

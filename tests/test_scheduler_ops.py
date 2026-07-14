@@ -222,6 +222,79 @@ def test_restore_backup_rejects_traversal_without_stopping(tmp_path, monkeypatch
     assert any(e.kind == "error" for e in events)
 
 
+def test_restore_backup_rejects_empty_name_without_stopping(tmp_path, monkeypatch):
+    # An empty (or ".") name resolves to backup_root itself; it must be rejected
+    # before the server is stopped and the world overwritten.
+    cfg = Config()
+    cfg.backup_root = str(tmp_path)
+
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+
+    bus = EventBus()
+    events = _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).restore_backup(""))
+
+    assert not calls
+    assert any(e.kind == "error" for e in events)
+
+
+# ---------------- intentional-stop awareness ----------------
+
+
+def test_intentionally_stopped_reflects_intent_callback():
+    cfg = Config()
+    # No callback (standalone/tests) == always "running", so loops behave as before.
+    assert sched_mod.Scheduler(cfg, FakeApi(), EventBus())._intentionally_stopped() is False
+    stopped = sched_mod.Scheduler(cfg, FakeApi(), EventBus(), intent_running=lambda: False)
+    assert stopped._intentionally_stopped() is True
+    running = sched_mod.Scheduler(cfg, FakeApi(), EventBus(), intent_running=lambda: True)
+    assert running._intentionally_stopped() is False
+
+
+def test_daily_restart_loop_skips_when_intentionally_stopped(monkeypatch):
+    # The core of the fix: a server the admin stopped must NOT be restarted by
+    # the scheduled daily restart.
+    from datetime import datetime
+
+    cfg = Config()
+    cfg.schedule.enabled = True
+    cfg.schedule.daily_restart = True
+
+    bus = EventBus()
+    events = _collect(bus)
+    sched = sched_mod.Scheduler(cfg, FakeApi(), bus, intent_running=lambda: False)
+
+    monkeypatch.setattr(sched, "_next_restart", lambda: datetime.now())
+    restarted: list = []
+
+    async def fake_restart(reason):
+        restarted.append(reason)
+
+    monkeypatch.setattr(sched, "restart_with_countdown", fake_restart)
+
+    # Drive the infinite loop for a couple of iterations, then break out via a
+    # patched sleep that yields control but stops us after a few calls.
+    real_sleep = asyncio.sleep
+    n = {"calls": 0}
+
+    async def fake_sleep(_secs):
+        n["calls"] += 1
+        if n["calls"] > 3:
+            raise asyncio.CancelledError
+        await real_sleep(0)
+
+    monkeypatch.setattr(sched_mod.asyncio, "sleep", fake_sleep)
+
+    try:
+        _run(sched._daily_restart_loop())
+    except asyncio.CancelledError:
+        pass
+
+    assert not restarted  # never restarted a deliberately-stopped server
+    assert any("Skipped" in e.message for e in events)
+
+
 # ---------------- update-available check ----------------
 
 

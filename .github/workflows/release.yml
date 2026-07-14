@@ -29,6 +29,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # setuptools-scm reads the tag/history for the version
+          # On a manual run, build the tag that was asked for — not the branch
+          # HEAD it was launched from — so the binary/installer version matches
+          # the release tag. On a tag push, github.ref IS the tag.
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - uses: actions/setup-python@v5
         with:

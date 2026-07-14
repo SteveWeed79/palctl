@@ -68,12 +68,12 @@ class Watchdog:
                     await self._tick()
             except Exception as e:
                 await self._bus.emit(Event("error", f"Watchdog tick failed: {e}"))
-            await asyncio.sleep(wd.poll_seconds)
+            await asyncio.sleep(max(1, wd.poll_seconds))
 
     async def _tick(self) -> None:
         wd = self._cfg.watchdog
 
-        stats = procs.proc_stats()
+        stats = await asyncio.to_thread(procs.proc_stats)  # psutil off the event loop
         if stats is None:
             self._over = 0
             return

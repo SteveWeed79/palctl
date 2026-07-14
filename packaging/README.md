@@ -12,6 +12,8 @@ and isn't run by CI.
 | `palctl.spec` | PyInstaller spec. Builds `palctl-daemon.exe` (console), `palctl-gui.exe` (windowed), and `palctl.exe` (the CLI) into one `dist\palctl\` folder. |
 | `installer.iss` | Inno Setup script. Installs the binaries, adds Start-Menu shortcuts, and optionally registers the palctl background service. |
 | `build.ps1` | Does both steps end to end. |
+| `make_icon.py` | Regenerates the committed app icon (`app-icon.ico` here + `app-icon-tile.svg` in the package) from `palctl/gui/icons/app-icon.svg`. Run only when the app glyph changes; needs `cairosvg`. |
+| `app-icon.ico` | The Windows app icon embedded in the exes (`palctl.spec`) and used by the installer (`installer.iss`). Committed so the build needs no rasteriser. |
 
 ## Build
 

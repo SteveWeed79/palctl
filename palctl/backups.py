@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,9 +44,39 @@ def listing(backup_root: Path) -> list[Backup]:
     out = [
         Backup(d.name, d, _dir_size_mb(d), datetime.fromtimestamp(d.stat().st_mtime))
         for d in backup_root.iterdir()
-        if d.is_dir()
+        if d.is_dir() and not d.name.endswith(".partial")  # skip in-progress copies
     ]
     return sorted(out, key=lambda b: b.name, reverse=True)
+
+
+def _safe_backup_path(backup_root: Path, name: str) -> Path:
+    """
+    Resolve `name` to a backup directory *directly under* backup_root, or raise
+    ValueError.
+
+    Rejects path-traversal (`..`, separators) and — critically — the empty
+    string and `.`, both of which `backup_root / name` collapses back to
+    backup_root itself. Without this a name of "" or "." sails past the old
+    substring check and makes restore()/delete() operate on the entire backups
+    folder (rmtree the lot, or copy every backup over the live world).
+    """
+    if not name or not name.strip() or name in (".", ".."):
+        raise ValueError(f"Invalid backup name: {name!r}")
+    if "/" in name or "\\" in name or ".." in name:
+        raise ValueError(f"Invalid backup name: {name!r}")
+    src = backup_root / name
+    if src.resolve().parent != backup_root.resolve():
+        raise ValueError(f"Invalid backup name: {name!r}")
+    return src
+
+
+def is_restorable(backup_root: Path, name: str) -> bool:
+    """True if `name` is a safe, existing backup directory — the non-raising
+    pre-check callers use to reject a bad name before taking the server down."""
+    try:
+        return _safe_backup_path(backup_root, name).is_dir()
+    except ValueError:
+        return False
 
 
 def restore(backup_root: Path, name: str, savegames: Path) -> None:
@@ -55,8 +86,8 @@ def restore(backup_root: Path, name: str, savegames: Path) -> None:
     Snapshots the current world before overwriting, so restoring the wrong
     backup is itself undoable.
     """
-    src = backup_root / name
-    if not src.is_dir() or ".." in name or "/" in name or "\\" in name:
+    src = _safe_backup_path(backup_root, name)
+    if not src.is_dir():
         raise ValueError(f"Invalid backup: {name}")
 
     if savegames.exists():
@@ -78,13 +109,25 @@ def mirror(backup_path: Path, mirror_root: Path) -> Path:
     dest = mirror_root / backup_path.name
     if dest.exists():
         return dest  # already mirrored (e.g. a retry)
-    shutil.copytree(backup_path, dest)
+    # Copy to a temp sibling and rename into place, so an interrupted copy (the
+    # mirror is meant for a network share, which drops mid-copy) never leaves a
+    # partial directory that looks like a complete backup. `dest` existing then
+    # genuinely means "complete".
+    tmp = mirror_root / f"{backup_path.name}.partial"
+    if tmp.exists():
+        shutil.rmtree(tmp)  # leftover from a previous failed attempt
+    try:
+        shutil.copytree(backup_path, tmp)
+        os.replace(tmp, dest)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
     return dest
 
 
 def delete(backup_root: Path, name: str) -> None:
-    target = backup_root / name
-    if not target.is_dir() or ".." in name or "/" in name or "\\" in name:
+    target = _safe_backup_path(backup_root, name)
+    if not target.is_dir():
         raise ValueError(f"Invalid backup: {name}")
     shutil.rmtree(target)
 

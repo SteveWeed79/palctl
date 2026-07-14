@@ -12,6 +12,7 @@ itself.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import asdict
 from pathlib import Path
@@ -43,7 +44,10 @@ def list_profiles() -> list[str]:
 
 def save_profile(name: str, cfg: Config) -> None:
     path = _profiles_dir() / f"{_safe(name)}.json"
-    path.write_text(json.dumps(asdict(cfg), indent=2), encoding="utf-8")
+    # Atomic write (temp + rename) so a torn write can't corrupt a saved profile.
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(asdict(cfg), indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def load_profile(name: str) -> Config:

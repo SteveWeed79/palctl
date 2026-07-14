@@ -163,7 +163,9 @@ def download_steamcmd(dest_dir: Path, *, url: str | None = None) -> Path:
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp_path = Path(tmp.name)
     try:
-        with urllib.request.urlopen(url) as resp, tmp_path.open("wb") as f:
+        # Timeout so a hung CDN doesn't stall setup forever. Integrity relies on
+        # the TLS connection to Valve's steamcdn host.
+        with urllib.request.urlopen(url, timeout=120) as resp, tmp_path.open("wb") as f:
             shutil.copyfileobj(resp, f)
         return extract_steamcmd(tmp_path, dest_dir)
     finally:

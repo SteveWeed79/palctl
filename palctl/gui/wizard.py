@@ -41,6 +41,7 @@ from ..config import (
     set_admin_password,
 )
 from ..discovery import detect_server_roots, detect_steamcmd, is_server_root, is_steamcmd
+from . import icons
 from .main import PathPicker
 from .widgets import NoScrollSpinBox
 
@@ -73,6 +74,9 @@ class SetupWorker(QThread):
         super().__init__()
         self._cfg = cfg
         self._plan = plan
+        # Whether the PalServer service actually got registered (a partial
+        # install skips it); read by the completion dialog so it stays truthful.
+        self.server_registered = False
 
     def _log(self, msg: str) -> None:
         self.line.emit(msg)
@@ -105,14 +109,16 @@ class SetupWorker(QThread):
             )
             self._log("  REST API enabled, port and admin password set.")
 
+            server_registered = False
             if plan.register_server_service:
-                self._register_server_service(cfg, plan)
+                server_registered = self._register_server_service(cfg, plan)
+            self.server_registered = server_registered
             if plan.daemon_startup == "login":
                 self._setup_login_startup()
             elif plan.daemon_startup == "service":
                 self._register_daemon_service()
 
-            self._verify_and_report(plan)
+            self._verify_and_report(plan, server_registered)
 
             self._log("\n✅ Setup complete.")
             self.done.emit(True)
@@ -176,6 +182,18 @@ class SetupWorker(QThread):
         )
         self._log(f"  SteamCMD finished (exit {code}).")
 
+        # SteamCMD's exit code is famously unreliable, so verify the actual
+        # artifact: if the server files aren't there, the download didn't finish.
+        # Abort with the real reason instead of falling through to ensure_rest_api's
+        # misleading "is the server installed at that path?" error a step later.
+        if not cfg.default_ini.exists():
+            raise RuntimeError(
+                f"The Palworld server files aren't present after SteamCMD ran "
+                f"(exit {code}). The download didn't finish — usually a dropped "
+                "internet connection or the disk filling up. Check both, then run "
+                "setup again."
+            )
+
     def _steam_sink(self, line: str) -> None:
         """Turn SteamCMD's chatty output into a single, updating percentage so a
         multi-GB download doesn't look frozen or spam the log."""
@@ -190,15 +208,20 @@ class SetupWorker(QThread):
         elif line.strip():
             self._log(f"  {line}")
 
-    def _verify_and_report(self, plan: SetupPlan) -> None:
+    def _verify_and_report(self, plan: SetupPlan, server_registered: bool) -> None:
         """The payoff: actually start the server and confirm the REST API answers,
-        then print the address players connect to. 'It works' beats 'it's set up'."""
+        then print the address players connect to. 'It works' beats 'it's set up'.
+
+        Only starts/verifies when the server service was actually registered —
+        on a partial install (server files present but PalServer.exe missing)
+        registration is skipped, and starting a service that doesn't exist would
+        hang for the full timeout and then falsely claim it 'Registered'."""
         import asyncio
 
         from .. import netinfo, procs
         from ..api import PalApi
 
-        if plan.register_server_service:
+        if server_registered:
             self._log("Starting the server to check it actually works…")
             try:
                 asyncio.run(procs.start_service(plan.service_name))
@@ -235,19 +258,27 @@ class SetupWorker(QThread):
             "to this PC — palctl can't do that part for you."
         )
 
-    def _register_server_service(self, cfg: Config, plan: SetupPlan) -> None:
+    def _register_server_service(self, cfg: Config, plan: SetupPlan) -> bool:
+        """Register the PalServer Windows service. Returns False (skipped) when
+        PalServer.exe isn't there yet, so the caller doesn't try to start a
+        service that was never created."""
         from .. import winservice
 
         exe = Path(plan.server_root) / "PalServer.exe"
         if not exe.exists():
-            self._log(f"  ⚠️ {exe} not found — skipping the server service.")
-            return
+            self._log(
+                f"  ⚠️ {exe} not found — skipping the server service. Install the "
+                "server (tick “Install / update the server”) or fix the server "
+                "root, then run setup again."
+            )
+            return False
         self._log(f"Registering the '{plan.service_name}' Windows service…")
         nssm = winservice.ensure_nssm(config_dir() / "bin")
         winservice.install_service(
             nssm, plan.service_name, exe, PALSERVER_ARGS, plan.server_root, start=False
         )
         self._log(f"  Service '{plan.service_name}' registered.")
+        return True
 
     def _register_daemon_service(self) -> None:
         from .. import daemon
@@ -277,6 +308,7 @@ class SetupWizard(QDialog):
         self._cfg = cfg
         self._worker: SetupWorker | None = None
         self.setWindowTitle("palctl setup")
+        self.setWindowIcon(icons.load_icon("wizard"))
         self.resize(760, 620)
 
         root = QVBoxLayout(self)
@@ -378,9 +410,11 @@ class SetupWizard(QDialog):
         buttons.addStretch(1)
         self.close_btn = QPushButton("Close")
         self.close_btn.clicked.connect(self.reject)
-        self.check_btn = QPushButton("Check readiness")
+        self.check_btn = QPushButton(
+            icons.load_icon("status-ok", color=icons.OK), "Check readiness"
+        )
         self.check_btn.clicked.connect(self._check_readiness)
-        self.run_btn = QPushButton("Run setup")
+        self.run_btn = QPushButton(icons.load_icon("wizard"), "Run setup")
         self.run_btn.clicked.connect(self._run)
         buttons.addWidget(self.close_btn)
         buttons.addWidget(self.check_btn)
@@ -436,6 +470,8 @@ class SetupWizard(QDialog):
             daemon_startup=self._daemon_startup(),
             service_name=self._cfg.service_name or "PalServer",
         )
+        # Kept so the completion dialog can describe what actually ran.
+        self._plan = plan
 
         self.run_btn.setEnabled(False)
         self.check_btn.setEnabled(False)
@@ -451,6 +487,38 @@ class SetupWizard(QDialog):
     def _append(self, line: str) -> None:
         self.log.append(line)
 
+    def _completion_message(self) -> str:
+        """Describe only what actually ran. Claiming 'the server was started'
+        when the user unticked service registration (or ran nothing in the
+        background) is how the old dialog misled people onto a dead dashboard."""
+        plan = getattr(self, "_plan", None)
+        worker = getattr(self, "_worker", None)
+        # What actually ran, not what was requested: a partial install can skip
+        # server registration even when the box was ticked.
+        started_server = bool(worker and getattr(worker, "server_registered", False))
+        daemon_running = bool(plan and plan.daemon_startup != "none")
+
+        if started_server:
+            lead = (
+                "palctl is configured and your server was started. The log below "
+                "shows the address your friends connect to."
+            )
+        else:
+            lead = (
+                "palctl is configured. You chose not to register the server as a "
+                "service, so start it yourself when you're ready."
+            )
+
+        if daemon_running:
+            tail = "\n\nClick Finish to open the dashboard."
+        else:
+            tail = (
+                "\n\nNothing is running in the background yet — the dashboard will "
+                "say the daemon is down until you start palctl (re-run setup and "
+                "pick a background option, or launch palctl-daemon)."
+            )
+        return lead + tail
+
     def _finished(self, ok: bool) -> None:
         self.progress.hide()
         self.run_btn.setEnabled(True)
@@ -463,10 +531,7 @@ class SetupWizard(QDialog):
             self.close_btn.setDefault(True)
             self.close_btn.setFocus()
             QMessageBox.information(
-                self, "Setup complete",
-                "palctl is configured and the server was started. The log below "
-                "shows the address your friends connect to.\n\n"
-                "Click Finish to close this wizard and open the dashboard.",
+                self, "Setup complete", self._completion_message(),
             )
         else:
             # Failure used to be silent — the wizard just sat there. Say so.
