@@ -152,11 +152,14 @@ class Sparkline(QLabel):
         self._render()
 
     def _render(self) -> None:
-        from PySide6.QtGui import QColor, QPainter, QPen
+        from PySide6.QtGui import QColor, QPainter, QPalette, QPen
+        from PySide6.QtWidgets import QApplication
 
         w, h = max(self.width(), 120), self._h
         pm = QPixmap(w, h)
-        pm.fill(QColor("#0d1117"))
+        # Follow the theme instead of a hardcoded dark fill, so the graph isn't a
+        # black rectangle on a light-themed Windows.
+        pm.fill(QApplication.palette().color(QPalette.ColorRole.Base))
 
         pts = list(self._points)
         if len(pts) > 1:
@@ -198,7 +201,7 @@ class Dashboard(QWidget):
             self.tiles[key] = lab
             grid.addWidget(box, i // 3, i % 3)
 
-        fps_box = QGroupBox("Server FPS")
+        fps_box = QGroupBox("Server FPS — recent trend")
         fv = QVBoxLayout(fps_box)
         self.fps_spark = Sparkline("#3fb950")
         fv.addWidget(self.fps_spark)
@@ -243,7 +246,9 @@ class Dashboard(QWidget):
 
         self.events.clear()
         for e in reversed(s.get("events", [])):
-            self.events.addItem(f"[{e['kind']}] {e['message']}")
+            when = (e.get("at") or "")[11:19]  # HH:MM:SS from the ISO timestamp
+            prefix = f"{when}  " if when else ""
+            self.events.addItem(f"{prefix}[{e['kind']}] {e['message']}")
 
 
 class Players(QWidget):
@@ -292,8 +297,22 @@ class Players(QWidget):
     def _moderate(self, action: str) -> None:
         row = self.table.currentRow()
         if row < 0 or row >= len(self._players):
+            QMessageBox.information(
+                self, f"{action.title()} player",
+                f"Select a player in the table first, then click {action.title()}.",
+            )
             return
         p = self._players[row]
+
+        # Ban persists — confirm it, like the Console does for Stop/Restart.
+        # A kick just drops the player and needs no gate.
+        if action == "ban":
+            ok = QMessageBox.question(
+                self, f"Ban {p['name']}?",
+                f"Ban {p['name']}? They won't be able to rejoin until you unban them.",
+            )
+            if ok != QMessageBox.StandardButton.Yes:
+                return
 
         reason, ok = QInputDialog.getText(
             self, f"{action.title()} {p['name']}", "Reason shown to the player:"
@@ -302,6 +321,7 @@ class Players(QWidget):
             return
         try:
             call(f"/action/{action}", {"user_id": p["user_id"], "reason": reason})
+            QMessageBox.information(self, "Done", f"{action.title()}ed {p['name']}.")
         except Exception as e:
             QMessageBox.critical(self, "Failed", str(e))
 
@@ -321,22 +341,30 @@ class Console(QWidget):
         self._icon_buttons.append((b, "action-announce"))
         v.addLayout(row)
 
-        row2 = QHBoxLayout()
-        # The daemon action name and the icon name mostly line up; `icon` names
-        # the glyph where they don't (update-server -> action-update).
-        for label, action, confirm, icon in (
-            ("Save world", "save", False, "action-save"),
-            ("Backup now", "backup", False, "action-backup"),
-            ("Start", "start", False, "action-start"),
-            ("Stop", "stop", True, "action-stop"),
-            ("Restart (countdown)", "restart", True, "action-restart"),
-            ("Update (SteamCMD)", "update-server", True, "action-update"),
-        ):
+        row2 = QGridLayout()
+        # `confirm` is the consequence spelled out for operations that take the
+        # server down, or None for the safe ones; `icon` names the glyph where it
+        # doesn't match the action (update-server -> action-update).
+        _down = "This takes the server down"
+        for i, (label, action, confirm, icon) in enumerate((
+            ("Save world", "save", None, "action-save"),
+            ("Backup now", "backup", None, "action-backup"),
+            ("Start", "start", None, "action-start"),
+            ("Stop", "stop",
+             f"Stop the server? {_down} and disconnects everyone. It stays down "
+             "until you Start it.", "action-stop"),
+            ("Restart (countdown)", "restart",
+             "Restart the server? Players get an in-game countdown first, then it "
+             "goes down and comes back.", "action-restart"),
+            ("Update (SteamCMD)", "update-server",
+             f"Update the server via SteamCMD? {_down} for several minutes while "
+             "it downloads. The world is backed up first.", "action-update"),
+        )):
             btn = QPushButton(icons.load_icon(icon), label)
             btn.clicked.connect(
                 lambda _=False, a=action, c=confirm, text=label: self._act(a, c, text)
             )
-            row2.addWidget(btn)
+            row2.addWidget(btn, i // 3, i % 3)
             self._icon_buttons.append((btn, icon))
         v.addLayout(row2)
 
@@ -363,9 +391,9 @@ class Console(QWidget):
         except Exception as e:
             self.log.append(f"❌ {e}")
 
-    def _act(self, action: str, confirm: bool, label: str) -> None:
+    def _act(self, action: str, confirm: str | None, label: str) -> None:
         if confirm:
-            ok = QMessageBox.question(self, label, f"{label}?")
+            ok = QMessageBox.question(self, label, confirm)
             if ok != QMessageBox.StandardButton.Yes:
                 return
         try:
@@ -658,6 +686,15 @@ class ConfigTab(QWidget):
         c.backup_root = self.backup_root.text()
         c.service_name = self.service.text()
         c.api_port = self.api_port.value()
+
+        if self.wd_hard.value() < self.wd_limit.value():
+            QMessageBox.warning(
+                self, "Check the memory limits",
+                "The hard limit (force a restart even with players online) is "
+                "below the restart limit. It should be the higher of the two — "
+                "raise it above the restart limit.",
+            )
+            return
 
         c.watchdog.enabled = self.wd_enabled.isChecked()
         c.watchdog.memory_limit_mb = self.wd_limit.value()
