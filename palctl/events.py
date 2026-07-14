@@ -21,6 +21,7 @@ charges for that.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from collections import defaultdict
@@ -67,8 +68,13 @@ class EventBus:
         for h in [*self._handlers.get(event.kind, []), *self._handlers.get("*", [])]:
             try:
                 await h(event)
-            except Exception as e:  # a broken subscriber must not kill the daemon
-                print(f"[eventbus] handler failed for {event.kind}: {e}")
+            except Exception:  # a broken subscriber must not kill the daemon
+                # The file log, not print(): under the Windows service stdout
+                # goes nowhere, and a handler that fails every event (e.g. the
+                # Discord bot mis-configured) would be completely invisible.
+                logging.getLogger("palctl.events").exception(
+                    "event handler failed for %s", event.kind
+                )
 
     def recent(self, n: int = 50) -> list[Event]:
         return self._recent[-n:]
@@ -79,56 +85,95 @@ class EventBus:
 DB_PATH = config_dir() / "sessions.db"
 
 
+def _migrate(db: sqlite3.Connection) -> None:
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            user_id     TEXT NOT NULL,
+            name        TEXT NOT NULL,
+            joined_at   TEXT NOT NULL,
+            left_at     TEXT,
+            level_start INTEGER,
+            level_end   INTEGER
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            at      TEXT NOT NULL,
+            kind    TEXT NOT NULL,
+            message TEXT NOT NULL,
+            data    TEXT
+        )
+        """
+    )
+    # One row per poll. This is what lets GUI graphs survive a daemon
+    # restart, and what the leak forecaster fits its line to.
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS metrics (
+            at         REAL NOT NULL,
+            fps        INTEGER,
+            frame_time REAL,
+            players    INTEGER,
+            memory_mb  REAL,
+            cpu        REAL
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_metrics_at ON metrics(at)")
+    # Sessions a previous daemon run never closed can't be closed correctly
+    # (we don't know when the player left), and they'd shadow the player's
+    # next real session in close_session(). Close them at zero length.
+    db.execute("UPDATE sessions SET left_at = joined_at WHERE left_at IS NULL")
+    db.commit()
+
+
+def _connect_and_migrate(target: Path | str) -> sqlite3.Connection:
+    # sqlite3.connect(Path) is fine, but a corrupt file only surfaces at the
+    # first statement — running the migration here makes failures happen where
+    # _open_store can catch and quarantine them.
+    db = sqlite3.connect(target, check_same_thread=False)
+    try:
+        _migrate(db)
+    except BaseException:
+        db.close()
+        raise
+    return db
+
+
+def _open_store(path: Path) -> sqlite3.Connection:
+    """
+    A corrupt or unwritable sessions.db must not crash-loop the daemon under
+    NSSM — the same policy Config.load applies to config.json: quarantine the
+    file and start fresh (history is expendable, the daemon is not), falling
+    back to an in-memory store as a last resort.
+    """
+    log = logging.getLogger("palctl.events")
+    try:
+        return _connect_and_migrate(path)
+    except sqlite3.Error:
+        log.exception("sessions.db is unusable — setting it aside as .broken")
+    try:
+        Path(path).replace(Path(path).with_name(Path(path).name + ".broken"))
+        return _connect_and_migrate(path)
+    except (sqlite3.Error, OSError):
+        log.exception(
+            "could not recreate sessions.db — playtime/metrics history will "
+            "not persist this run"
+        )
+        return _connect_and_migrate(":memory:")
+
+
 class SessionStore:
     """Playtime and history. Palworld remembers none of this; we do."""
 
     def __init__(self, path: Path = DB_PATH) -> None:
-        self._db = sqlite3.connect(path, check_same_thread=False)
         # log_event runs on worker threads (asyncio.to_thread) while the loop
         # thread reads/writes sessions; one lock serialises all access.
         self._lock = threading.Lock()
-        self._db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                user_id     TEXT NOT NULL,
-                name        TEXT NOT NULL,
-                joined_at   TEXT NOT NULL,
-                left_at     TEXT,
-                level_start INTEGER,
-                level_end   INTEGER
-            )
-            """
-        )
-        self._db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS events (
-                at      TEXT NOT NULL,
-                kind    TEXT NOT NULL,
-                message TEXT NOT NULL,
-                data    TEXT
-            )
-            """
-        )
-        # One row per poll. This is what lets GUI graphs survive a daemon
-        # restart, and what the leak forecaster fits its line to.
-        self._db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS metrics (
-                at         REAL NOT NULL,
-                fps        INTEGER,
-                frame_time REAL,
-                players    INTEGER,
-                memory_mb  REAL,
-                cpu        REAL
-            )
-            """
-        )
-        self._db.execute("CREATE INDEX IF NOT EXISTS idx_metrics_at ON metrics(at)")
-        # Sessions a previous daemon run never closed can't be closed correctly
-        # (we don't know when the player left), and they'd shadow the player's
-        # next real session in close_session(). Close them at zero length.
-        self._db.execute("UPDATE sessions SET left_at = joined_at WHERE left_at IS NULL")
-        self._db.commit()
+        self._db = _open_store(path)
 
     def open_session(self, p: Player) -> None:
         with self._lock:

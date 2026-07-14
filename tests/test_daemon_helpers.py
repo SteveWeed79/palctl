@@ -157,3 +157,26 @@ def test_service_target_dev_uses_module_invocation(monkeypatch):
     monkeypatch.setattr(daemon_mod.sys, "frozen", False, raising=False)
     exe, args, _ = service_target()
     assert args == "-m palctl.daemon"
+
+
+def test_desired_running_persists_across_restarts(tmp_path, monkeypatch):
+    # An admin's Stop must survive a daemon restart — otherwise the 06:00
+    # schedule resurrects a server that was taken down for maintenance.
+    import palctl.daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
+
+    assert daemon_mod._load_desired_running() is True  # first run: no state file
+    daemon_mod._save_desired_running(False)  # the admin hits Stop
+    assert daemon_mod._load_desired_running() is False  # the "restart" remembers
+    daemon_mod._save_desired_running(True)
+    assert daemon_mod._load_desired_running() is True
+
+
+def test_desired_running_tolerates_garbage_state(tmp_path, monkeypatch):
+    import palctl.daemon as daemon_mod
+
+    state = tmp_path / "daemon_state.json"
+    monkeypatch.setattr(daemon_mod, "_STATE_PATH", state)
+    state.write_text("{not json")
+    assert daemon_mod._load_desired_running() is True  # fail open to normal behavior

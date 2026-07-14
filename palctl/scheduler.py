@@ -310,9 +310,20 @@ class Scheduler:
             await self._bus.emit(
                 Event("restore", f"♻️ Restoring backup `{name}` — stopping the server.")
             )
+            await self._control.save_best_effort()
+            if not await self._control.stop():
+                # Copying over a live save corrupts it. If the server didn't
+                # confirm STOPPED, refuse to touch the world at all.
+                await self._bus.emit(
+                    Event(
+                        "error",
+                        "Restore aborted: the server did not stop (it may be "
+                        "hung, or the service name may be wrong). The world is "
+                        "untouched. Stop the server manually, then retry.",
+                    )
+                )
+                return
             try:
-                await self._control.save_best_effort()
-                await self._control.stop()
                 await asyncio.to_thread(
                     backups.restore, Path(cfg.backup_root), name, cfg.savegames_dir
                 )
@@ -365,20 +376,30 @@ class Scheduler:
         await self._bus.emit(
             Event("update", "⏬ Server update starting — backing up, saving, stopping.")
         )
-        try:
-            # Game updates are exactly when save migration or corruption
-            # happens; a world backup first makes a bad update undoable.
-            b = await self._do_backup("pre-update")
-            if b is None:
-                await self._bus.emit(
-                    Event(
-                        "update",
-                        "⚠️ Pre-update backup failed (see the error above) — "
-                        "continuing with the update anyway.",
-                    )
+        # Game updates are exactly when save migration or corruption
+        # happens; a world backup first makes a bad update undoable.
+        b = await self._do_backup("pre-update")
+        if b is None:
+            await self._bus.emit(
+                Event(
+                    "update",
+                    "⚠️ Pre-update backup failed (see the error above) — "
+                    "continuing with the update anyway.",
                 )
-            await self._control.stop()
-
+            )
+        if not await self._control.stop():
+            # SteamCMD rewriting the install under a still-running server
+            # corrupts it. If the server didn't confirm STOPPED, don't update.
+            await self._bus.emit(
+                Event(
+                    "error",
+                    "Update aborted: the server did not stop (it may be hung, "
+                    "or the service name may be wrong). Nothing was changed. "
+                    "Stop the server manually, then retry.",
+                )
+            )
+            return
+        try:
             ini = cfg.live_ini
             ini_backup = await asyncio.to_thread(steamcmd.backup_file, ini)
 
@@ -389,23 +410,26 @@ class Scheduler:
                     latest.append(line)
                     del latest[:-1]  # keep only the most recent line
 
-            code = await steamcmd.run_update_async(
-                cfg.steamcmd_path,
-                cfg.server_root,
-                app_id=cfg.app_id,
-                validate=validate,
-                on_line=sink,
-            )
-
-            if ini_backup and is_blank(ini):
-                await asyncio.to_thread(shutil.copy2, ini_backup, ini)
-                await self._bus.emit(
-                    Event(
-                        "update",
-                        "♻️ SteamCMD blanked PalWorldSettings.ini — restored it "
-                        "from the pre-update backup.",
-                    )
+            try:
+                code = await steamcmd.run_update_async(
+                    cfg.steamcmd_path,
+                    cfg.server_root,
+                    app_id=cfg.app_id,
+                    validate=validate,
+                    on_line=sink,
                 )
+            finally:
+                # SteamCMD can blank the ini and then die — put the settings
+                # back even on failure, before the server is started again.
+                if ini_backup and is_blank(ini):
+                    await asyncio.to_thread(shutil.copy2, ini_backup, ini)
+                    await self._bus.emit(
+                        Event(
+                            "update",
+                            "♻️ SteamCMD blanked PalWorldSettings.ini — restored "
+                            "it from the pre-update backup.",
+                        )
+                    )
 
             tail = f" ({latest[0]})" if latest else ""
             await self._bus.emit(
@@ -416,6 +440,11 @@ class Scheduler:
                     {"exit_code": code},
                 )
             )
+        except Exception as e:
+            # Without this, a GUI- or bot-triggered update that throws would
+            # restart the server and announce success with no trace of the
+            # failure (only the scheduled path had a catch).
+            await self._bus.emit(Event("error", f"Update failed: {e}"))
         finally:
             await self._control.start()
             ok = await self._api.wait_until_alive(timeout=300)

@@ -18,6 +18,7 @@ So we split on depth-0, outside-quotes commas only.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -220,8 +221,16 @@ class PalSettings:
             bak = path.with_suffix(f".ini.{stamp}.bak")
             shutil.copy2(path, bak)
 
-        path.write_text(self.render(), encoding="utf-8")
+        _write_text_atomic(path, self.render())
         return bak
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Write-then-rename, like Config.save: a crash mid-write must not leave a
+    truncated ini for the server to boot defaults from."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def seed_from_default(default_ini: Path, live_ini: Path) -> None:
@@ -232,7 +241,7 @@ def seed_from_default(default_ini: Path, live_ini: Path) -> None:
     Almost every "my settings don't apply" thread is this.
     """
     live_ini.parent.mkdir(parents=True, exist_ok=True)
-    live_ini.write_text(default_ini.read_text(encoding="utf-8-sig"), encoding="utf-8")
+    _write_text_atomic(live_ini, default_ini.read_text(encoding="utf-8-sig"))
 
 
 def is_blank(path: Path) -> bool:

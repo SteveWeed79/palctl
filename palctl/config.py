@@ -14,6 +14,7 @@ plaintext in a config file is not acceptable.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from dataclasses import asdict, dataclass, field, fields
@@ -169,7 +170,14 @@ class Config:
             return cls.from_dict(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
             # A corrupt config must not crash-loop the daemon under NSSM.
-            # Set the file aside so the values can still be recovered by hand.
+            # Set the file aside so the values can still be recovered by hand —
+            # and say so: the daemon silently running on default paths (backups
+            # start failing, watchdog thresholds reset) is baffling without
+            # this one line naming the root cause.
+            logging.getLogger("palctl.config").warning(
+                "config.json was unreadable — set aside as config.json.broken; "
+                "running with built-in defaults until it is fixed or re-saved"
+            )
             CONFIG_PATH.replace(CONFIG_PATH.with_suffix(".json.broken"))
             return cls()
 

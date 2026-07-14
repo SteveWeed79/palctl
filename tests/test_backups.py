@@ -104,6 +104,59 @@ def test_listing_ignores_partial_copies(tmp_path: Path):
     assert [b.name for b in backups.listing(root)] == ["2026-01-02_00-00-00-manual"]
 
 
+def test_create_interrupted_leaves_no_fake_backup(tmp_path: Path, monkeypatch):
+    # A daemon kill / disk-full mid-copy must not leave a directory that
+    # listing() (and therefore restore/prune) would treat as a finished backup.
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+
+    real_copytree = backups.shutil.copytree
+
+    def dies_mid_copy(src, dst, *a, **kw):
+        real_copytree(src, dst, *a, **kw)  # the files land...
+        raise OSError("No space left on device")  # ...but the copy "fails"
+
+    monkeypatch.setattr(backups.shutil, "copytree", dies_mid_copy)
+    with pytest.raises(OSError):
+        backups.create(sg, root, "scheduled")
+
+    assert backups.listing(root) == []  # nothing masquerades as complete
+    assert not any(root.iterdir())  # and the .partial temp was cleaned up
+
+
+def test_restore_failure_leaves_live_world_untouched(tmp_path: Path, monkeypatch):
+    # If copying the backup out fails (disk full, unreadable backup), the live
+    # world must not have been touched yet — no rmtree-then-hope.
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+    b = backups.create(sg, root, "manual")
+    (sg / "0" / "world" / "Level.sav").write_bytes(b"live-world")
+
+    def dies(src, dst, **kw):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(backups.shutil, "copytree", dies)
+    with pytest.raises(OSError):
+        backups.restore(root, b.name, sg)
+
+    assert (sg / "0" / "world" / "Level.sav").read_bytes() == b"live-world"
+    assert not (sg.parent / f"{sg.name}.partial-restore").exists()
+
+
+def test_prune_retain_zero_never_wipes_everything(tmp_path: Path):
+    # backup_retain: 0 in a hand-edited config must not mean "delete all" —
+    # prune runs immediately after every create.
+    root = tmp_path / "backups"
+    root.mkdir()
+    for stamp in ("2026-01-01_00-00-00", "2026-01-02_00-00-00"):
+        (root / f"{stamp}-scheduled").mkdir()
+
+    doomed = backups.prune(root, retain=0)
+
+    assert doomed == ["2026-01-01_00-00-00-scheduled"]
+    assert (root / "2026-01-02_00-00-00-scheduled").exists()
+
+
 def test_prune_keeps_newest_and_pre_restore(tmp_path: Path):
     root = tmp_path / "backups"
     root.mkdir()

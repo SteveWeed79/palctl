@@ -15,6 +15,7 @@ What you DO get, all reconstructed from polling /players and /metrics:
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import timedelta
 
 import discord
@@ -57,6 +58,22 @@ class PalBot(discord.Client):
         self._status_started = False
         self._register()
         bus.on_any(self._on_event)
+
+    def _spawn(self, coro) -> None:
+        """Fire-and-forget with a strong ref (asyncio only keeps weak ones) and
+        exception logging — a failed /update or /restore must leave a trace in
+        the file log, not just asyncio's GC-time stderr warning that service
+        mode discards."""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._spawned_done)
+
+    def _spawned_done(self, task: asyncio.Task) -> None:
+        self._bg_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logging.getLogger("palctl.bot").error(
+                "bot background task failed", exc_info=task.exception()
+            )
 
     def reconfigure(self, cfg: Config, api: PalApi) -> None:
         """Pick up a config reload: channel, notification toggles, API endpoint.
@@ -278,10 +295,7 @@ class PalBot(discord.Client):
             await interaction.response.send_message(
                 f"🔁 Restarting with countdown — *{reason}*. I'll report back."
             )
-            # asyncio holds only weak refs to tasks; keep one for the countdown.
-            task = asyncio.create_task(self._sched.restart_with_countdown(reason))
-            self._bg_tasks.add(task)
-            task.add_done_callback(self._bg_tasks.discard)
+            self._spawn(self._sched.restart_with_countdown(reason))
 
         @tree.command(
             name="update", description="Update the server via SteamCMD (stops it first)"
@@ -294,9 +308,7 @@ class PalBot(discord.Client):
                 "⏬ Updating the server via SteamCMD — it'll go down and I'll report "
                 "back here when it's finished."
             )
-            task = asyncio.create_task(self._sched.update_server())
-            self._bg_tasks.add(task)
-            task.add_done_callback(self._bg_tasks.discard)
+            self._spawn(self._sched.update_server())
 
         @tree.command(name="backups", description="List the most recent backups")
         async def backups_cmd(interaction: discord.Interaction) -> None:
@@ -328,9 +340,7 @@ class PalBot(discord.Client):
                 f"♻️ Restoring `{name}` — the server will restart. A safety copy of "
                 "the current world is taken first. I'll report back here."
             )
-            task = asyncio.create_task(self._sched.restore_backup(name))
-            self._bg_tasks.add(task)
-            task.add_done_callback(self._bg_tasks.discard)
+            self._spawn(self._sched.restore_backup(name))
 
         @tree.command(name="kick", description="Kick a player")
         async def kick(
@@ -383,9 +393,7 @@ class PalBot(discord.Client):
         # on_ready can fire again on reconnect; only ever start one status loop.
         if not self._status_started:
             self._status_started = True
-            task = asyncio.create_task(self._status_loop())
-            self._bg_tasks.add(task)
-            task.add_done_callback(self._bg_tasks.discard)
+            self._spawn(self._status_loop())
 
 
 async def run_bot(

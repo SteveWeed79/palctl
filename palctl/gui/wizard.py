@@ -161,7 +161,11 @@ class SetupWorker(QThread):
         self._log(f"     Visual C++ runtime installer finished (exit {code}).")
 
     def _install_server(self, cfg: Config, plan: SetupPlan) -> None:
-        from .. import steamcmd
+        import asyncio
+        import shutil
+
+        from .. import backups, procs, steamcmd
+        from ..inifile import is_blank
 
         steam = Path(plan.steamcmd_path)
         if not is_steamcmd(steam):
@@ -172,14 +176,48 @@ class SetupWorker(QThread):
             cfg.save()
             self._log(f"  SteamCMD ready at {steam}")
 
+        # Re-running setup over an existing install is supported (our own error
+        # messages say "run setup again"), so this path needs the same guards
+        # the scheduled update has: never let SteamCMD rewrite files under a
+        # running server, and keep the world and the tuned ini safe across
+        # `validate` (which blanks PalWorldSettings.ini).
+        if procs.find_process() is not None:
+            self._log("The server is running — stopping it before the update…")
+            try:
+                asyncio.run(procs.stop_service(plan.service_name))
+            except Exception as e:
+                self._log(f"  couldn't stop the service: {e}")
+            if procs.find_process() is not None:
+                raise RuntimeError(
+                    "The Palworld server is still running — updating its files "
+                    "now could corrupt them. Stop the server, then run setup "
+                    "again."
+                )
+
+        savegames = cfg.savegames_dir
+        if savegames.exists():
+            self._log("Backing up the world before the update…")
+            b = backups.create(savegames, Path(cfg.backup_root), "pre-update")
+            self._log(f"  world backed up to {b.path}")
+
+        ini_backup = steamcmd.backup_file(cfg.live_ini)
+
         self._log(
             f"Installing / updating the Palworld server into {plan.server_root} "
             "(this downloads a few GB the first time)…"
         )
         self._last_pct = -1
-        code = steamcmd.run_update(
-            steam, plan.server_root, app_id=cfg.app_id, on_line=self._steam_sink
-        )
+        try:
+            code = steamcmd.run_update(
+                steam, plan.server_root, app_id=cfg.app_id, on_line=self._steam_sink
+            )
+        finally:
+            if ini_backup and is_blank(cfg.live_ini):
+                shutil.copy2(ini_backup, cfg.live_ini)
+                self._log(
+                    "  SteamCMD blanked PalWorldSettings.ini — restored it from "
+                    "the pre-update backup."
+                )
         self._log(f"  SteamCMD finished (exit {code}).")
 
         # SteamCMD's exit code is famously unreliable, so verify the actual
