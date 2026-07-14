@@ -58,6 +58,25 @@ def find_process() -> psutil.Process | None:
     return None
 
 
+# The actual server binaries (one live process per running instance). The thin
+# launchers in PAL_PROCESS_NAMES are deliberately excluded: a single healthy
+# server shows both a launcher and a Shipping process, so counting launchers
+# would double-count. Two Shipping processes == two real server instances.
+SHIPPING_PROCESS_NAMES = ("PalServer-Win64-Shipping.exe", "PalServer-Linux-Shipping")
+
+
+def shipping_processes() -> list[psutil.Process]:
+    """Every running Palworld server process. find_process() returns the single
+    one the watchdog should watch; this returns them all, so preflight can flag
+    two instances fighting over the game (8211) and REST (8212) ports — the
+    classic result of a leftover second service."""
+    out: list[psutil.Process] = []
+    for p in psutil.process_iter(["name"]):
+        if (p.info.get("name") or "") in SHIPPING_PROCESS_NAMES:
+            out.append(p)
+    return out
+
+
 def proc_stats() -> ProcStats | None:
     p = find_process()
     if p is None:

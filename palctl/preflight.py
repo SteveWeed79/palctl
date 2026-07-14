@@ -130,6 +130,35 @@ def check_vcredist() -> Check:
     )
 
 
+def check_single_server_instance() -> Check:
+    """Flag more than one running Palworld server process. Two instances (almost
+    always a leftover second Windows service) fight over the game and REST ports,
+    so the REST API never answers and the memory watchdog can't tell which
+    process to watch — a confusing failure that looks like 'the server just
+    won't respond'."""
+    try:
+        from . import procs
+
+        running = procs.shipping_processes()
+    except Exception as e:  # psutil missing (minimal-deps) or an odd platform
+        return Check("Single server instance", None, f"couldn't check: {e}")
+
+    n = len(running)
+    if n == 0:
+        return Check("Single server instance", True, "no server running yet")
+    if n == 1:
+        return Check("Single server instance", True, "one server process")
+
+    pids = ", ".join(str(p.pid) for p in running)
+    return Check(
+        "Single server instance", False,
+        f"{n} Palworld server processes are running (PIDs {pids})",
+        fix="Two servers are running at once — they collide on ports 8211 and "
+            "8212, so the REST API won't answer. Stop and disable the extra "
+            "Windows service (services.msc), leaving only the one palctl manages.",
+    )
+
+
 def run_all(
     server_root: str | Path,
     api_port: int,
@@ -143,6 +172,7 @@ def run_all(
         checks.append(check_disk_space(server_root))
         checks.append(check_vcredist())
     checks.append(check_port_free(api_port))
+    checks.append(check_single_server_instance())
     if need_admin:
         checks.append(check_admin())
     return checks

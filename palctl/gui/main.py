@@ -75,10 +75,14 @@ def _auth_headers() -> dict:
     return {TOKEN_HEADER: _token_cache}
 
 
-class DaemonDown(RuntimeError):
-    """The daemon isn't reachable. Shown to the user as a sentence, never a raw
-    socket error (WinError 10061 & friends): the GUI is only a view onto the
-    daemon, so 'it's not running' is the answer, not the error number."""
+class DaemonError(RuntimeError):
+    """A daemon call didn't succeed — always shown to the user as its own
+    message, never a raw socket error or a bare HTTP status line."""
+
+
+class DaemonDown(DaemonError):
+    """Specifically: the daemon isn't reachable (connection refused / 401). The
+    GUI is only a view onto the daemon, so 'it's not running' is the answer."""
 
 
 def call(path: str, body: dict | None = None) -> dict:
@@ -103,7 +107,15 @@ def call(path: str, body: dict | None = None) -> dict:
             "the same Windows user; if the daemon runs as a service, re-register "
             "it with:  palctl-daemon install-service --as-user"
         )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        # The daemon puts a human reason in {"error": ...} — e.g. a 409
+        # "busy: <operation> is in progress" from the server-op lock. Surface
+        # THAT, not httpx's generic "Client error '409 Conflict'".
+        try:
+            reason = r.json().get("error")
+        except Exception:
+            reason = None
+        raise DaemonError(reason or f"The daemon returned HTTP {r.status_code}.")
     return r.json()
 
 
@@ -670,6 +682,15 @@ class Main(QMainWindow):
         tabs.addTab(self.editor, "Settings")
         tabs.addTab(self.config, "Config")
         self.setCentralWidget(tabs)
+
+        # Setup wizard reachable from the window itself, not only the tray icon.
+        # A reinstall keeps your %APPDATA% config, so the first-run auto-popup
+        # won't fire on an upgrade — this is how you re-run setup on purpose
+        # (e.g. to repoint the server service or re-enable the REST API).
+        setup_menu = self.menuBar().addMenu("&Setup")
+        wizard_action = QAction("Run setup wizard…", self)
+        wizard_action.triggered.connect(lambda: self._open_wizard(first_run=False))
+        setup_menu.addAction(wizard_action)
 
         self.status = self.statusBar()
         self.status.showMessage("Connecting to daemon…")
