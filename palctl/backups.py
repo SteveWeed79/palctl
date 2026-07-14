@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,7 +44,7 @@ def listing(backup_root: Path) -> list[Backup]:
     out = [
         Backup(d.name, d, _dir_size_mb(d), datetime.fromtimestamp(d.stat().st_mtime))
         for d in backup_root.iterdir()
-        if d.is_dir()
+        if d.is_dir() and not d.name.endswith(".partial")  # skip in-progress copies
     ]
     return sorted(out, key=lambda b: b.name, reverse=True)
 
@@ -108,7 +109,19 @@ def mirror(backup_path: Path, mirror_root: Path) -> Path:
     dest = mirror_root / backup_path.name
     if dest.exists():
         return dest  # already mirrored (e.g. a retry)
-    shutil.copytree(backup_path, dest)
+    # Copy to a temp sibling and rename into place, so an interrupted copy (the
+    # mirror is meant for a network share, which drops mid-copy) never leaves a
+    # partial directory that looks like a complete backup. `dest` existing then
+    # genuinely means "complete".
+    tmp = mirror_root / f"{backup_path.name}.partial"
+    if tmp.exists():
+        shutil.rmtree(tmp)  # leftover from a previous failed attempt
+    try:
+        shutil.copytree(backup_path, tmp)
+        os.replace(tmp, dest)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
     return dest
 
 

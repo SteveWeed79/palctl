@@ -32,7 +32,13 @@ def _parse_version(v: str) -> tuple[int, ...]:
 
 
 def is_newer(current: str, latest: str) -> bool:
-    return _parse_version(latest) > _parse_version(current)
+    a, b = _parse_version(latest), _parse_version(current)
+    # Zero-pad to equal length so "1.2.0" isn't treated as newer than "1.2"
+    # ((1,2,0) > (1,2) is True as a raw tuple compare).
+    n = max(len(a), len(b))
+    a += (0,) * (n - len(a))
+    b += (0,) * (n - len(b))
+    return a > b
 
 
 def latest_release(repo: str = REPO, timeout: float = 5.0) -> str | None:

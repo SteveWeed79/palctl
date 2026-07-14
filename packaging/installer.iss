@@ -46,6 +46,9 @@ WizardStyle=modern
 ; On upgrade, let Restart Manager close the GUI if it's holding a file.
 CloseApplications=yes
 RestartApplications=no
+; The addtopath task edits the system PATH; this broadcasts WM_SETTINGCHANGE so
+; a newly-opened terminal sees `palctl` without a logoff/logon.
+ChangesEnvironment=yes
 
 [Files]
 ; The whole PyInstaller onedir output.
@@ -142,3 +145,6 @@ Filename: "{app}\palctl-gui.exe"; Description: "Launch palctl"; Flags: nowait po
 ; Remove the service before the files go, so nothing is left pointing at a
 ; deleted exe. runhidden so an already-absent service fails quietly.
 Filename: "{app}\palctl-daemon.exe"; Parameters: "uninstall-service"; Flags: runhidden waituntilterminated; RunOnceId: "RemovePalctlService"
+; Also clear the login-startup HKCU Run key (the wizard's DEFAULT background
+; mode), or an autorun pointing at the just-deleted exe is left behind.
+Filename: "{app}\palctl-daemon.exe"; Parameters: "uninstall-startup"; Flags: runhidden waituntilterminated; RunOnceId: "RemovePalctlStartup"

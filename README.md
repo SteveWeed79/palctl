@@ -153,8 +153,9 @@ Then it opens the GUI, and the **first-run wizard** does the rest:
 - **installs the server for you** from Steam via SteamCMD, if it isn't already
 - **enables the REST API** — seeds the blank `PalWorldSettings.ini`, sets
   `RESTAPIEnabled=True`, the port, and your admin password
-- **registers both Windows services** (the game server *and* the palctl daemon)
-  so everything survives a reboot
+- **registers the game server** as a Windows service and sets **palctl itself
+  to run in the background** — password-free login startup by default, or a
+  Windows service — so your server keeps being managed after a reboot or sign-in
 
 You still need to point it at, or let it install, a Palworld **dedicated
 server** — that software comes from Steam (app `2394010`). The wizard is happy to
@@ -250,7 +251,8 @@ pytest
 ruff check palctl tests
 ```
 
-Both run in CI on Windows and Linux, Python 3.11 and 3.12.
+`pytest` runs in CI on Windows and Linux for Python 3.11 and 3.12; `ruff` runs
+on Linux (Python 3.11). Keep both green.
 
 ---
 

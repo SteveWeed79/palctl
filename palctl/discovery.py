@@ -164,7 +164,11 @@ def server_root_from_process() -> Path | None:
     except Exception:
         return None
 
-    if exe.name.lower() == "palserver-win64-shipping.exe" and len(exe.parents) >= 4:
+    # The shipping binary sits at <root>/Pal/Binaries/<Win64|Linux>/; the thin
+    # PalServer launcher sits at <root>/. Handle both platforms — the running
+    # process is the most reliable signal and shouldn't be discarded on Linux.
+    shipping = ("palserver-win64-shipping.exe", "palserver-linux-shipping")
+    if exe.name.lower() in shipping and len(exe.parents) >= 4:
         root = exe.parents[3]
     else:
         root = exe.parent

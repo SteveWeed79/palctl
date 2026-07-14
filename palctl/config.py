@@ -174,7 +174,12 @@ class Config:
             return cls()
 
     def save(self) -> None:
-        CONFIG_PATH.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        # Write-then-rename so a crash/power-loss mid-write can't leave a
+        # truncated config.json — load() would quarantine it and silently revert
+        # every path/port/service name to the built-in defaults.
+        tmp = CONFIG_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        os.replace(tmp, CONFIG_PATH)
 
 
 # ---------------- secrets ----------------

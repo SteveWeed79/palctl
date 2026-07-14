@@ -13,6 +13,8 @@ def test_install_commands_full():
     )
     assert cmds[0] == ["nssm.exe", "install", "palctl-daemon", r"C:\app\palctl-daemon.exe"]
     joined = [" ".join(c) for c in cmds]
+    # Application is set explicitly so a re-install can repair a wrong exe path.
+    assert ["nssm.exe", "set", "palctl-daemon", "Application", r"C:\app\palctl-daemon.exe"] in cmds
     assert any("AppParameters" in j and "palctl.daemon" in j for j in joined)
     assert any("AppDirectory" in j for j in joined)
     # Auto-start is always configured, and last.
@@ -22,9 +24,10 @@ def test_install_commands_full():
 def test_install_commands_minimal_still_sets_autostart():
     cmds = winservice.install_commands("nssm.exe", "svc", "svc.exe")
     assert cmds[0] == ["nssm.exe", "install", "svc", "svc.exe"]
+    assert ["nssm.exe", "set", "svc", "Application", "svc.exe"] in cmds
     assert ["nssm.exe", "set", "svc", "Start", "SERVICE_AUTO_START"] in cmds
-    # No args and no app_dir -> only install + the autostart set.
-    assert len(cmds) == 2
+    # No args and no app_dir -> install + the Application set + the autostart set.
+    assert len(cmds) == 3
 
 
 def test_nssm_exe_in_prefers_arch(tmp_path: Path):

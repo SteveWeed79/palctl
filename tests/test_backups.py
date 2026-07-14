@@ -95,6 +95,15 @@ def test_mirror_copies_backup_and_is_idempotent(tmp_path: Path):
     assert [x.name for x in backups.listing(mirror_root)] == [b.name]
 
 
+def test_listing_ignores_partial_copies(tmp_path: Path):
+    # A mirror mid-copy leaves a "<name>.partial" dir; it must not be listed (or
+    # restored/pruned) as if it were a finished backup.
+    root = tmp_path / "backups"
+    (root / "2026-01-02_00-00-00-manual").mkdir(parents=True)
+    (root / "2026-01-01_00-00-00-manual.partial").mkdir()
+    assert [b.name for b in backups.listing(root)] == ["2026-01-02_00-00-00-manual"]
+
+
 def test_prune_keeps_newest_and_pre_restore(tmp_path: Path):
     root = tmp_path / "backups"
     root.mkdir()

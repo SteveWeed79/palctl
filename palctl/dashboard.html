@@ -157,7 +157,13 @@ const $ = (id) => document.getElementById(id);
 // The token arrives in the fragment (palctl ui puts it there). Remember it so
 // a plain reload of the same tab keeps working even if the hash gets edited.
 const token = location.hash.slice(1) || sessionStorage.getItem("palctl-token") || "";
-if (location.hash.slice(1)) sessionStorage.setItem("palctl-token", token);
+if (location.hash.slice(1)) {
+  sessionStorage.setItem("palctl-token", token);
+  // Strip the token out of the address bar and browser history right away, so it
+  // isn't left sitting in the URL. sessionStorage (per-tab, cleared when the tab
+  // closes) keeps a plain reload working.
+  history.replaceState(null, "", location.pathname + location.search);
+}
 
 const esc = (s) => String(s).replace(/[&<>"']/g,
   (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));

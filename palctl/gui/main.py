@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import httpx
-from PySide6.QtCore import QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -99,8 +99,10 @@ def call(path: str, body: dict | None = None) -> dict:
         # Connection refused etc. — nothing is listening on the daemon port.
         raise DaemonDown(
             "Can't reach the palctl daemon — it runs in the background and this "
-            "window only talks to it. Start the palctl-daemon service (or run "
-            "palctl-daemon), then try again."
+            "window only talks to it. If you haven't set palctl up yet, open "
+            "Setup → Run setup wizard. Otherwise start palctl in the background "
+            "(the wizard's background option, or the palctl-daemon service), "
+            "then try again."
         ) from e
     if r.status_code == 401:
         raise DaemonDown(
@@ -257,14 +259,20 @@ class Players(QWidget):
         v.addWidget(self.table)
 
         row = QHBoxLayout()
+        self._icon_buttons: list[tuple[QPushButton, str]] = []
         for label, action in (("Kick", "kick"), ("Ban", "ban")):
             b = QPushButton(icons.load_icon(f"action-{action}"), label)
             b.clicked.connect(lambda _=False, a=action: self._moderate(a))
             row.addWidget(b)
+            self._icon_buttons.append((b, f"action-{action}"))
         row.addStretch(1)
         v.addLayout(row)
 
         self._players: list[dict] = []
+
+    def retint(self) -> None:
+        for btn, name in self._icon_buttons:
+            btn.setIcon(icons.load_icon(name))
 
     def update_state(self, s: dict) -> None:
         self._players = s.get("players", [])
@@ -304,11 +312,13 @@ class Console(QWidget):
         v = QVBoxLayout(self)
 
         row = QHBoxLayout()
+        self._icon_buttons: list[tuple[QPushButton, str]] = []
         self.msg = QLineEdit(placeholderText="Announcement (spaces work — REST, not RCON)")
         row.addWidget(self.msg, 1)
         b = QPushButton(icons.load_icon("action-announce"), "Announce")
         b.clicked.connect(self._announce)
         row.addWidget(b)
+        self._icon_buttons.append((b, "action-announce"))
         v.addLayout(row)
 
         row2 = QHBoxLayout()
@@ -327,14 +337,20 @@ class Console(QWidget):
                 lambda _=False, a=action, c=confirm, text=label: self._act(a, c, text)
             )
             row2.addWidget(btn)
+            self._icon_buttons.append((btn, icon))
         v.addLayout(row2)
 
         restore_btn = QPushButton(icons.load_icon("action-restore"), "Restore backup…")
         restore_btn.clicked.connect(self._restore)
         v.addWidget(restore_btn)
+        self._icon_buttons.append((restore_btn, "action-restore"))
 
         self.log = QTextEdit(readOnly=True)
         v.addWidget(self.log, 1)
+
+    def retint(self) -> None:
+        for btn, name in self._icon_buttons:
+            btn.setIcon(icons.load_icon(name))
 
     def _announce(self) -> None:
         text = self.msg.text().strip()
@@ -606,6 +622,14 @@ class ConfigTab(QWidget):
         diag.clicked.connect(self._export_diagnostics)
         v.addWidget(diag)
         v.addStretch(1)
+        self._icon_buttons: list[tuple[QPushButton, str]] = [
+            (save, "action-save"),
+            (diag, "export-diagnostics"),
+        ]
+
+    def retint(self) -> None:
+        for btn, name in self._icon_buttons:
+            btn.setIcon(icons.load_icon(name))
 
     def _export_diagnostics(self) -> None:
         from ..diagnostics import build_bundle
@@ -685,28 +709,34 @@ class Main(QMainWindow):
         self.setWindowIcon(icons.app_icon())
         self.resize(1000, 780)
 
-        tabs = QTabWidget()
+        self.tabs = QTabWidget()
         self.dash = Dashboard()
         self.players = Players()
         self.console = Console()
         self.editor = SettingsEditor(self.cfg.live_ini, self.cfg.default_ini)
         self.config = ConfigTab(self.cfg)
 
-        tabs.addTab(self.dash, icons.load_icon("tab-dashboard"), "Dashboard")
-        tabs.addTab(self.players, icons.load_icon("tab-players"), "Players")
-        tabs.addTab(self.console, icons.load_icon("tab-console"), "Console")
-        tabs.addTab(self.editor, icons.load_icon("tab-settings"), "Settings")
-        tabs.addTab(self.config, icons.load_icon("tab-config"), "Config")
-        self.setCentralWidget(tabs)
+        self._tab_icons = [
+            "tab-dashboard", "tab-players", "tab-console", "tab-settings", "tab-config",
+        ]
+        for widget, icon, label in (
+            (self.dash, "tab-dashboard", "Dashboard"),
+            (self.players, "tab-players", "Players"),
+            (self.console, "tab-console", "Console"),
+            (self.editor, "tab-settings", "Settings"),
+            (self.config, "tab-config", "Config"),
+        ):
+            self.tabs.addTab(widget, icons.load_icon(icon), label)
+        self.setCentralWidget(self.tabs)
 
         # Setup wizard reachable from the window itself, not only the tray icon.
         # A reinstall keeps your %APPDATA% config, so the first-run auto-popup
         # won't fire on an upgrade — this is how you re-run setup on purpose
         # (e.g. to repoint the server service or re-enable the REST API).
         setup_menu = self.menuBar().addMenu("&Setup")
-        wizard_action = QAction(icons.load_icon("wizard"), "Run setup wizard…", self)
-        wizard_action.triggered.connect(lambda: self._open_wizard(first_run=False))
-        setup_menu.addAction(wizard_action)
+        self._wizard_action = QAction(icons.load_icon("wizard"), "Run setup wizard…", self)
+        self._wizard_action.triggered.connect(lambda: self._open_wizard(first_run=False))
+        setup_menu.addAction(self._wizard_action)
 
         self.status = self.statusBar()
         self.status.showMessage("Connecting to daemon…")
@@ -734,6 +764,31 @@ class Main(QMainWindow):
             call("/action/reload-config", {})
         except Exception:
             pass
+
+    def changeEvent(self, event) -> None:
+        # Re-tint the palette-following glyph icons when the OS light/dark theme
+        # flips — otherwise they'd keep the old tint until the app is relaunched.
+        if event.type() in (
+            QEvent.Type.PaletteChange,
+            QEvent.Type.ApplicationPaletteChange,
+            QEvent.Type.ThemeChange,
+        ):
+            self._retint_icons()
+        super().changeEvent(event)
+
+    def _retint_icons(self) -> None:
+        # Guard: changeEvent can fire during construction before these exist.
+        if not hasattr(self, "tabs"):
+            return
+        for i, name in enumerate(self._tab_icons):
+            self.tabs.setTabIcon(i, icons.load_icon(name))
+        self._wizard_action.setIcon(icons.load_icon("wizard"))
+        if hasattr(self, "_tray_setup_action"):
+            self._tray_setup_action.setIcon(icons.load_icon("wizard"))
+        for tab in (self.players, self.console, self.config):
+            tab.retint()
+        # Window/app icon (full-colour brand tile) and the tray icon (fixed
+        # semantic colours) don't follow the palette, so they need no redo.
 
     def _on_state(self, s: dict) -> None:
         self.dash.update_state(s)
@@ -782,6 +837,7 @@ class Main(QMainWindow):
         show = QAction("Show", self)
         show.triggered.connect(self.showNormal)
         setup = QAction(icons.load_icon("wizard"), "Setup wizard…", self)
+        self._tray_setup_action = setup
         setup.triggered.connect(lambda: self._open_wizard(first_run=False))
         quit_ = QAction("Quit GUI (daemon keeps running)", self)
         quit_.triggered.connect(QApplication.quit)

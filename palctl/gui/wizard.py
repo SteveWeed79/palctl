@@ -74,6 +74,9 @@ class SetupWorker(QThread):
         super().__init__()
         self._cfg = cfg
         self._plan = plan
+        # Whether the PalServer service actually got registered (a partial
+        # install skips it); read by the completion dialog so it stays truthful.
+        self.server_registered = False
 
     def _log(self, msg: str) -> None:
         self.line.emit(msg)
@@ -106,14 +109,16 @@ class SetupWorker(QThread):
             )
             self._log("  REST API enabled, port and admin password set.")
 
+            server_registered = False
             if plan.register_server_service:
-                self._register_server_service(cfg, plan)
+                server_registered = self._register_server_service(cfg, plan)
+            self.server_registered = server_registered
             if plan.daemon_startup == "login":
                 self._setup_login_startup()
             elif plan.daemon_startup == "service":
                 self._register_daemon_service()
 
-            self._verify_and_report(plan)
+            self._verify_and_report(plan, server_registered)
 
             self._log("\n✅ Setup complete.")
             self.done.emit(True)
@@ -203,15 +208,20 @@ class SetupWorker(QThread):
         elif line.strip():
             self._log(f"  {line}")
 
-    def _verify_and_report(self, plan: SetupPlan) -> None:
+    def _verify_and_report(self, plan: SetupPlan, server_registered: bool) -> None:
         """The payoff: actually start the server and confirm the REST API answers,
-        then print the address players connect to. 'It works' beats 'it's set up'."""
+        then print the address players connect to. 'It works' beats 'it's set up'.
+
+        Only starts/verifies when the server service was actually registered —
+        on a partial install (server files present but PalServer.exe missing)
+        registration is skipped, and starting a service that doesn't exist would
+        hang for the full timeout and then falsely claim it 'Registered'."""
         import asyncio
 
         from .. import netinfo, procs
         from ..api import PalApi
 
-        if plan.register_server_service:
+        if server_registered:
             self._log("Starting the server to check it actually works…")
             try:
                 asyncio.run(procs.start_service(plan.service_name))
@@ -248,19 +258,27 @@ class SetupWorker(QThread):
             "to this PC — palctl can't do that part for you."
         )
 
-    def _register_server_service(self, cfg: Config, plan: SetupPlan) -> None:
+    def _register_server_service(self, cfg: Config, plan: SetupPlan) -> bool:
+        """Register the PalServer Windows service. Returns False (skipped) when
+        PalServer.exe isn't there yet, so the caller doesn't try to start a
+        service that was never created."""
         from .. import winservice
 
         exe = Path(plan.server_root) / "PalServer.exe"
         if not exe.exists():
-            self._log(f"  ⚠️ {exe} not found — skipping the server service.")
-            return
+            self._log(
+                f"  ⚠️ {exe} not found — skipping the server service. Install the "
+                "server (tick “Install / update the server”) or fix the server "
+                "root, then run setup again."
+            )
+            return False
         self._log(f"Registering the '{plan.service_name}' Windows service…")
         nssm = winservice.ensure_nssm(config_dir() / "bin")
         winservice.install_service(
             nssm, plan.service_name, exe, PALSERVER_ARGS, plan.server_root, start=False
         )
         self._log(f"  Service '{plan.service_name}' registered.")
+        return True
 
     def _register_daemon_service(self) -> None:
         from .. import daemon
@@ -474,7 +492,10 @@ class SetupWizard(QDialog):
         when the user unticked service registration (or ran nothing in the
         background) is how the old dialog misled people onto a dead dashboard."""
         plan = getattr(self, "_plan", None)
-        started_server = bool(plan and plan.register_server_service)
+        worker = getattr(self, "_worker", None)
+        # What actually ran, not what was requested: a partial install can skip
+        # server registration even when the box was ticked.
+        started_server = bool(worker and getattr(worker, "server_registered", False))
         daemon_running = bool(plan and plan.daemon_startup != "none")
 
         if started_server:

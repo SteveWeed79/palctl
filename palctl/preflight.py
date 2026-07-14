@@ -208,7 +208,9 @@ def install_vcredist(on_line=None) -> int:
     try:
         if on_line:
             on_line("Downloading the Visual C++ runtime…")
-        with urllib.request.urlopen(VCREDIST_URL) as resp, path.open("wb") as f:
+        # Timeout so a hung CDN can't stall the wizard indefinitely. Integrity
+        # relies on the TLS connection to Microsoft's aka.ms host.
+        with urllib.request.urlopen(VCREDIST_URL, timeout=120) as resp, path.open("wb") as f:
             shutil.copyfileobj(resp, f)
         if on_line:
             on_line("Installing the Visual C++ runtime…")

@@ -89,7 +89,10 @@ class Scheduler:
             await asyncio.sleep(max(1, hours) * 3600)
             if not self._cfg.schedule.enabled or hours <= 0:
                 continue
-            await self.backup_now("scheduled")
+            try:
+                await self.backup_now("scheduled")
+            except Exception as e:
+                await self._bus.emit(Event("error", f"Scheduled backup failed: {e}"))
 
     async def backup_now(self, label: str = "manual") -> None:
         # Under the op lock: a backup mid-restore would copy a half-swapped
@@ -181,7 +184,12 @@ class Scheduler:
                 await asyncio.sleep(COUNTDOWN_MARKS[0])
                 continue
 
-            await self.restart_with_countdown("Scheduled daily restart")
+            try:
+                await self.restart_with_countdown("Scheduled daily restart")
+            except Exception as e:
+                await self._bus.emit(
+                    Event("error", f"Scheduled daily restart failed: {e}")
+                )
 
     # ---------- scheduled auto-update ----------
 
@@ -210,7 +218,10 @@ class Scheduler:
                 await asyncio.sleep(60)
                 continue
 
-            await self.update_server()
+            try:
+                await self.update_server()
+            except Exception as e:
+                await self._bus.emit(Event("error", f"Scheduled update failed: {e}"))
 
     async def check_update_available(self) -> bool:
         """Compare the installed build id to Steam's latest; emit an event if a
