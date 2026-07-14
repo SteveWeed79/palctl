@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
 import secrets
 import sys
 import time
@@ -35,6 +37,29 @@ from .scheduler import Scheduler
 from .watchdog import Watchdog
 
 SERVICE_NAME = "palctl-daemon"  # the Windows service name NSSM registers
+
+# The admin's Stop intent, persisted so it survives daemon restarts (crash +
+# NSSM restart, a palctl upgrade, a manual service bounce). Without this the
+# in-memory flag resets to True and the daily restart / auto-update schedule
+# would resurrect a server that was deliberately taken down for maintenance.
+_STATE_PATH = config_dir() / "daemon_state.json"
+
+
+def _load_desired_running() -> bool:
+    try:
+        state = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
+        return bool(state["desired_running"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return True  # no/unreadable state (e.g. first run) = normal behavior
+
+
+def _save_desired_running(value: bool) -> None:
+    try:
+        tmp = _STATE_PATH.with_name(_STATE_PATH.name + ".tmp")
+        tmp.write_text(json.dumps({"desired_running": value}), encoding="utf-8")
+        os.replace(tmp, _STATE_PATH)
+    except OSError:
+        pass  # best effort — worst case is the old resets-to-True behavior
 
 
 def _within_window(times: list[float], now: float, window: float = 3600.0) -> list[float]:
@@ -163,7 +188,9 @@ class Daemon:
         # Crash/hang auto-recovery bookkeeping. ("palctl is doing this on
         # purpose" now lives in the ServerController's operation lock.)
         self._ever_alive = False           # only recover a server that WAS up
-        self._desired_running = True       # user "Stop" flips this off
+        # User "Stop" flips this off. Loaded from disk so a daemon restart
+        # can't forget an intentional stop (the setter persists changes).
+        self._desired_running = _load_desired_running()
         self._down_polls = 0               # consecutive unreachable polls
         self._autorestart_times: list[float] = []
 
@@ -206,11 +233,30 @@ class Daemon:
     def _set_bot(self, bot) -> None:
         self.bot = bot
 
+    @property
+    def _desired_running(self) -> bool:
+        return self.__desired_running
+
+    @_desired_running.setter
+    def _desired_running(self, value: bool) -> None:
+        self.__desired_running = value
+        _save_desired_running(value)
+
     def _spawn(self, coro) -> None:
         # asyncio holds only weak refs to tasks; keep one or it can be GC'd mid-run.
         t = asyncio.create_task(coro)
         self._tasks.add(t)
-        t.add_done_callback(self._tasks.discard)
+        t.add_done_callback(self._spawned_done)
+
+    def _spawned_done(self, t: asyncio.Task) -> None:
+        self._tasks.discard(t)
+        # Without this, a failed operation surfaces only as asyncio's GC-time
+        # "Task exception was never retrieved" on stderr — which service mode
+        # discards entirely (NSSM captures no stdio; only the file log survives).
+        if not t.cancelled() and t.exception() is not None:
+            self.log.error(
+                "background operation failed", exc_info=t.exception()
+            )
 
     async def _persist(self, e: Event) -> None:
         await asyncio.to_thread(self.store.log_event, e)

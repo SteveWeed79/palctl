@@ -157,3 +157,37 @@ def test_metrics_limit_and_retention(tmp_path: Path):
     # And LIMIT returns the newest n, still oldest-first.
     store.log_metrics({"at": later + 1, "memory_mb": 3.0})
     assert [s["memory_mb"] for s in store.recent_metrics(1)] == [3.0]
+
+
+def test_corrupt_sessions_db_is_quarantined_not_fatal(tmp_path: Path):
+    # A corrupt sessions.db must not crash-loop the daemon under NSSM — same
+    # policy as a corrupt config.json: set it aside and start fresh.
+    db = tmp_path / "sessions.db"
+    db.write_bytes(b"this is not a sqlite database, it is garbage")
+
+    store = SessionStore(db)  # must not raise
+    store.log_metrics({"at": 1.0, "memory_mb": 1.0})  # and must be usable
+
+    assert (tmp_path / "sessions.db.broken").exists()  # evidence kept
+    assert [s["at"] for s in store.recent_metrics(10)] == [1.0]
+
+
+def test_unrecoverable_sessions_db_falls_back_to_memory(tmp_path: Path, monkeypatch):
+    # If even the recreated file can't be opened (e.g. the disk is full), the
+    # daemon still runs — history just doesn't persist.
+    import palctl.events as ev
+
+    db = tmp_path / "sessions.db"
+    db.write_bytes(b"garbage")
+
+    real_connect = ev.sqlite3.connect
+
+    def connect_fails_for_files(target, **kw):
+        if target != ":memory:":
+            raise ev.sqlite3.OperationalError("database or disk is full")
+        return real_connect(target, **kw)
+
+    monkeypatch.setattr(ev.sqlite3, "connect", connect_fails_for_files)
+    store = SessionStore(db)  # must not raise
+    store.log_metrics({"at": 2.0, "memory_mb": 1.0})
+    assert [s["at"] for s in store.recent_metrics(10)] == [2.0]
