@@ -96,3 +96,20 @@ def test_auth_middleware_exempts_only_the_named_paths():
     assert asyncio.run(mw(page, _ok_handler)) == "OK"
     data = types.SimpleNamespace(headers={}, path="/state")
     assert asyncio.run(mw(data, _ok_handler)).status == 401
+
+
+# ---------------- machine-account detection ----------------
+
+
+def test_service_account_warning_flags_machine_accounts():
+    from palctl.daemon import service_account_warning
+
+    for name in ("SYSTEM", "system", "GAMEBOX$"):
+        msg = service_account_warning(name, r"C:\odd\appdata\palctl")
+        assert msg and "install-service --as-user" in msg
+
+
+def test_service_account_warning_quiet_for_real_users():
+    from palctl.daemon import service_account_warning
+
+    assert service_account_warning("steve", "/home/steve/.config/palctl") is None

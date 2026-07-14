@@ -50,16 +50,38 @@ def install_commands(
     exe: str | Path,
     args: str = "",
     app_dir: str | Path | None = None,
+    *,
+    user: str | None = None,
+    password: str | None = None,
+    appdata: str | None = None,
 ) -> list[list[str]]:
     """
     The ordered NSSM calls that create and configure a service. Pure — the
     runner just executes what this returns, which is also what makes it testable.
+
+    The account matters more than it looks: a service defaults to LocalSystem,
+    which has its OWN %APPDATA% and Credential Manager — a daemon there reads a
+    different config.json and token than the user's GUI, and can't decrypt the
+    user's DPAPI secrets at all. So:
+
+      * `user`/`password` set — run the service AS that account (ObjectName).
+        Everything just works; this is the recommended mode.
+      * else, `appdata` set — stay LocalSystem but point %APPDATA% at the
+        installing user's config dir, so at least config, token, and logs are
+        shared. Per-user secrets remain unreadable (the daemon falls back to
+        the AdminPassword already sitting in PalWorldSettings.ini).
     """
     cmds: list[list[str]] = [[str(nssm), "install", name, str(exe)]]
     if args:
         cmds.append([str(nssm), "set", name, "AppParameters", args])
     if app_dir:
         cmds.append([str(nssm), "set", name, "AppDirectory", str(app_dir)])
+    if user:
+        cmds.append([str(nssm), "set", name, "ObjectName", user, password or ""])
+    elif appdata:
+        cmds.append(
+            [str(nssm), "set", name, "AppEnvironmentExtra", f"APPDATA={appdata}"]
+        )
     cmds.append([str(nssm), "set", name, "Start", "SERVICE_AUTO_START"])
     return cmds
 
@@ -86,10 +108,15 @@ def install_service(
     args: str = "",
     app_dir: str | Path | None = None,
     *,
+    user: str | None = None,
+    password: str | None = None,
+    appdata: str | None = None,
     start: bool = True,
 ) -> None:
     """Create/configure the service, then optionally start it."""
-    for cmd in install_commands(nssm, name, exe, args, app_dir):
+    for cmd in install_commands(
+        nssm, name, exe, args, app_dir, user=user, password=password, appdata=appdata
+    ):
         _run(cmd)
     if start:
         _run([str(nssm), "start", name])

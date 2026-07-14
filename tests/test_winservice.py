@@ -48,3 +48,34 @@ def test_nssm_exe_in_falls_back_to_any(tmp_path: Path):
 
 def test_nssm_exe_in_none_when_absent(tmp_path: Path):
     assert winservice.nssm_exe_in(tmp_path) is None
+
+
+def test_install_commands_as_user_sets_objectname():
+    cmds = winservice.install_commands(
+        "nssm.exe", "svc", "svc.exe", user=r".\steve", password="hunter2",
+    )
+    assert ["nssm.exe", "set", "svc", "ObjectName", r".\steve", "hunter2"] in cmds
+
+
+def test_install_commands_localsystem_redirects_appdata():
+    # Without a user account, the service stays LocalSystem — whose %APPDATA%
+    # is NOT the installing user's. The redirect keeps daemon and GUI reading
+    # the same config, token, and logs.
+    cmds = winservice.install_commands(
+        "nssm.exe", "svc", "svc.exe", appdata=r"C:\Users\steve\AppData\Roaming",
+    )
+    assert [
+        "nssm.exe", "set", "svc", "AppEnvironmentExtra",
+        r"APPDATA=C:\Users\steve\AppData\Roaming",
+    ] in cmds
+
+
+def test_install_commands_user_wins_over_appdata_redirect():
+    # Running AS the user makes the redirect pointless — never set both.
+    cmds = winservice.install_commands(
+        "nssm.exe", "svc", "svc.exe",
+        user=r".\steve", password="pw", appdata=r"C:\Users\steve\AppData\Roaming",
+    )
+    joined = [" ".join(c) for c in cmds]
+    assert any("ObjectName" in j for j in joined)
+    assert not any("AppEnvironmentExtra" in j for j in joined)

@@ -192,6 +192,15 @@ registers the daemon service without touching a terminal full of `nssm` lines.
 Secrets go into Windows Credential Manager (DPAPI-encrypted), never into a config
 file.
 
+> **Which account runs the service?** By default the service runs as
+> LocalSystem with `%APPDATA%` redirected to yours, so it shares your config,
+> token, and logs — and it reads `AdminPassword` from the server's own ini,
+> which is where Palworld keeps it anyway. The one thing LocalSystem can't
+> reach is your DPAPI-encrypted secrets (the Discord bot token). Using the
+> bot? Register with `palctl-daemon install-service --as-user` — the service
+> then runs as *you* and sees everything the GUI saved. It asks for your
+> Windows password once, passing it straight to the service manager.
+
 ### Linux (headless)
 
 The daemon and its whole core — REST client, memory-leak watchdog, scheduler,

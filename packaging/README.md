@@ -33,7 +33,11 @@ The installer lands in `packaging\Output\palctl-setup.exe`.
 - Adds Start-Menu (and optional desktop) shortcuts, and can optionally add the
   install dir to the PATH so `palctl` works in any terminal.
 - Optionally runs `palctl-daemon.exe install-service`, which downloads NSSM and
-  registers **palctl-daemon** as an always-on Windows service.
+  registers **palctl-daemon** as an always-on Windows service. The service stays
+  on LocalSystem but with `%APPDATA%` redirected to the installing user's, so
+  the daemon and GUI share one config and token. To also share DPAPI secrets
+  (the Discord bot token), re-register later with
+  `palctl-daemon install-service --as-user`.
 - Launches the GUI, whose **first-run wizard** finishes the job: auto-detect the
   server, turn on the REST API, optionally install the server with SteamCMD, and
   register the **PalServer** service.

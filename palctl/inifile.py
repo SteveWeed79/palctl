@@ -239,3 +239,20 @@ def is_blank(path: Path) -> bool:
     if not path.exists():
         return True
     return "OptionSettings" not in path.read_text(encoding="utf-8-sig")
+
+
+def read_admin_password(live_ini: Path) -> str:
+    """
+    AdminPassword straight from the server's own ini.
+
+    The REST API password IS this value, and Palworld already stores it in the
+    ini in cleartext — so reading it here adds no new secret to disk. It's the
+    fallback for a daemon that can't see the per-user keyring (classic case: a
+    Windows service running as LocalSystem, which has its own Credential
+    Manager). Returns "" when the ini is missing, blank, or has no password.
+    """
+    try:
+        value = PalSettings.load(live_ini).get("AdminPassword", "")
+    except (OSError, ValueError):
+        return ""
+    return str(value) if value else ""
