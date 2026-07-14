@@ -10,7 +10,12 @@
 ; (build.ps1 does both.)
 
 #define AppName "palctl"
-#define AppVersion "0.1.0"
+; AppVersion is injected by the release workflow (ISCC /DAppVersion=x.y.z)
+; from palctl/__init__.py, so it can't drift from the code. The fallback
+; marks ad-hoc local builds as such.
+#ifndef AppVersion
+  #define AppVersion "0.0.0-dev"
+#endif
 #define AppPublisher "palctl"
 
 [Setup]

@@ -6,7 +6,7 @@
 # release (the release workflow already publishes SHA256SUMS.txt), then run
 # `winget validate` before opening the PR. After that: `winget install palctl`.
 PackageIdentifier: SteveWeed79.palctl
-PackageVersion: 0.1.0
+PackageVersion: 0.1.6
 InstallerType: inno
 InstallModes:
   - interactive
@@ -14,7 +14,7 @@ InstallModes:
   - silentWithProgress
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/SteveWeed79/pal-it-up/releases/download/v0.1.0/palctl-setup.exe
+    InstallerUrl: https://github.com/SteveWeed79/pal-it-up/releases/download/0.1.6/palctl-setup.exe
     InstallerSha256: REPLACE_WITH_SHA256_FROM_SHA256SUMS_TXT
 ManifestType: installer
 ManifestVersion: 1.6.0
