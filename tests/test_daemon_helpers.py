@@ -11,10 +11,12 @@ import pytest
 
 pytest.importorskip("aiohttp")
 
+import palctl.daemon as daemon_mod  # noqa: E402
 from palctl.daemon import (  # noqa: E402  (after importorskip guard)
     _within_window,
     autorecover_phase,
     make_auth_middleware,
+    service_target,
     should_recover_now,
 )
 from palctl.localauth import TOKEN_HEADER  # noqa: E402
@@ -113,3 +115,45 @@ def test_service_account_warning_quiet_for_real_users():
     from palctl.daemon import service_account_warning
 
     assert service_account_warning("steve", "/home/steve/.config/palctl") is None
+
+
+# ---------------- frozen service target ----------------
+
+
+def test_service_target_frozen_resolves_daemon_exe_from_gui(tmp_path, monkeypatch):
+    # The onedir frozen build ships palctl-daemon.exe and palctl-gui.exe side by
+    # side. The wizard registers the daemon service from inside the GUI process,
+    # so sys.executable is the GUI — but the service must still point at the
+    # DAEMON exe, or the daemon never runs and every GUI action hits 10061.
+    (tmp_path / "palctl-daemon.exe").write_bytes(b"MZ")
+    gui = tmp_path / "palctl-gui.exe"
+    gui.write_bytes(b"MZ")
+
+    monkeypatch.setattr(daemon_mod.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(daemon_mod.sys, "executable", str(gui))
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+
+    exe, args, app_dir = service_target()
+    assert exe.endswith("palctl-daemon.exe")
+    assert args == ""
+    assert app_dir == str(tmp_path)
+
+
+def test_service_target_frozen_falls_back_when_daemon_exe_absent(tmp_path, monkeypatch):
+    # Odd layout (no sibling daemon exe): register the running exe rather than a
+    # path that doesn't exist.
+    gui = tmp_path / "palctl-gui.exe"
+    gui.write_bytes(b"MZ")
+
+    monkeypatch.setattr(daemon_mod.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(daemon_mod.sys, "executable", str(gui))
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+
+    exe, _, _ = service_target()
+    assert exe == str(gui)
+
+
+def test_service_target_dev_uses_module_invocation(monkeypatch):
+    monkeypatch.setattr(daemon_mod.sys, "frozen", False, raising=False)
+    exe, args, _ = service_target()
+    assert args == "-m palctl.daemon"
