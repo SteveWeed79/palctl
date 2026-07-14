@@ -51,6 +51,7 @@ MODULES = [
     "palctl.logging_setup",
     "palctl.bot",
     "palctl.daemon",
+    "palctl.gui.icons",
     "palctl.gui.main",
     "palctl.gui.settings_editor",
     "palctl.gui.wizard",

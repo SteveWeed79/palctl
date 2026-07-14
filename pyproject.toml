@@ -41,6 +41,9 @@ include = ["palctl*"]
 [tool.setuptools.package-data]
 # The web dashboard the daemon serves at / — one self-contained file.
 palctl = ["dashboard.html"]
+# The GUI icon set (tinted at runtime by palctl/gui/icons.py). app-icon-tile.svg
+# is the composed brand tile used for the window/taskbar icon.
+"palctl.gui" = ["icons/*.svg"]
 
 [tool.ruff]
 line-length = 100

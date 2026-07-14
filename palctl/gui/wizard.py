@@ -41,6 +41,7 @@ from ..config import (
     set_admin_password,
 )
 from ..discovery import detect_server_roots, detect_steamcmd, is_server_root, is_steamcmd
+from . import icons
 from .main import PathPicker
 from .widgets import NoScrollSpinBox
 
@@ -277,6 +278,7 @@ class SetupWizard(QDialog):
         self._cfg = cfg
         self._worker: SetupWorker | None = None
         self.setWindowTitle("palctl setup")
+        self.setWindowIcon(icons.load_icon("wizard"))
         self.resize(760, 620)
 
         root = QVBoxLayout(self)
@@ -378,9 +380,11 @@ class SetupWizard(QDialog):
         buttons.addStretch(1)
         self.close_btn = QPushButton("Close")
         self.close_btn.clicked.connect(self.reject)
-        self.check_btn = QPushButton("Check readiness")
+        self.check_btn = QPushButton(
+            icons.load_icon("status-ok", color=icons.OK), "Check readiness"
+        )
         self.check_btn.clicked.connect(self._check_readiness)
-        self.run_btn = QPushButton("Run setup")
+        self.run_btn = QPushButton(icons.load_icon("wizard"), "Run setup")
         self.run_btn.clicked.connect(self._run)
         buttons.addWidget(self.close_btn)
         buttons.addWidget(self.check_btn)

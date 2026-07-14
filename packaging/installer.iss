@@ -31,6 +31,11 @@ DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 OutputBaseFilename=palctl-setup
 OutputDir=Output
+; The installer's own icon (and, via UninstallDisplayIcon below, the entry in
+; Apps & features). Committed by packaging/make_icon.py; path is relative to
+; this .iss file.
+SetupIconFile=app-icon.ico
+UninstallDisplayIcon={app}\palctl-gui.exe
 Compression=lzma2
 SolidCompression=yes
 ; Registering a Windows service needs elevation.

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import httpx
 from PySide6.QtCore import QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QIcon, QPixmap
+from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -60,6 +60,7 @@ from ..discovery import (
     is_steamcmd,
 )
 from ..localauth import TOKEN_HEADER, get_or_create_token
+from . import icons
 from .settings_editor import SettingsEditor
 from .widgets import NoScrollSpinBox, NoScrollTimeEdit
 
@@ -257,7 +258,7 @@ class Players(QWidget):
 
         row = QHBoxLayout()
         for label, action in (("Kick", "kick"), ("Ban", "ban")):
-            b = QPushButton(label)
+            b = QPushButton(icons.load_icon(f"action-{action}"), label)
             b.clicked.connect(lambda _=False, a=action: self._moderate(a))
             row.addWidget(b)
         row.addStretch(1)
@@ -305,28 +306,30 @@ class Console(QWidget):
         row = QHBoxLayout()
         self.msg = QLineEdit(placeholderText="Announcement (spaces work — REST, not RCON)")
         row.addWidget(self.msg, 1)
-        b = QPushButton("Announce")
+        b = QPushButton(icons.load_icon("action-announce"), "Announce")
         b.clicked.connect(self._announce)
         row.addWidget(b)
         v.addLayout(row)
 
         row2 = QHBoxLayout()
-        for label, action, confirm in (
-            ("Save world", "save", False),
-            ("Backup now", "backup", False),
-            ("Start", "start", False),
-            ("Stop", "stop", True),
-            ("Restart (countdown)", "restart", True),
-            ("Update (SteamCMD)", "update-server", True),
+        # The daemon action name and the icon name mostly line up; `icon` names
+        # the glyph where they don't (update-server -> action-update).
+        for label, action, confirm, icon in (
+            ("Save world", "save", False, "action-save"),
+            ("Backup now", "backup", False, "action-backup"),
+            ("Start", "start", False, "action-start"),
+            ("Stop", "stop", True, "action-stop"),
+            ("Restart (countdown)", "restart", True, "action-restart"),
+            ("Update (SteamCMD)", "update-server", True, "action-update"),
         ):
-            btn = QPushButton(label)
+            btn = QPushButton(icons.load_icon(icon), label)
             btn.clicked.connect(
                 lambda _=False, a=action, c=confirm, text=label: self._act(a, c, text)
             )
             row2.addWidget(btn)
         v.addLayout(row2)
 
-        restore_btn = QPushButton("Restore backup…")
+        restore_btn = QPushButton(icons.load_icon("action-restore"), "Restore backup…")
         restore_btn.clicked.connect(self._restore)
         v.addWidget(restore_btn)
 
@@ -592,11 +595,14 @@ class ConfigTab(QWidget):
         )
         v.addWidget(dc)
 
-        save = QPushButton("Save config && reload daemon")
+        save = QPushButton(icons.load_icon("action-save"), "Save config && reload daemon")
         save.clicked.connect(self._save)
         v.addWidget(save)
 
-        diag = QPushButton("Export diagnostics (logs + config) for a bug report…")
+        diag = QPushButton(
+            icons.load_icon("export-diagnostics"),
+            "Export diagnostics (logs + config) for a bug report…",
+        )
         diag.clicked.connect(self._export_diagnostics)
         v.addWidget(diag)
         v.addStretch(1)
@@ -676,6 +682,7 @@ class Main(QMainWindow):
         super().__init__()
         self.cfg = Config.load()
         self.setWindowTitle("palctl — Palworld server control")
+        self.setWindowIcon(icons.app_icon())
         self.resize(1000, 780)
 
         tabs = QTabWidget()
@@ -685,11 +692,11 @@ class Main(QMainWindow):
         self.editor = SettingsEditor(self.cfg.live_ini, self.cfg.default_ini)
         self.config = ConfigTab(self.cfg)
 
-        tabs.addTab(self.dash, "Dashboard")
-        tabs.addTab(self.players, "Players")
-        tabs.addTab(self.console, "Console")
-        tabs.addTab(self.editor, "Settings")
-        tabs.addTab(self.config, "Config")
+        tabs.addTab(self.dash, icons.load_icon("tab-dashboard"), "Dashboard")
+        tabs.addTab(self.players, icons.load_icon("tab-players"), "Players")
+        tabs.addTab(self.console, icons.load_icon("tab-console"), "Console")
+        tabs.addTab(self.editor, icons.load_icon("tab-settings"), "Settings")
+        tabs.addTab(self.config, icons.load_icon("tab-config"), "Config")
         self.setCentralWidget(tabs)
 
         # Setup wizard reachable from the window itself, not only the tray icon.
@@ -697,7 +704,7 @@ class Main(QMainWindow):
         # won't fire on an upgrade — this is how you re-run setup on purpose
         # (e.g. to repoint the server service or re-enable the REST API).
         setup_menu = self.menuBar().addMenu("&Setup")
-        wizard_action = QAction("Run setup wizard…", self)
+        wizard_action = QAction(icons.load_icon("wizard"), "Run setup wizard…", self)
         wizard_action.triggered.connect(lambda: self._open_wizard(first_run=False))
         setup_menu.addAction(wizard_action)
 
@@ -734,19 +741,47 @@ class Main(QMainWindow):
         svc = s.get("service", "?")
         n = len(s.get("players", []))
         self.status.showMessage(f"Daemon OK · service {svc} · {n} online")
+        self._set_tray_state(*self._tray_state_for(s))
+
+    def _tray_state_for(self, s: dict) -> tuple[str, str]:
+        """Map daemon state to a tray (icon-state, tooltip). Idle/green only when
+        the server is up and its REST API is answering; amber for anything
+        transitional or not-yet-serving; the daemon itself being reachable means
+        it's never 'error' here (that's reserved for _on_failed)."""
+        svc = s.get("service", "UNKNOWN")
+        n = len(s.get("players", []))
+        if s.get("restarting") or svc in ("START_PENDING", "STOP_PENDING"):
+            return "warning", f"palctl — server {svc.replace('_', ' ').lower()}"
+        if svc == "RUNNING":
+            if s.get("alive"):
+                return "idle", f"palctl — server running · {n} online"
+            return "warning", "palctl — server up, REST API not answering yet"
+        return "warning", "palctl — server stopped"
+
+    def _set_tray_state(self, state: str, tooltip: str) -> None:
+        # Only touch the tray when the state actually changes — repainting the
+        # icon every 2s poll is needless churn.
+        if getattr(self, "_tray_state", None) == state:
+            self.tray.setToolTip(tooltip)
+            return
+        self._tray_state = state
+        self.tray.setIcon(icons.tray_icon(state))
+        self.tray.setToolTip(tooltip)
 
     def _on_failed(self, err: str) -> None:
         # `err` is already a plain-English sentence for the common case (daemon
         # down / token mismatch); show it as-is rather than wrapping it again.
         self.status.showMessage(err)
+        self._set_tray_state("error", "palctl — can't reach the daemon")
 
     def _tray(self) -> None:
-        icon = QIcon.fromTheme("applications-games")
-        self.tray = QSystemTrayIcon(icon, self)
+        self._tray_state: str | None = None
+        self.tray = QSystemTrayIcon(icons.tray_icon("idle"), self)
+        self._tray_state = "idle"
         menu = QMenu()
         show = QAction("Show", self)
         show.triggered.connect(self.showNormal)
-        setup = QAction("Setup wizard…", self)
+        setup = QAction(icons.load_icon("wizard"), "Setup wizard…", self)
         setup.triggered.connect(lambda: self._open_wizard(first_run=False))
         quit_ = QAction("Quit GUI (daemon keeps running)", self)
         quit_.triggered.connect(QApplication.quit)
