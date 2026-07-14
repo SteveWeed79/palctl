@@ -29,7 +29,10 @@ Write-Host "==> Binaries are in dist\palctl\"
 $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 if (Test-Path $iscc) {
     Write-Host "==> Compiling installer with Inno Setup"
-    & $iscc packaging\installer.iss
+    # Same version injection as the release workflow: palctl/__init__.py is
+    # the single source, so local builds report the right version too.
+    $ver = & $py -c "import palctl; print(palctl.__version__)"
+    & $iscc /DAppVersion=$ver packaging\installer.iss
     Write-Host "==> Installer written to packaging\Output\palctl-setup.exe"
 } else {
     Write-Host "Inno Setup 6 not found at '$iscc'."
