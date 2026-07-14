@@ -141,7 +141,13 @@ class Daemon:
         # watchdog, and auto-recovery all share it, so a scheduled restart
         # can't fire mid-update and a watchdog restart can't race a restore.
         self.control = ServerController(self.cfg, self.api)
-        self.scheduler = Scheduler(self.cfg, self.api, self.bus, self.control)
+        # `intent_running` lets the scheduler see the admin's Stop intent so a
+        # time-triggered restart/update won't resurrect a deliberately-stopped
+        # server. Read lazily (lambda) — `_desired_running` is set just below.
+        self.scheduler = Scheduler(
+            self.cfg, self.api, self.bus, self.control,
+            intent_running=lambda: self._desired_running,
+        )
         self.watchdog = Watchdog(self.cfg, self.api, self.bus, self.control)
         self.bot = None  # set by run_bot if the Discord bot is enabled
 
@@ -235,6 +241,7 @@ class Daemon:
             await self._maybe_autorecover()
             return
 
+        first_poll = self._alive is None
         if self._alive is False:
             await self.bus.emit(Event("server_up", "🟢 Server is **up**."))
             self._epoch_at = time.time()  # fresh process; old memory samples don't apply
@@ -246,6 +253,15 @@ class Daemon:
 
         stats = procs.proc_stats()
         self._last_metrics = metrics
+
+        if first_poll:
+            # Daemon (re)started while the server was already up: `_history` was
+            # seeded from SQLite and may span a *previous* server process whose
+            # restart drop would flatten the leak fit. Anchor the forecaster to
+            # this server process's start so those older samples are excluded
+            # (fall back to now if we can't read the process — safe, just
+            # discards the seeded history for forecasting).
+            self._epoch_at = time.time() - (stats.uptime_seconds if stats else 0.0)
         sample = {
             "at": time.time(),
             "fps": metrics.server_fps,

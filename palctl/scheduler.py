@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -38,6 +39,7 @@ class Scheduler:
         api: PalApi,
         bus: EventBus,
         control: ServerController | None = None,
+        intent_running: Callable[[], bool] | None = None,
     ) -> None:
         self._cfg = cfg
         self._api = api
@@ -46,6 +48,12 @@ class Scheduler:
         # updates, restores, the watchdog, and auto-recovery all serialise on
         # one lock. Standalone construction (tests) gets a private one.
         self._control = control or ServerController(cfg, api)
+        # Reports whether the admin currently *wants* the server running (the
+        # daemon's `_desired_running`). The time-triggered restart/update loops
+        # consult it so a server deliberately stopped for maintenance is not
+        # silently brought back to life at 06:00. None = always-running (tests
+        # and standalone use), matching the previous behaviour.
+        self._intent_running = intent_running
 
     def reconfigure(self, cfg: Config, api: PalApi) -> None:
         self._cfg = cfg
@@ -141,6 +149,11 @@ class Scheduler:
 
     # ---------- daily restart ----------
 
+    def _intentionally_stopped(self) -> bool:
+        """True when the admin has deliberately stopped the server, so a
+        time-triggered restart/update must not resurrect it."""
+        return self._intent_running is not None and not self._intent_running()
+
     def _next_restart(self) -> datetime:
         return next_daily(datetime.now(), self._cfg.schedule.daily_restart_at, 6)
 
@@ -155,6 +168,17 @@ class Scheduler:
             await asyncio.sleep(max(0.0, wait - COUNTDOWN_MARKS[0]))
 
             if not (self._cfg.schedule.enabled and self._cfg.schedule.daily_restart):
+                continue
+            if self._intentionally_stopped():
+                await self._bus.emit(
+                    Event(
+                        "restart",
+                        "⏸️ Skipped the scheduled daily restart — the server is "
+                        "stopped on purpose. Start it and it'll resume tomorrow.",
+                    )
+                )
+                # Don't busy-wait the mark again; wait out the countdown window.
+                await asyncio.sleep(COUNTDOWN_MARKS[0])
                 continue
 
             await self.restart_with_countdown("Scheduled daily restart")
@@ -174,6 +198,16 @@ class Scheduler:
             await asyncio.sleep(max(0.0, wait))
 
             if not (self._cfg.schedule.enabled and self._cfg.schedule.auto_update):
+                continue
+            if self._intentionally_stopped():
+                await self._bus.emit(
+                    Event(
+                        "update",
+                        "⏸️ Skipped the scheduled server update — the server is "
+                        "stopped on purpose. Start it, then use Update when ready.",
+                    )
+                )
+                await asyncio.sleep(60)
                 continue
 
             await self.update_server()
@@ -257,8 +291,7 @@ class Scheduler:
         down for nothing.
         """
         cfg = self._cfg
-        src = Path(cfg.backup_root) / name
-        if any(c in name for c in ("..", "/", "\\")) or not src.is_dir():
+        if not backups.is_restorable(Path(cfg.backup_root), name):
             await self._bus.emit(Event("error", f"Restore aborted: no such backup '{name}'."))
             return
 

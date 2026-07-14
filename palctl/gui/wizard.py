@@ -177,6 +177,18 @@ class SetupWorker(QThread):
         )
         self._log(f"  SteamCMD finished (exit {code}).")
 
+        # SteamCMD's exit code is famously unreliable, so verify the actual
+        # artifact: if the server files aren't there, the download didn't finish.
+        # Abort with the real reason instead of falling through to ensure_rest_api's
+        # misleading "is the server installed at that path?" error a step later.
+        if not cfg.default_ini.exists():
+            raise RuntimeError(
+                f"The Palworld server files aren't present after SteamCMD ran "
+                f"(exit {code}). The download didn't finish — usually a dropped "
+                "internet connection or the disk filling up. Check both, then run "
+                "setup again."
+            )
+
     def _steam_sink(self, line: str) -> None:
         """Turn SteamCMD's chatty output into a single, updating percentage so a
         multi-GB download doesn't look frozen or spam the log."""
@@ -440,6 +452,8 @@ class SetupWizard(QDialog):
             daemon_startup=self._daemon_startup(),
             service_name=self._cfg.service_name or "PalServer",
         )
+        # Kept so the completion dialog can describe what actually ran.
+        self._plan = plan
 
         self.run_btn.setEnabled(False)
         self.check_btn.setEnabled(False)
@@ -455,6 +469,35 @@ class SetupWizard(QDialog):
     def _append(self, line: str) -> None:
         self.log.append(line)
 
+    def _completion_message(self) -> str:
+        """Describe only what actually ran. Claiming 'the server was started'
+        when the user unticked service registration (or ran nothing in the
+        background) is how the old dialog misled people onto a dead dashboard."""
+        plan = getattr(self, "_plan", None)
+        started_server = bool(plan and plan.register_server_service)
+        daemon_running = bool(plan and plan.daemon_startup != "none")
+
+        if started_server:
+            lead = (
+                "palctl is configured and your server was started. The log below "
+                "shows the address your friends connect to."
+            )
+        else:
+            lead = (
+                "palctl is configured. You chose not to register the server as a "
+                "service, so start it yourself when you're ready."
+            )
+
+        if daemon_running:
+            tail = "\n\nClick Finish to open the dashboard."
+        else:
+            tail = (
+                "\n\nNothing is running in the background yet — the dashboard will "
+                "say the daemon is down until you start palctl (re-run setup and "
+                "pick a background option, or launch palctl-daemon)."
+            )
+        return lead + tail
+
     def _finished(self, ok: bool) -> None:
         self.progress.hide()
         self.run_btn.setEnabled(True)
@@ -467,10 +510,7 @@ class SetupWizard(QDialog):
             self.close_btn.setDefault(True)
             self.close_btn.setFocus()
             QMessageBox.information(
-                self, "Setup complete",
-                "palctl is configured and the server was started. The log below "
-                "shows the address your friends connect to.\n\n"
-                "Click Finish to close this wizard and open the dashboard.",
+                self, "Setup complete", self._completion_message(),
             )
         else:
             # Failure used to be silent — the wizard just sat there. Say so.

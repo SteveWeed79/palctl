@@ -48,6 +48,36 @@ def listing(backup_root: Path) -> list[Backup]:
     return sorted(out, key=lambda b: b.name, reverse=True)
 
 
+def _safe_backup_path(backup_root: Path, name: str) -> Path:
+    """
+    Resolve `name` to a backup directory *directly under* backup_root, or raise
+    ValueError.
+
+    Rejects path-traversal (`..`, separators) and — critically — the empty
+    string and `.`, both of which `backup_root / name` collapses back to
+    backup_root itself. Without this a name of "" or "." sails past the old
+    substring check and makes restore()/delete() operate on the entire backups
+    folder (rmtree the lot, or copy every backup over the live world).
+    """
+    if not name or not name.strip() or name in (".", ".."):
+        raise ValueError(f"Invalid backup name: {name!r}")
+    if "/" in name or "\\" in name or ".." in name:
+        raise ValueError(f"Invalid backup name: {name!r}")
+    src = backup_root / name
+    if src.resolve().parent != backup_root.resolve():
+        raise ValueError(f"Invalid backup name: {name!r}")
+    return src
+
+
+def is_restorable(backup_root: Path, name: str) -> bool:
+    """True if `name` is a safe, existing backup directory — the non-raising
+    pre-check callers use to reject a bad name before taking the server down."""
+    try:
+        return _safe_backup_path(backup_root, name).is_dir()
+    except ValueError:
+        return False
+
+
 def restore(backup_root: Path, name: str, savegames: Path) -> None:
     """
     CALLER MUST STOP THE SERVER FIRST — copying over a live save corrupts it.
@@ -55,8 +85,8 @@ def restore(backup_root: Path, name: str, savegames: Path) -> None:
     Snapshots the current world before overwriting, so restoring the wrong
     backup is itself undoable.
     """
-    src = backup_root / name
-    if not src.is_dir() or ".." in name or "/" in name or "\\" in name:
+    src = _safe_backup_path(backup_root, name)
+    if not src.is_dir():
         raise ValueError(f"Invalid backup: {name}")
 
     if savegames.exists():
@@ -83,8 +113,8 @@ def mirror(backup_path: Path, mirror_root: Path) -> Path:
 
 
 def delete(backup_root: Path, name: str) -> None:
-    target = backup_root / name
-    if not target.is_dir() or ".." in name or "/" in name or "\\" in name:
+    target = _safe_backup_path(backup_root, name)
+    if not target.is_dir():
         raise ValueError(f"Invalid backup: {name}")
     shutil.rmtree(target)
 
