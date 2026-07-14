@@ -5,6 +5,9 @@ raising."""
 
 import socket
 import sys
+import types
+
+import pytest
 
 from palctl import preflight
 
@@ -61,9 +64,32 @@ def test_check_icon_mapping():
 
 
 def test_run_all_scopes_checks_to_intent(tmp_path):
-    # Not installing and not registering services -> only the port check applies.
+    # Not installing and not registering services -> port + instance checks.
+    # (The single-server-instance check always applies; without psutil it just
+    # reports "couldn't check", but it's still in the list.)
     checks = preflight.run_all(tmp_path, 8212, need_install=False, need_admin=False)
-    assert [c.name for c in checks] == ["Port 8212 free"]
+    assert [c.name for c in checks] == ["Port 8212 free", "Single server instance"]
 
     names = {c.name for c in preflight.run_all(tmp_path, 8212)}
     assert "Disk space" in names and "Visual C++ runtime" in names
+
+
+def test_single_instance_ok_with_zero_or_one(monkeypatch):
+    procs = pytest.importorskip("palctl.procs")
+    monkeypatch.setattr(procs, "shipping_processes", lambda: [])
+    assert preflight.check_single_server_instance().ok is True
+
+    monkeypatch.setattr(procs, "shipping_processes", lambda: [types.SimpleNamespace(pid=1)])
+    assert preflight.check_single_server_instance().ok is True
+
+
+def test_single_instance_fails_and_names_pids_when_two_running(monkeypatch):
+    procs = pytest.importorskip("palctl.procs")
+    monkeypatch.setattr(
+        procs, "shipping_processes",
+        lambda: [types.SimpleNamespace(pid=1000), types.SimpleNamespace(pid=2000)],
+    )
+    c = preflight.check_single_server_instance()
+    assert c.ok is False
+    assert "1000" in c.detail and "2000" in c.detail  # points at the culprits
+    assert c.fix  # tells them to disable the extra service

@@ -683,6 +683,15 @@ class Main(QMainWindow):
         tabs.addTab(self.config, "Config")
         self.setCentralWidget(tabs)
 
+        # Setup wizard reachable from the window itself, not only the tray icon.
+        # A reinstall keeps your %APPDATA% config, so the first-run auto-popup
+        # won't fire on an upgrade — this is how you re-run setup on purpose
+        # (e.g. to repoint the server service or re-enable the REST API).
+        setup_menu = self.menuBar().addMenu("&Setup")
+        wizard_action = QAction("Run setup wizard…", self)
+        wizard_action.triggered.connect(lambda: self._open_wizard(first_run=False))
+        setup_menu.addAction(wizard_action)
+
         self.status = self.statusBar()
         self.status.showMessage("Connecting to daemon…")
 
