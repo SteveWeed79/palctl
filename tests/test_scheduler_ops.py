@@ -167,6 +167,101 @@ def test_update_server_mirrors_backup_when_configured(tmp_path, monkeypatch):
     assert primary == mirrored and len(mirrored) == 1
 
 
+def test_update_server_aborts_when_server_wont_stop(tmp_path, monkeypatch):
+    # SteamCMD rewriting the install under a still-running server corrupts it:
+    # a stop that never confirms STOPPED must abort the update untouched.
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path / "server")
+    cfg.backup_root = str(tmp_path / "backups")
+
+    calls: list = []
+
+    async def stop_fails(name):
+        calls.append(("stop", name))
+        return False
+
+    async def start(name):
+        calls.append(("start", name))
+        return True
+
+    monkeypatch.setattr(sched_mod.procs, "stop_service", stop_fails)
+    monkeypatch.setattr(sched_mod.procs, "start_service", start)
+
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+        calls.append(("update",))
+        return 0
+
+    monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
+
+    bus = EventBus()
+    events = _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+
+    assert ("update",) not in calls  # SteamCMD never ran
+    assert [c[0] for c in calls] == ["stop"]  # and we didn't blind-start either
+    assert any(e.kind == "error" and "did not stop" in e.message for e in events)
+
+
+def test_update_server_reports_update_exceptions(tmp_path, monkeypatch):
+    # A GUI/bot-triggered update that throws used to restart the server and
+    # announce success with no trace of the failure.
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path / "server")
+    cfg.backup_root = str(tmp_path / "backups")
+
+    _patch_service(monkeypatch, [])
+
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+        raise OSError("steamcmd exploded")
+
+    monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
+    monkeypatch.setattr(sched_mod.steamcmd, "backup_file", lambda p: None)
+    monkeypatch.setattr(sched_mod, "is_blank", lambda p: False)
+
+    bus = EventBus()
+    events = _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+
+    assert any(e.kind == "error" and "steamcmd exploded" in e.message for e in events)
+    # The server is still brought back — on the old files, but running.
+    assert any(e.kind == "update" and "back up" in e.message for e in events)
+
+
+def test_update_server_restores_ini_even_when_steamcmd_dies(tmp_path, monkeypatch):
+    # SteamCMD can blank the ini and then die; the settings must come back
+    # before the server is restarted, not only on the success path.
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path / "server")
+    cfg.backup_root = str(tmp_path / "backups")
+
+    _patch_service(monkeypatch, [])
+
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+        raise OSError("dropped connection")
+
+    fake_bak = tmp_path / "PalWorldSettings.ini.bak"
+    copied: list = []
+    monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
+    monkeypatch.setattr(sched_mod.steamcmd, "backup_file", lambda p: fake_bak)
+    monkeypatch.setattr(sched_mod, "is_blank", lambda p: True)
+    monkeypatch.setattr(sched_mod.shutil, "copy2", lambda a, b: copied.append((a, b)))
+
+    bus = EventBus()
+    _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+
+    assert copied and copied[0][0] == fake_bak
+
+
 def test_update_server_aborts_without_steamcmd(tmp_path, monkeypatch):
     cfg = Config()
     cfg.steamcmd_path = str(tmp_path / "missing-steamcmd.exe")
@@ -205,6 +300,40 @@ def test_restore_backup_stops_restores_then_starts(tmp_path, monkeypatch):
 
     assert [c[0] for c in calls] == ["stop", "restore", "start"]
     assert any(e.kind == "restore" and "back up" in e.message for e in events)
+
+
+def test_restore_backup_aborts_when_server_wont_stop(tmp_path, monkeypatch):
+    # Copying over a live save corrupts it: a stop that never confirms STOPPED
+    # must leave the world untouched.
+    cfg = Config()
+    cfg.backup_root = str(tmp_path / "backups")
+    cfg.server_root = str(tmp_path / "server")
+    name = "2026-01-01_00-00-00-manual"
+    (Path(cfg.backup_root) / name).mkdir(parents=True)
+
+    calls: list = []
+
+    async def stop_fails(n):
+        calls.append(("stop", n))
+        return False
+
+    async def start(n):
+        calls.append(("start", n))
+        return True
+
+    monkeypatch.setattr(sched_mod.procs, "stop_service", stop_fails)
+    monkeypatch.setattr(sched_mod.procs, "start_service", start)
+    monkeypatch.setattr(
+        sched_mod.backups, "restore",
+        lambda root, n, savegames: calls.append(("restore", n)),
+    )
+
+    bus = EventBus()
+    events = _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).restore_backup(name))
+
+    assert [c[0] for c in calls] == ["stop"]  # no restore, no blind start
+    assert any(e.kind == "error" and "did not stop" in e.message for e in events)
 
 
 def test_restore_backup_rejects_traversal_without_stopping(tmp_path, monkeypatch):
