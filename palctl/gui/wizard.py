@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -56,7 +57,9 @@ class SetupPlan:
     install_server: bool
     install_vcredist: bool
     register_server_service: bool
-    register_daemon_service: bool
+    # How the daemon starts in the background: "login" (password-free HKCU Run
+    # key, the default), "service" (Windows service, starts on boot), or "none".
+    daemon_startup: str
     service_name: str
 
 
@@ -104,7 +107,9 @@ class SetupWorker(QThread):
 
             if plan.register_server_service:
                 self._register_server_service(cfg, plan)
-            if plan.register_daemon_service:
+            if plan.daemon_startup == "login":
+                self._setup_login_startup()
+            elif plan.daemon_startup == "service":
                 self._register_daemon_service()
 
             self._verify_and_report(plan)
@@ -125,7 +130,8 @@ class SetupWorker(QThread):
         checks = preflight.run_all(
             plan.server_root, plan.api_port,
             need_install=plan.install_server,
-            need_admin=plan.register_server_service or plan.register_daemon_service,
+            # Login startup needs no elevation; only a service does.
+            need_admin=plan.register_server_service or plan.daemon_startup == "service",
         )
         blocking = False
         for c in checks:
@@ -250,6 +256,18 @@ class SetupWorker(QThread):
         daemon.install_service()
         self._log(f"  Service '{daemon.SERVICE_NAME}' registered and started.")
 
+    def _setup_login_startup(self) -> None:
+        from .. import daemon
+
+        self._log("Setting palctl to start when you log in (no password needed)…")
+        daemon.install_startup()
+        # Register-only would wait for the next login; start it now so the
+        # dashboard works immediately.
+        if daemon.start_detached():
+            self._log("  Done — palctl is running now and will start at each login.")
+        else:
+            self._log("  Done — palctl will start at your next login.")
+
 
 class SetupWizard(QDialog):
     def __init__(
@@ -320,13 +338,32 @@ class SetupWizard(QDialog):
         self.install_vc.setChecked(True)
         self.reg_server = QCheckBox("Register the Palworld server as a Windows service")
         self.reg_server.setChecked(True)
-        self.reg_daemon = QCheckBox(
-            "Register the palctl daemon as a Windows service (keeps it always running)"
-        )
-        self.reg_daemon.setChecked(True)
-        for cb in (self.install_server, self.install_vc, self.reg_server, self.reg_daemon):
+        for cb in (self.install_server, self.install_vc, self.reg_server):
             sf.addWidget(cb)
         root.addWidget(steps)
+
+        # How the daemon runs in the background. Login startup is the default:
+        # it needs no password (unlike a user service, which fails with Error
+        # 1069 on PIN-only accounts) and gets full user context incl. the
+        # Discord token. A service is offered for boxes that must run before
+        # anyone logs in.
+        bg = QGroupBox("Keep palctl running in the background")
+        bg.setCheckable(True)
+        bg.setChecked(True)
+        bgf = QVBoxLayout(bg)
+        self.startup_login = QRadioButton(
+            "Start when I log in  —  recommended (no password, works with the "
+            "Discord bot)"
+        )
+        self.startup_login.setChecked(True)
+        self.startup_service = QRadioButton(
+            "Run as a Windows service  —  starts on boot before login, but can't "
+            "use the Discord bot"
+        )
+        bgf.addWidget(self.startup_login)
+        bgf.addWidget(self.startup_service)
+        self._bg_group = bg
+        root.addWidget(bg)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)  # indeterminate; hidden until running
@@ -360,7 +397,7 @@ class SetupWizard(QDialog):
         checks = preflight.run_all(
             self.server_root.text().strip(), self.port.value(),
             need_install=self.install_server.isChecked(),
-            need_admin=self.reg_server.isChecked() or self.reg_daemon.isChecked(),
+            need_admin=self.reg_server.isChecked() or self._daemon_startup() == "service",
         )
         for c in checks:
             self.log.append(f"  {c.icon} {c.name}: {c.detail}")
@@ -372,6 +409,11 @@ class SetupWizard(QDialog):
 
         self.password.setText(secrets.token_urlsafe(12))
         self.password.setEchoMode(QLineEdit.EchoMode.Normal)
+
+    def _daemon_startup(self) -> str:
+        if not self._bg_group.isChecked():
+            return "none"
+        return "service" if self.startup_service.isChecked() else "login"
 
     def _run(self) -> None:
         password = self.password.text().strip()
@@ -391,7 +433,7 @@ class SetupWizard(QDialog):
             install_server=self.install_server.isChecked(),
             install_vcredist=self.install_vc.isChecked(),
             register_server_service=self.reg_server.isChecked(),
-            register_daemon_service=self.reg_daemon.isChecked(),
+            daemon_startup=self._daemon_startup(),
             service_name=self._cfg.service_name or "PalServer",
         )
 

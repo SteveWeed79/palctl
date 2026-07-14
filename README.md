@@ -180,17 +180,21 @@ run-daemon.bat      creates a venv, installs deps, starts the daemon
 run-gui.bat         opens the GUI  (first launch pops the setup wizard)
 ```
 
-The wizard handles detection, the REST API, an optional server install, and
-service registration. Prefer to do it by hand? The **Config** tab has Browse and
-Auto-detect on every path with a live ✓/✗, and:
+The wizard handles detection, the REST API, an optional server install, and how
+the daemon runs in the background. Prefer to do it by hand?
 
 ```
-palctl-daemon.exe install-service      # or: python -m palctl.daemon install-service
+palctl-daemon.exe install-startup      # start at login — password-free (recommended)
+palctl-daemon.exe install-service      # or run as a Windows service
 ```
 
-registers the daemon service without touching a terminal full of `nssm` lines.
-Secrets go into Windows Credential Manager (DPAPI-encrypted), never into a config
-file.
+**Login startup vs. service.** By default palctl starts with your login via the
+current user's Run key. It needs **no password**, runs with full access to your
+config and saved secrets (so the Discord bot works), and avoids Windows **Error
+1069** — which a service under a passwordless / PIN-only account fails with. The
+one tradeoff is it only runs while you're logged in; a **service** starts on boot
+before login, so it's the better pick for a truly headless box. Secrets go into
+Windows Credential Manager (DPAPI-encrypted), never a config file.
 
 > **Which account runs the service?** By default the service runs as
 > LocalSystem with `%APPDATA%` redirected to yours, so it shares your config,

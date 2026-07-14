@@ -54,7 +54,11 @@ Name: "{autodesktop}\palctl"; Filename: "{app}\palctl-gui.exe"; Tasks: desktopic
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
-Name: "daemonservice"; Description: "Register and start the palctl background service now"
+; Off by default: the first-run wizard now chooses how the daemon runs in the
+; background (password-free login startup by default, or a service). Registering
+; a service here too would leave two daemons fighting for the control port. Tick
+; this only for an unattended install with no wizard.
+Name: "daemonservice"; Description: "Register the palctl background service now (advanced; the wizard normally handles this)"; Flags: unchecked
 Name: "addtopath"; Description: "Add palctl to the PATH (use the ""palctl"" command in any terminal)"; Flags: unchecked
 
 [Registry]

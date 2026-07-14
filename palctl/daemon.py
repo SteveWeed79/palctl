@@ -611,6 +611,19 @@ def install_service(as_user: bool = False) -> None:
             nssm, SERVICE_NAME, exe, args, app_dir,
             user=user, password=password, appdata=os.environ.get("APPDATA"),
         )
+        # A user-account service is the one path that can hit Error 1069 (the
+        # account has no password / is PIN-only). If it didn't come up, don't
+        # leave the user staring at a dead service — point them at login startup.
+        if as_user and procs.service_state(SERVICE_NAME) != "RUNNING":
+            print(
+                "[daemon] The service registered but did NOT start. This is almost\n"
+                "         always Error 1069: a PIN-only or passwordless Windows\n"
+                "         account can't host a service logon. Remove it and use\n"
+                "         password-free login startup instead:\n"
+                "             palctl-daemon uninstall-service\n"
+                "             palctl-daemon install-startup"
+            )
+            return
     else:
         from . import systemd
 
@@ -634,6 +647,78 @@ def uninstall_service() -> None:
     print(f"[daemon] service '{SERVICE_NAME}' removed.")
 
 
+def install_startup() -> None:
+    """Register the daemon to start at login via the current user's Run key —
+    the password-free path that avoids the service-logon Error 1069 entirely.
+    Windows-only; a headless Linux box uses the systemd service instead."""
+    if not sys.platform.startswith("win"):
+        print("[daemon] login startup is Windows-only; on Linux use install-service.")
+        return
+    from . import startup
+
+    exe, args, _ = service_target()
+    startup.install_startup(exe, args)
+    print(
+        "[daemon] palctl will start automatically when you log in — no password "
+        "or Windows service needed."
+    )
+
+
+def uninstall_startup() -> None:
+    if not sys.platform.startswith("win"):
+        return
+    from . import startup
+
+    startup.uninstall_startup()
+    print("[daemon] removed palctl from login startup.")
+
+
+def _daemon_reachable() -> bool:
+    """Is a daemon already answering on the localhost control port?"""
+    import socket
+
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", DAEMON_PORT)) == 0
+
+
+def start_detached() -> bool:
+    """Launch the daemon now, in the background, hidden — used right after
+    registering login startup so the user doesn't have to log out and back in
+    first. Returns whether a daemon is running afterward. Windows-only.
+
+    Skips the spawn if one is already up (e.g. a leftover service), so switching
+    to login startup can't end up with two daemons fighting over the port."""
+    if not sys.platform.startswith("win"):
+        return False
+    if _daemon_reachable():
+        return True
+    import subprocess
+
+    exe, args, app_dir = service_target()
+    argv = [exe, *(args.split() if args else []), "run", "--headless"]
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+        subprocess, "CREATE_NO_WINDOW", 0
+    )
+    subprocess.Popen(argv, cwd=app_dir, creationflags=flags, close_fds=True)
+    return True
+
+
+def _hide_console() -> None:
+    """Hide our own console window (the --headless login-startup path), so
+    logging in doesn't flash a black box. No-op if there's no console."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+    except Exception:
+        pass
+
+
 def main() -> None:
     import argparse
 
@@ -645,8 +730,15 @@ def main() -> None:
         "command",
         nargs="?",
         default="run",
-        choices=["run", "install-service", "uninstall-service"],
-        help="run the daemon (default), or (un)register it as a Windows service",
+        choices=[
+            "run",
+            "install-service",
+            "uninstall-service",
+            "install-startup",
+            "uninstall-startup",
+        ],
+        help="run the daemon (default); (un)register a Windows service; or "
+        "(un)register password-free login startup",
     )
     parser.add_argument(
         "--as-user",
@@ -654,6 +746,11 @@ def main() -> None:
         help="register the Windows service under your account (asks for your "
         "Windows password) instead of LocalSystem — recommended if you use "
         "the Discord bot or saved the admin password in the GUI",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="hide the console window (used by the login-startup entry)",
     )
     args = parser.parse_args()
 
@@ -663,7 +760,15 @@ def main() -> None:
     if args.command == "uninstall-service":
         uninstall_service()
         return
+    if args.command == "install-startup":
+        install_startup()
+        return
+    if args.command == "uninstall-startup":
+        uninstall_startup()
+        return
 
+    if args.headless:
+        _hide_console()
     try:
         asyncio.run(Daemon().run())
     except KeyboardInterrupt:
