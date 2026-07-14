@@ -118,8 +118,12 @@ class PalApi:
                 r = await client.request(method, url, auth=self._auth, json=json)
         except httpx.RequestError as e:
             raise PalApiUnreachable(
-                f"Can't reach the Palworld REST API at {url}. "
-                "Is the server running, and is RESTAPIEnabled=True?"
+                f"Can't reach the Palworld REST API at {url}. Check, in order: "
+                "the server may still be booting (it needs ~a minute after start "
+                "before the API answers); the server is actually running; and "
+                "RESTAPIEnabled=True is set in the LIVE PalWorldSettings.ini "
+                "under Saved/Config — editing DefaultPalWorldSettings.ini does "
+                "nothing, which is the most common cause."
             ) from e
 
         if r.status_code == 401:

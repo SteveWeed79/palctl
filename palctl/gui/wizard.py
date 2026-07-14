@@ -209,8 +209,11 @@ class SetupWorker(QThread):
             self._log(
                 "  ✅ Server is up and answering — it works."
                 if ok
-                else "  ⚠️ Registered, but the server hasn't answered yet. It may "
-                "still be starting; watch the Dashboard, or check the log."
+                else "  ⚠️ Registered, but the server hasn't answered yet. Give "
+                "it a minute (Palworld is slow to boot) and watch the Dashboard. "
+                "If it never answers, confirm RESTAPIEnabled=True landed in the "
+                "live PalWorldSettings.ini under Saved/Config — not the Default "
+                "one — and check the log."
             )
 
         lan = netinfo.lan_ip()
@@ -412,8 +415,21 @@ class SetupWizard(QDialog):
         self.check_btn.setEnabled(True)
         self.close_btn.setEnabled(True)
         if ok:
+            # Give the wizard an unmistakable finish line: promote "Close" to the
+            # primary "Finish" button so it doesn't just sit there after setup.
+            self.close_btn.setText("Finish")
+            self.close_btn.setDefault(True)
+            self.close_btn.setFocus()
             QMessageBox.information(
                 self, "Setup complete",
-                "palctl is configured and the server was started. The log shows the "
-                "address your friends connect to. Watch the Dashboard from here.",
+                "palctl is configured and the server was started. The log below "
+                "shows the address your friends connect to.\n\n"
+                "Click Finish to close this wizard and open the dashboard.",
+            )
+        else:
+            # Failure used to be silent — the wizard just sat there. Say so.
+            QMessageBox.warning(
+                self, "Setup didn't finish",
+                "A step didn't complete — check the log for which one. Fix it and "
+                "run setup again, or Close to finish the rest by hand.",
             )
