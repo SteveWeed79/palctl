@@ -553,14 +553,27 @@ class Daemon:
 
 def service_target() -> tuple[str, str, str]:
     """
-    (exe, args, app_dir) to run *this* daemon as a Windows service — correct
-    whether we're a PyInstaller-frozen palctl-daemon.exe or `python -m
-    palctl.daemon` in a dev checkout. The installer and the wizard both register
-    the service off this, so there's one source of truth for "how do you run me".
+    (exe, args, app_dir) to run *the daemon* as a service — correct whether we're
+    a PyInstaller-frozen build or `python -m palctl.daemon` in a dev checkout.
+    The installer and the wizard both register the service off this, so there's
+    one source of truth for "how do you run the daemon".
+
+    In the frozen onedir build, palctl-daemon.exe and palctl-gui.exe sit side by
+    side. The wizard registers the daemon service from *inside the GUI process*,
+    where sys.executable is palctl-gui.exe — so we must resolve the sibling
+    daemon exe explicitly, not launch whatever exe happens to be running. (This
+    bug pointed the daemon service at the GUI, so the daemon never started and
+    every GUI action got a connection-refused.)
     """
     if getattr(sys, "frozen", False):
-        exe = sys.executable
-        return exe, "", str(Path(exe).parent)
+        exe_dir = Path(sys.executable).parent
+        name = "palctl-daemon.exe" if sys.platform.startswith("win") else "palctl-daemon"
+        daemon_exe = exe_dir / name
+        if not daemon_exe.exists():
+            # Unexpected layout — fall back to the running exe rather than
+            # registering a path that doesn't exist.
+            daemon_exe = Path(sys.executable)
+        return str(daemon_exe), "", str(exe_dir)
     return sys.executable, "-m palctl.daemon", str(Path(__file__).resolve().parents[1])
 
 
