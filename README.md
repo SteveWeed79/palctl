@@ -3,7 +3,9 @@
 Palworld dedicated server control for Windows. **REST-native**, with a real
 memory-leak watchdog and a **self-hosted Discord bot**.
 
-> **Status:** v0.1. Works, but young. Issues and PRs welcome.
+> **Status:** released and in active development — installers for every version
+> are on the [Releases page](https://github.com/SteveWeed79/pal-it-up/releases),
+> with the history in [CHANGELOG.md](CHANGELOG.md). Issues and PRs welcome.
 
 ---
 
@@ -143,7 +145,9 @@ works if you'd rather drive it yourself.
 
 ### Option A — installer (recommended)
 
-Run `palctl-setup.exe` (build it from `packaging/`, see
+Download `palctl-setup.exe` from the
+[latest release](https://github.com/SteveWeed79/pal-it-up/releases/latest)
+(or build it yourself from `packaging/`, see
 [packaging/README.md](packaging/README.md)). No Python needed. It installs both
 binaries, adds shortcuts, and offers to register the palctl background service.
 Then it opens the GUI, and the **first-run wizard** does the rest:
@@ -224,9 +228,12 @@ the Discord bot, and the service CLI.
 
 ### winget
 
-Once a release is tagged, palctl can be installed with
-`winget install SteveWeed79.palctl` — the manifest template lives in
-[packaging/winget/](packaging/winget/).
+Not yet — a manifest template lives in [packaging/winget/](packaging/winget/),
+but it hasn't been submitted to
+[microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs), so
+`winget install SteveWeed79.palctl` won't find anything today. Until it lands,
+grab the installer from the
+[Releases page](https://github.com/SteveWeed79/pal-it-up/releases/latest).
 
 ### Discord (optional)
 
@@ -268,3 +275,6 @@ available. Open an issue or contact the maintainer.
 
 **Contributing.** palctl uses a light CLA ([CLA.md](CLA.md)) so the dual-license
 option above stays possible. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+**Security.** Found a vulnerability? Please report it privately — see
+[SECURITY.md](SECURITY.md).

@@ -1,8 +1,10 @@
 """The crash auto-recovery decision and the daemon API token gate are the two
 bits of new daemon logic where a mistake is silent and dangerous (restart a
 server the user stopped; let any local process drive the API). They're pinned as
-pure functions here. The daemon imports aiohttp, which the minimal-deps CI test
-job doesn't install, so skip cleanly there rather than erroring at collection."""
+pure functions here. CI installs aiohttp and discord.py so these tests really
+run there; the importorskip guards are for minimal local environments, where a
+clean skip beats erroring at collection (palctl.daemon imports both — aiohttp
+for its API server, discord via palctl.bot at module level)."""
 
 import asyncio
 import types
@@ -10,6 +12,7 @@ import types
 import pytest
 
 pytest.importorskip("aiohttp")
+pytest.importorskip("discord")
 
 import palctl.daemon as daemon_mod  # noqa: E402
 from palctl.daemon import (  # noqa: E402  (after importorskip guard)
