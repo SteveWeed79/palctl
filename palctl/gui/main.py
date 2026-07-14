@@ -75,16 +75,36 @@ def _auth_headers() -> dict:
     return {TOKEN_HEADER: _token_cache}
 
 
+class DaemonDown(RuntimeError):
+    """The daemon isn't reachable. Shown to the user as a sentence, never a raw
+    socket error (WinError 10061 & friends): the GUI is only a view onto the
+    daemon, so 'it's not running' is the answer, not the error number."""
+
+
 def call(path: str, body: dict | None = None) -> dict:
     headers = _auth_headers()
-    with httpx.Client(timeout=10) as c:
-        r = (
-            c.post(f"{DAEMON}{path}", json=body or {}, headers=headers)
-            if body is not None or path.startswith("/action")
-            else c.get(f"{DAEMON}{path}", headers=headers)
+    try:
+        with httpx.Client(timeout=10) as c:
+            r = (
+                c.post(f"{DAEMON}{path}", json=body or {}, headers=headers)
+                if body is not None or path.startswith("/action")
+                else c.get(f"{DAEMON}{path}", headers=headers)
+            )
+    except httpx.RequestError as e:
+        # Connection refused etc. — nothing is listening on the daemon port.
+        raise DaemonDown(
+            "Can't reach the palctl daemon — it runs in the background and this "
+            "window only talks to it. Start the palctl-daemon service (or run "
+            "palctl-daemon), then try again."
+        ) from e
+    if r.status_code == 401:
+        raise DaemonDown(
+            "The daemon rejected the token. The GUI and the daemon must run as "
+            "the same Windows user; if the daemon runs as a service, re-register "
+            "it with:  palctl-daemon install-service --as-user"
         )
-        r.raise_for_status()
-        return r.json()
+    r.raise_for_status()
+    return r.json()
 
 
 class Poller(QThread):
@@ -673,9 +693,9 @@ class Main(QMainWindow):
         self.status.showMessage(f"Daemon OK · service {svc} · {n} online")
 
     def _on_failed(self, err: str) -> None:
-        self.status.showMessage(
-            f"Daemon unreachable ({err}). Start it: python -m palctl.daemon"
-        )
+        # `err` is already a plain-English sentence for the common case (daemon
+        # down / token mismatch); show it as-is rather than wrapping it again.
+        self.status.showMessage(err)
 
     def _tray(self) -> None:
         icon = QIcon.fromTheme("applications-games")
