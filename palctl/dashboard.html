@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>palctl</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232a78d6' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 2.5 L19.5 5.5 V11.5 C19.5 16.3 16.2 20.1 12 21.5 C7.8 20.1 4.5 16.3 4.5 11.5 V5.5 Z'/%3E%3Cpath d='M6.5 12 H9 L10.5 8.5 L13 15.5 L14.5 12 H17.5'/%3E%3C/svg%3E">
 <style>
   /* Served by the palctl daemon on 127.0.0.1 only. The page itself is public
      (it contains no data); every /state call and every action needs the
@@ -11,7 +12,9 @@
      leave the browser. Actions send it in a custom header, which browsers
      only allow same-origin — that requirement is also the CSRF defence. */
   :root {
-    --surface: #fcfcfb;
+    color-scheme: light;
+    --plane: #f9f9f7;          /* page behind the cards */
+    --surface: #fcfcfb;        /* cards / chart surface */
     --panel: #f3f3f1;
     --ink: #0b0b0b;
     --ink-2: #52514e;
@@ -19,11 +22,15 @@
     --line: #e3e2de;
     --series: #2a78d6;         /* memory sparkline */
     --series-fill: rgba(42, 120, 214, 0.10);
+    --meter-track: #cde2fb;    /* lighter step of the series ramp */
     --good: #0ca30c;
+    --warning: #fab219;
     --critical: #d03b3b;
   }
   @media (prefers-color-scheme: dark) {
     :root {
+      color-scheme: dark;
+      --plane: #0d0d0d;
       --surface: #1a1a19;
       --panel: #232322;
       --ink: #ffffff;
@@ -32,46 +39,66 @@
       --line: #33332f;
       --series: #3987e5;
       --series-fill: rgba(57, 135, 229, 0.14);
+      --meter-track: #184f95;  /* darker step of the same ramp */
     }
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0; background: var(--surface); color: var(--ink);
+    margin: 0; background: var(--plane); color: var(--ink);
     font: 14px/1.45 system-ui, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
   }
   .wrap { max-width: 880px; margin: 0 auto; padding: 20px 16px 48px; }
-  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .mark { width: 26px; height: 26px; color: var(--series); flex: none; }
   h1 { font-size: 18px; margin: 0; letter-spacing: 0.2px; }
   .badge {
-    display: inline-flex; align-items: center; gap: 6px;
+    display: inline-flex; align-items: center; gap: 7px;
     font-size: 12px; color: var(--ink-2);
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 999px; padding: 4px 12px 4px 9px;
   }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); flex: none; }
   .dot.up   { background: var(--good); }
   .dot.down { background: var(--critical); }
   .op { font-size: 12px; color: var(--ink-2); }
+  .op::before { content: "· "; color: var(--ink-3); }
   .op:empty { display: none; }
   #err {
-    margin: 16px 0 0; padding: 10px 12px; border-radius: 8px;
-    background: var(--panel); color: var(--ink-2); font-size: 13px;
+    margin: 16px 0 0; padding: 10px 12px; border-radius: 10px;
+    background: var(--surface); color: var(--ink-2); font-size: 13px;
     border: 1px solid var(--line);
   }
   #err:empty { display: none; }
   .tiles {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-    gap: 8px; margin-top: 16px;
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+    gap: 10px; margin-top: 18px;
   }
   .tile {
-    background: var(--panel); border-radius: 10px; padding: 10px 12px;
+    background: var(--surface); border-radius: 12px; padding: 12px 14px;
     border: 1px solid var(--line);
   }
   .tile .k { font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px;
              color: var(--ink-3); }
-  .tile .v { font-size: 20px; font-variant-numeric: tabular-nums; margin-top: 2px; }
-  .tile .s { font-size: 11px; color: var(--ink-2); }
-  section { margin-top: 24px; }
+  .tile .v { font-size: 22px; font-weight: 600; margin-top: 2px; }
+  .tile .s { font-size: 11px; color: var(--ink-2); margin-top: 1px; }
+  .meter {
+    margin-top: 8px; height: 4px; border-radius: 2px;
+    background: var(--meter-track); overflow: hidden;
+  }
+  .meter i {
+    display: block; height: 100%; border-radius: 2px;
+    background: var(--series); width: 0; transition: width 0.6s ease;
+  }
+  .meter i.warn { background: var(--warning); }
+  .meter i.crit { background: var(--critical); }
+  section {
+    margin-top: 18px; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px;
+  }
   h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px;
-       color: var(--ink-3); margin: 0 0 8px; font-weight: 600; }
+       color: var(--ink-3); margin: 0 0 10px; font-weight: 600; }
+  .scroll-x { overflow-x: auto; }
   .chart-box { position: relative; }
   svg { display: block; width: 100%; height: 120px; }
   .spark-line { fill: none; stroke: var(--series); stroke-width: 2;
@@ -106,42 +133,81 @@
   .muted { color: var(--ink-3); font-size: 13px; }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; }
   button {
-    font: inherit; font-size: 13px; color: var(--ink);
-    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-    padding: 6px 12px; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 7px;
+    font: inherit; font-size: 13px; font-weight: 500; color: var(--ink);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 9px;
+    padding: 7px 13px; cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
   }
+  button svg { width: 15px; height: 15px; flex: none; color: var(--ink-2); }
   button:hover:not(:disabled) { border-color: var(--ink-3); }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:focus-visible { outline: 2px solid var(--series); outline-offset: 1px; }
   button:disabled { opacity: 0.45; cursor: default; }
   button.danger { color: var(--critical); }
-  button.small { font-size: 12px; padding: 3px 9px; }
+  button.danger svg { color: var(--critical); }
+  button.small { font-size: 12px; padding: 4px 10px; gap: 5px; }
   .announce { display: flex; gap: 8px; margin-top: 10px; }
   .announce input {
     flex: 1; font: inherit; font-size: 13px; color: var(--ink);
-    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-    padding: 6px 10px; min-width: 0;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 9px;
+    padding: 7px 11px; min-width: 0;
   }
-  .announce input:focus { outline: none; border-color: var(--ink-3); }
+  .announce input::placeholder { color: var(--ink-3); }
+  .announce input:focus { outline: none; border-color: var(--series); }
   #act-note { margin: 8px 0 0; min-height: 1.2em; }
   td.act { text-align: right; white-space: nowrap; }
+  .axis-row {
+    display: flex; justify-content: space-between; margin-top: 4px;
+    font-size: 10px; color: var(--ink-3); font-variant-numeric: tabular-nums;
+  }
+  /* Phone: the kick/ban buttons matter more than the buildings count. */
+  @media (max-width: 480px) {
+    .hide-sm { display: none; }
+    .wrap { padding: 14px 10px 40px; }
+    section { padding: 12px; }
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
+    <!-- The GUI's app icon (palctl/gui/icons/app-icon.svg), inlined so the web
+         and desktop faces of the app share one mark. currentColor = series blue. -->
+    <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M12 2.5 L19.5 5.5 V11.5 C19.5 16.3 16.2 20.1 12 21.5 C7.8 20.1 4.5 16.3 4.5 11.5 V5.5 Z"/>
+      <path d="M6.5 12 H9 L10.5 8.5 L13 15.5 L14.5 12 H17.5"/>
+    </svg>
     <h1>palctl</h1>
-    <span class="badge"><span id="dot" class="dot"></span><span id="svc">connecting…</span></span>
-    <span class="op" id="op"></span>
+    <span class="badge"><span id="dot" class="dot"></span><span id="svc">connecting…</span>
+      <span class="op" id="op"></span></span>
   </header>
   <p id="err"></p>
 
   <section id="actions-sec" hidden>
     <h2>Actions</h2>
+    <!-- Icons are the GUI action set (palctl/gui/icons/action-*.svg), inlined. -->
     <div class="actions">
-      <button id="a-startstop">Start</button>
-      <button id="a-restart">Restart</button>
-      <button id="a-save">Save world</button>
-      <button id="a-backup">Backup</button>
-      <button id="a-update">Update server</button>
+      <button id="a-startstop"><svg id="ss-icon" viewBox="0 0 24 24" fill="none"
+        stroke="currentColor" stroke-width="1.75" stroke-linecap="round"
+        stroke-linejoin="round" aria-hidden="true"><path id="ss-path" fill="currentColor"
+        d="M8 5.5 L18 12 L8 18.5 Z"/></svg><span id="ss-label">Start</span></button>
+      <button id="a-restart"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+        stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M20 8 A9 9 0 1 0 21 12"/><polyline points="20 3 20 8 15 8"/></svg>Restart</button>
+      <button id="a-save"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+        stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+        <polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>Save world</button>
+      <button id="a-backup"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+        stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9"/>
+        <line x1="10" y1="13" x2="14" y2="13"/></svg>Backup</button>
+      <button id="a-update"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+        stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Update server</button>
     </div>
     <div class="announce">
       <input id="a-msg" placeholder="Announce to everyone in-game…" maxlength="200"
@@ -156,7 +222,8 @@
     <div class="tile"><div class="k">Server FPS</div><div class="v" id="t-fps">–</div>
       <div class="s" id="t-frame"></div></div>
     <div class="tile"><div class="k">Memory</div><div class="v" id="t-mem">–</div>
-      <div class="s" id="t-memlim"></div></div>
+      <div class="s" id="t-memlim"></div>
+      <div class="meter" id="t-meter" hidden><i id="t-meter-fill"></i></div></div>
     <div class="tile"><div class="k">CPU</div><div class="v" id="t-cpu">–</div></div>
     <div class="tile"><div class="k">Uptime</div><div class="v" id="t-up">–</div></div>
     <div class="tile"><div class="k">In-game</div><div class="v" id="t-day">–</div>
@@ -170,25 +237,30 @@
            viewBox="0 0 880 120" preserveAspectRatio="none"></svg>
       <div id="tip"></div>
     </div>
+    <div class="axis-row"><span id="ax-start"></span><span id="ax-end"></span></div>
   </section>
 
   <section id="players-sec" hidden>
     <h2>Players online</h2>
+    <div class="scroll-x">
     <table aria-label="Players online">
       <thead><tr><th>Name</th><th class="num">Level</th><th class="num">Ping</th>
-        <th class="num">Buildings</th><th></th></tr></thead>
+        <th class="num hide-sm">Buildings</th><th></th></tr></thead>
       <tbody id="players"></tbody>
     </table>
+    </div>
     <p class="muted" id="players-empty" hidden>Nobody online.</p>
   </section>
 
   <section id="backups-sec" hidden>
     <h2>Backups</h2>
     <button id="b-refresh" class="small">Show backups</button>
+    <div class="scroll-x">
     <table id="b-table" aria-label="Backups" hidden style="margin-top:8px">
       <thead><tr><th>Name</th><th class="num">Size</th><th></th></tr></thead>
       <tbody id="b-rows"></tbody>
     </table>
+    </div>
     <p class="muted" id="b-empty" hidden>No backups yet.</p>
   </section>
 
@@ -357,7 +429,10 @@ function render(state) {
   $("actions-sec").hidden = false;
   $("backups-sec").hidden = false;
   const busy = !!state.operation;
-  $("a-startstop").textContent = running ? "Stop" : "Start";
+  $("ss-label").textContent = running ? "Stop" : "Start";
+  // Swap the glyph with the verb: play triangle <-> stop square.
+  $("ss-path").setAttribute("d", running
+    ? "M7 7 H17 V17 H7 Z" : "M8 5.5 L18 12 L8 18.5 Z");
   $("a-startstop").classList.toggle("danger", running);
   // Server-cycle operations refuse to queue (the daemon answers 409); grey the
   // buttons out so the refusal isn't a surprise. Save/announce just talk to
@@ -375,6 +450,16 @@ function render(state) {
   $("t-mem").textContent = p ? `${Math.round(p.memory_mb).toLocaleString()} MB` : "–";
   $("t-memlim").textContent = state.memory_limit_mb
     ? `restart limit ${state.memory_limit_mb.toLocaleString()} MB` : "";
+  // The watchdog story at a glance: how close memory is to the restart limit.
+  // The label above carries the numbers; the meter is the supplementary read.
+  const showMeter = p && state.memory_limit_mb > 0;
+  $("t-meter").hidden = !showMeter;
+  if (showMeter) {
+    const frac = p.memory_mb / state.memory_limit_mb;
+    const fill = $("t-meter-fill");
+    fill.style.width = `${Math.min(100, frac * 100).toFixed(1)}%`;
+    fill.className = frac >= 0.9 ? "crit" : frac >= 0.75 ? "warn" : "";
+  }
   $("t-cpu").textContent = p ? `${Math.round(p.cpu_percent)}%` : "–";
   $("t-up").textContent = m ? fmtUp(m.uptime) : "–";
   $("t-day").textContent = m ? `day ${m.days}` : "–";
@@ -389,7 +474,7 @@ function render(state) {
   $("players").innerHTML = players.map((pl) =>
     `<tr><td>${esc(pl.name)}</td><td class="num">${pl.level}</td>` +
     `<td class="num">${Math.round(pl.ping)}ms</td>` +
-    `<td class="num">${pl.building_count}</td>` +
+    `<td class="num hide-sm">${pl.building_count}</td>` +
     `<td class="act">` +
     `<button class="small" data-kick="${esc(pl.user_id)}" data-name="${esc(pl.name)}">Kick</button> ` +
     `<button class="small danger" data-ban="${esc(pl.user_id)}" data-name="${esc(pl.name)}">Ban</button>` +
@@ -408,7 +493,10 @@ function drawSpark(limitMb) {
   $("chart-sec").hidden = histData.length < 2;
   if (histData.length < 2) return;
 
-  const W = 880, H = 120, PAD = 14;
+  // Draw in the element's real pixel width. A fixed viewBox stretched with
+  // preserveAspectRatio=none distorts the text tags on narrow screens.
+  const W = Math.max(280, Math.round(svg.clientWidth || 880)), H = 120, PAD = 14;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   const ys = histData.map((s) => s.memory_mb);
   const yMax = Math.max(limitMb * 1.05 || 0, ...ys) || 1;
   const x = (i) => (i / (histData.length - 1)) * W;
@@ -427,8 +515,20 @@ function drawSpark(limitMb) {
   const last = ys[ys.length - 1];
   inner += `<text class="axis-tag" x="${W - 6}" y="12" text-anchor="end">` +
     `${Math.round(last).toLocaleString()} MB now</text>`;
+  // End-dot on the newest sample, ringed in the surface color so it stays
+  // legible on top of the line.
+  inner += `<circle cx="${W}" cy="${y(last).toFixed(1)}" r="5.5" ` +
+    `fill="var(--surface)"></circle>` +
+    `<circle cx="${W}" cy="${y(last).toFixed(1)}" r="3.5" ` +
+    `fill="var(--series)"></circle>`;
   inner += `<line id="cursor" class="cursor" y1="0" y2="${H}"></line>`;
   svg.innerHTML = inner;
+
+  const t = (s) => s.at
+    ? new Date(s.at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : "";
+  $("ax-start").textContent = t(histData[0]);
+  $("ax-end").textContent = t(histData[histData.length - 1]);
 }
 
 // Crosshair + tooltip on the sparkline.
@@ -440,7 +540,7 @@ box.addEventListener("mousemove", (ev) => {
   const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
   const i = Math.round(frac * (histData.length - 1));
   const s = histData[i];
-  const xv = (i / (histData.length - 1)) * 880;
+  const xv = (i / (histData.length - 1)) * svg.viewBox.baseVal.width;
   cursor.setAttribute("x1", xv); cursor.setAttribute("x2", xv);
   cursor.style.opacity = 1;
   const when = s.at ? new Date(s.at * 1000).toLocaleTimeString() : "";

@@ -34,6 +34,13 @@ Installers for every release are on the
   silently skipped on every push.
 
 ### Added
+- **The web dashboard got a visual overhaul** — the GUI's app icon and action
+  icons inlined (one brand across desktop and web), card layout on a page
+  plane, a favicon, a watchdog meter under the Memory tile that shifts
+  blue → amber → red as memory approaches the restart limit, time axis and a
+  current-value dot on the sparkline, and a phone-width layout (the Tailscale
+  / ssh-tunnel remote story is phone-first). Palette re-validated for both
+  light and dark modes.
 - **The web dashboard can act, not just watch.** `palctl ui` now has
   start/stop/restart, save, backup, update, announce, kick/ban, and
   restore-a-backup — the same daemon endpoints the GUI and CLI use, gated by
