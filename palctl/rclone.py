@@ -90,6 +90,20 @@ def prune(remote: str, retain: int) -> list[str]:
     return doomed
 
 
+def test_remote(target: str) -> tuple[bool, str]:
+    """Verify rclone can actually reach the account behind `target` — the
+    "test connection" the Settings button drives. Lists the remote *root* (not
+    the backup subpath, which may not exist until the first backup), so a
+    working auth reads as success even before any backup has been uploaded.
+    Returns (ok, human message)."""
+    root = target.split(":", 1)[0] + ":"
+    try:
+        _run(["lsd", root])
+    except RuntimeError as e:
+        return False, str(e)
+    return True, f"Connected — rclone reached {root}"
+
+
 def check() -> tuple[bool, str]:
     """Is the rclone binary available? Returns (ok, detail) for preflight. Does
     not validate the remote itself — that needs a network round-trip we keep out

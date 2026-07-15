@@ -122,6 +122,26 @@ def test_prune_retain_zero_never_wipes_everything(monkeypatch):
     assert doomed == ["2026-07-14_00-00-00-scheduled"]  # only the oldest
 
 
+def test_test_remote_lists_the_root_not_the_subpath(monkeypatch):
+    # The configured subpath may not exist before the first backup, so the
+    # connection test must probe the remote root (auth), not `remote:sub`.
+    fake = FakeRclone().install(monkeypatch)
+    ok, msg = rclone.test_remote("gdrive:PalworldBackups/nested")
+
+    assert ok is True
+    assert "gdrive:" in msg
+    assert fake.calls == [["lsd", "gdrive:"]]
+
+
+def test_test_remote_reports_auth_failure(monkeypatch):
+    fake = FakeRclone().install(monkeypatch)
+    fake.fail_on = "lsd"
+    ok, msg = rclone.test_remote("gdrive:PalworldBackups")
+
+    assert ok is False
+    assert "quota exceeded" in msg  # rclone's stderr, surfaced verbatim
+
+
 def test_prune_never_touches_pre_restore(monkeypatch):
     fake = FakeRclone().install(monkeypatch)
     fake.lsf_output = (

@@ -541,6 +541,26 @@ class PathPicker(QWidget):
         self._status.setStyleSheet("color:#3fb950;" if ok else "color:#f85149;")
 
 
+class _MirrorTestWorker(QThread):
+    """Runs the backup-mirror check off the UI thread — an rclone remote test is
+    a network round-trip that would otherwise freeze the window."""
+
+    done = Signal(bool, str)
+
+    def __init__(self, target: str) -> None:
+        super().__init__()
+        self._target = target
+
+    def run(self) -> None:
+        from ..backups import test_mirror
+
+        try:
+            ok, msg = test_mirror(self._target)
+        except Exception as e:  # a worker crash must not take the app down
+            ok, msg = False, str(e)
+        self.done.emit(ok, msg)
+
+
 class ConfigTab(QWidget):
     """Paths, watchdog thresholds, schedules, and secrets. All entered here."""
 
@@ -579,6 +599,29 @@ class ConfigTab(QWidget):
         pf.addRow("steamcmd.exe", self.steamcmd)
         pf.addRow("Backup folder", self.backup_root)
         pf.addRow("Service name", self.service)
+
+        # Optional second copy of every backup. A local path (another disk or a
+        # \\server\share) OR an rclone remote (remote:path) for off-site/cloud
+        # storage. The Test button proves the target works before backups rely
+        # on it. Not a PathPicker: a remote like gdrive:Pal isn't a filesystem path.
+        mirror_row = QHBoxLayout()
+        self.backup_mirror = QLineEdit(cfg.backup_mirror)
+        self.backup_mirror.setPlaceholderText(
+            r"Off — or D:\Backups, \\nas\pal, or gdrive:PalworldBackups"
+        )
+        self._mirror_test = QPushButton("Test")
+        self._mirror_test.clicked.connect(self._test_mirror)
+        mirror_row.addWidget(self.backup_mirror, 1)
+        mirror_row.addWidget(self._mirror_test)
+        pf.addRow("Backup mirror", mirror_row)
+        mirror_help = QLabel(
+            'A second copy survives a dead disk. For cloud (Google Drive, '
+            'Dropbox, S3…), install <a href="https://rclone.org">rclone</a>, run '
+            "<code>rclone config</code>, then enter <code>remote:path</code>."
+        )
+        mirror_help.setOpenExternalLinks(True)
+        mirror_help.setWordWrap(True)
+        pf.addRow("", mirror_help)
         v.addWidget(paths)
 
         api = QGroupBox("REST API")
@@ -632,6 +675,18 @@ class ConfigTab(QWidget):
         self.sch_backup.setRange(1, 48)
         self.sch_backup.setSuffix(" h")
         self.sch_backup.setValue(cfg.schedule.backup_hours)
+        self.sch_retain = NoScrollSpinBox()
+        self.sch_retain.setRange(1, 999)
+        self.sch_retain.setValue(cfg.schedule.backup_retain)
+        self.sch_retain.setToolTip("How many backups to keep on the local disk.")
+        self.sch_mirror_retain = NoScrollSpinBox()
+        self.sch_mirror_retain.setRange(0, 999)
+        self.sch_mirror_retain.setSpecialValueText("same as local")  # shown at 0
+        self.sch_mirror_retain.setValue(cfg.schedule.mirror_retain)
+        self.sch_mirror_retain.setToolTip(
+            "How many backups to keep on the mirror (second copy). Cloud storage "
+            "costs money, so you may want fewer off-site. 0 = same as local."
+        )
         self.sch_upd_backup = QCheckBox(checked=cfg.schedule.update_requires_backup)
         self.sch_upd_backup.setToolTip(
             "Server updates are when saves get corrupted, so an update only "
@@ -642,6 +697,8 @@ class ConfigTab(QWidget):
         sf.addRow("Daily restart", self.sch_restart)
         sf.addRow("At", self.sch_time)
         sf.addRow("Backup every", self.sch_backup)
+        sf.addRow("Backups to keep (local)", self.sch_retain)
+        sf.addRow("Copies to keep (mirror)", self.sch_mirror_retain)
         sf.addRow("Update requires a backup", self.sch_upd_backup)
         v.addWidget(sch)
 
@@ -727,6 +784,32 @@ class ConfigTab(QWidget):
         for btn, name in self._icon_buttons:
             btn.setIcon(icons.load_icon(name))
 
+    def _test_mirror(self) -> None:
+        target = self.backup_mirror.text().strip()
+        if not target:
+            QMessageBox.information(
+                self, "Backup mirror",
+                "No mirror set — backups are kept only in the local backup "
+                "folder, which won't survive that disk failing. Enter a second "
+                "disk, a network share, or an rclone remote (remote:path) to "
+                "keep an off-machine copy.",
+            )
+            return
+        self._mirror_test.setEnabled(False)
+        self._mirror_test.setText("Testing…")
+        # Held on self so the thread isn't garbage-collected mid-run.
+        self._mirror_worker = _MirrorTestWorker(target)
+        self._mirror_worker.done.connect(self._mirror_test_done)
+        self._mirror_worker.start()
+
+    def _mirror_test_done(self, ok: bool, msg: str) -> None:
+        self._mirror_test.setEnabled(True)
+        self._mirror_test.setText("Test")
+        if ok:
+            QMessageBox.information(self, "Backup mirror — reachable", msg)
+        else:
+            QMessageBox.warning(self, "Backup mirror — problem", msg)
+
     def _export_diagnostics(self) -> None:
         from ..diagnostics import build_bundle
 
@@ -752,6 +835,7 @@ class ConfigTab(QWidget):
         c.server_root = self.server_root.text()
         c.steamcmd_path = self.steamcmd.text()
         c.backup_root = self.backup_root.text()
+        c.backup_mirror = self.backup_mirror.text().strip()
         c.service_name = self.service.text()
         c.api_port = self.api_port.value()
 
@@ -774,6 +858,8 @@ class ConfigTab(QWidget):
         c.schedule.daily_restart = self.sch_restart.isChecked()
         c.schedule.daily_restart_at = self.sch_time.time().toString("HH:mm")
         c.schedule.backup_hours = self.sch_backup.value()
+        c.schedule.backup_retain = self.sch_retain.value()
+        c.schedule.mirror_retain = self.sch_mirror_retain.value()
         c.schedule.update_requires_backup = self.sch_upd_backup.isChecked()
 
         c.discord.enabled = self.dc_enabled.isChecked()
