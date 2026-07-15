@@ -123,9 +123,12 @@ begin
     SW_HIDE, ewWaitUntilTerminated, ResultCode);
   { The wizard's DEFAULT background mode is login startup: a plain
     palctl-daemon.exe process in the user's session, invisible to the service
-    manager but holding the exe open just the same. Record its Run key (so the
-    [Run] section can bring the daemon back), then kill the process. taskkill
-    exits nonzero when there is no such process; that's fine. }
+    manager but holding the exe open just the same. Record its Run key (so
+    the [Run] section can bring the daemon back), then kill the process.
+    taskkill exits nonzero when there is no such process; that's fine.
+    NB: no comment line may BEGIN with a bracket — ISCC reads a line-leading
+    bracket as a section tag even inside a Code comment, and exactly that
+    broke the 1.0.0 release build. }
   LoginStartupWasRegistered := RegValueExists(HKEY_CURRENT_USER,
     'Software\Microsoft\Windows\CurrentVersion\Run', 'palctl-daemon');
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM palctl-daemon.exe', '',
