@@ -192,6 +192,7 @@ class Daemon:
         # can't forget an intentional stop (the setter persists changes).
         self._desired_running = _load_desired_running()
         self._down_polls = 0               # consecutive unreachable polls
+        self._api_fail_streak = 0          # debounce for the down/up announcement
         self._autorestart_times: list[float] = []
 
         # Leak forecasting. _epoch_at marks the last server (re)start we saw:
@@ -282,10 +283,20 @@ class Daemon:
             metrics = await self.api.metrics()
             players = await self.api.players()
         except PalApiError:
-            if self._alive:
+            self._api_fail_streak += 1
+            # One failed poll is not an outage: a server answering in >6s under
+            # memory pressure is exactly when polls time out, and a false flip
+            # spams down/up announcements, splits playtime records, and resets
+            # the leak forecaster's history right when it's needed. Declare
+            # down only on the same consecutive-miss streak crash recovery
+            # uses. Auto-recovery still sees every miss (it has its own
+            # confirmation counter).
+            if self._alive and self._api_fail_streak >= max(
+                1, self.cfg.watchdog.crash_confirm_polls
+            ):
                 await self.tracker.handle_server_down()
                 await self.bus.emit(Event("server_down", "🔴 Server is **down**."))
-            self._alive = False
+                self._alive = False
             await self._maybe_autorecover()
             return
 
@@ -296,6 +307,7 @@ class Daemon:
         self._alive = True
         self._ever_alive = True
         self._down_polls = 0
+        self._api_fail_streak = 0
 
         await self.tracker.update(players)
 
@@ -430,7 +442,9 @@ class Daemon:
             )
             self._predict_warned = False
             self._spawn(
-                self.scheduler.restart_quick("Pre-emptive maintenance restart (memory)")
+                self.scheduler.restart_quick(
+                    "Pre-emptive maintenance restart (memory)", skip_if_busy=True
+                )
             )
         elif wd.predict_notify and not self._predict_warned:
             self._predict_warned = True
@@ -539,6 +553,8 @@ class Daemon:
                     await self.api.kick(body["user_id"], body.get("reason", ""))
                 elif what == "ban":
                     await self.api.ban(body["user_id"], body.get("reason", ""))
+                elif what == "unban":
+                    await self.api.unban(body["user_id"])
                 elif what == "reload-config":
                     self.cfg = Config.load()
                     self.api = PalApi(
@@ -586,16 +602,38 @@ class Daemon:
             self._spawn(self._check_palctl_update())
 
         await asyncio.gather(
-            self._poll_loop(),
-            self.watchdog.run(),
-            self.scheduler.run(),
-            self._predict_loop(),
-            self._update_check_loop(),
-            run_bot(
-                self.cfg, self.api, self.bus, self.store, self.scheduler,
-                on_created=self._set_bot,
+            self._supervised("poll loop", self._poll_loop()),
+            self._supervised("watchdog", self.watchdog.run()),
+            self._supervised("scheduler", self.scheduler.run()),
+            self._supervised("leak forecaster", self._predict_loop()),
+            self._supervised("update check", self._update_check_loop()),
+            self._supervised(
+                "discord bot",
+                run_bot(
+                    self.cfg, self.api, self.bus, self.store, self.scheduler,
+                    on_created=self._set_bot,
+                ),
             ),
         )
+
+    async def _supervised(self, name: str, coro) -> None:
+        """One escaped exception in any loop must not kill the whole daemon.
+
+        Every loop guards its tick body, but errors can still raise outside
+        those guards — a wrong-typed hand-edited config value at loop setup,
+        or a startup-time failure. gather() propagates the first one and
+        cancels everything: watchdog, scheduler, control API, bot, all gone.
+        Log it, tell the event feed, and keep the rest of the daemon alive."""
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.log.error("%s crashed; the rest of palctl keeps running", name, exc_info=True)
+            with contextlib.suppress(Exception):
+                await self.bus.emit(
+                    Event("error", f"{name} crashed and is disabled until restart: {e}")
+                )
 
     async def _update_check_loop(self) -> None:
         """Ask Steam whether a newer server build exists, a couple of minutes
@@ -702,10 +740,23 @@ def install_service(as_user: bool = False) -> None:
     else:
         from . import systemd
 
+        # Writing to /etc/systemd/system needs root, so this runs under sudo —
+        # but the daemon itself must NOT: without User= the unit runs as root,
+        # its config/token/secrets land under /root, and the invoking user's
+        # `palctl` CLI can never authenticate to it (401 on every call). Run
+        # the unit as the user who ran sudo, so daemon and CLI share the same
+        # ~/.config/palctl. A genuine root login keeps the old behavior.
+        run_as = os.environ.get("SUDO_USER") or None
+        if run_as == "root":
+            run_as = None
         exec_start = f"{exe} {args}".strip()
         systemd.install_service(
-            SERVICE_NAME, exec_start, description="palctl daemon", working_dir=app_dir
+            SERVICE_NAME, exec_start, description="palctl daemon",
+            working_dir=app_dir, user=run_as,
         )
+        if run_as:
+            print(f"[daemon] the service runs as '{run_as}' (not root), sharing that")
+            print("         account's ~/.config/palctl token with the palctl CLI.")
     print(f"[daemon] service '{SERVICE_NAME}' installed and started.")
 
 

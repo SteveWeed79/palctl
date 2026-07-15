@@ -9,7 +9,7 @@ pytest.importorskip("httpx")
 pytest.importorskip("keyring")
 
 from palctl.cli import (  # noqa: E402  (after importorskip)
-    find_player,
+    find_players,
     fmt_backups,
     fmt_players,
     fmt_status,
@@ -70,8 +70,18 @@ def test_fmt_backups():
     assert fmt_backups([]) == "No backups yet."
 
 
-def test_find_player_is_case_insensitive_and_exact():
-    assert find_player(STATE["players"], "zoe")["user_id"] == "steam_1"
-    assert find_player(STATE["players"], "ZOE")["user_id"] == "steam_1"
-    assert find_player(STATE["players"], "Zo") is None  # no prefix guessing
-    assert find_player([], "Zoe") is None
+def test_find_players_is_case_insensitive_and_exact():
+    assert [p["user_id"] for p in find_players(STATE["players"], "zoe")] == ["steam_1"]
+    assert [p["user_id"] for p in find_players(STATE["players"], "ZOE")] == ["steam_1"]
+    assert find_players(STATE["players"], "Zo") == []  # no prefix guessing
+    assert find_players([], "Zoe") == []
+
+
+def test_find_players_surfaces_duplicates():
+    # Palworld names aren't unique. Moderation must see BOTH matches and
+    # refuse, not silently kick whoever the API listed first.
+    dupes = STATE["players"] + [
+        {"name": "zoe", "user_id": "steam_9", "level": 5, "ping": 30.0,
+         "building_count": 1},
+    ]
+    assert [p["user_id"] for p in find_players(dupes, "Zoe")] == ["steam_1", "steam_9"]
