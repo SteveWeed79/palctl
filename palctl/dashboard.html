@@ -6,8 +6,10 @@
 <title>palctl</title>
 <style>
   /* Served by the palctl daemon on 127.0.0.1 only. The page itself is public
-     (it contains no data); every /state call needs the per-user token, which
-     rides in the URL fragment (#…) — fragments never leave the browser. */
+     (it contains no data); every /state call and every action needs the
+     per-user token, which rides in the URL fragment (#…) — fragments never
+     leave the browser. Actions send it in a custom header, which browsers
+     only allow same-origin — that requirement is also the CSRF defence. */
   :root {
     --surface: #fcfcfb;
     --panel: #f3f3f1;
@@ -102,6 +104,25 @@
                  flex: none; }
   .events span { color: var(--ink-2); overflow-wrap: anywhere; }
   .muted { color: var(--ink-3); font-size: 13px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    font: inherit; font-size: 13px; color: var(--ink);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 6px 12px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--ink-3); }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.danger { color: var(--critical); }
+  button.small { font-size: 12px; padding: 3px 9px; }
+  .announce { display: flex; gap: 8px; margin-top: 10px; }
+  .announce input {
+    flex: 1; font: inherit; font-size: 13px; color: var(--ink);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 6px 10px; min-width: 0;
+  }
+  .announce input:focus { outline: none; border-color: var(--ink-3); }
+  #act-note { margin: 8px 0 0; min-height: 1.2em; }
+  td.act { text-align: right; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -112,6 +133,23 @@
     <span class="op" id="op"></span>
   </header>
   <p id="err"></p>
+
+  <section id="actions-sec" hidden>
+    <h2>Actions</h2>
+    <div class="actions">
+      <button id="a-startstop">Start</button>
+      <button id="a-restart">Restart</button>
+      <button id="a-save">Save world</button>
+      <button id="a-backup">Backup</button>
+      <button id="a-update">Update server</button>
+    </div>
+    <div class="announce">
+      <input id="a-msg" placeholder="Announce to everyone in-game…" maxlength="200"
+             aria-label="Announcement message">
+      <button id="a-announce">Announce</button>
+    </div>
+    <p class="muted" id="act-note"></p>
+  </section>
 
   <div class="tiles" id="tiles" hidden>
     <div class="tile"><div class="k">Players</div><div class="v" id="t-players">–</div></div>
@@ -138,10 +176,20 @@
     <h2>Players online</h2>
     <table aria-label="Players online">
       <thead><tr><th>Name</th><th class="num">Level</th><th class="num">Ping</th>
-        <th class="num">Buildings</th></tr></thead>
+        <th class="num">Buildings</th><th></th></tr></thead>
       <tbody id="players"></tbody>
     </table>
     <p class="muted" id="players-empty" hidden>Nobody online.</p>
+  </section>
+
+  <section id="backups-sec" hidden>
+    <h2>Backups</h2>
+    <button id="b-refresh" class="small">Show backups</button>
+    <table id="b-table" aria-label="Backups" hidden style="margin-top:8px">
+      <thead><tr><th>Name</th><th class="num">Size</th><th></th></tr></thead>
+      <tbody id="b-rows"></tbody>
+    </table>
+    <p class="muted" id="b-empty" hidden>No backups yet.</p>
   </section>
 
   <section id="events-sec" hidden>
@@ -172,7 +220,7 @@ const fmtUp = (s) => {
   return d ? `${d}d ${h % 24}h` : `${h}h ${String(m % 60).padStart(2, "0")}m`;
 };
 
-let history = [];
+let histData = [];
 
 async function tick() {
   if (!token) {
@@ -196,12 +244,128 @@ async function tick() {
   render(state);
 }
 
+// ---------- actions ----------
+// Every action call carries the token in a custom header. Browsers only allow
+// custom headers same-origin (or after a CORS preflight the daemon never
+// grants), so a malicious page in another tab can't drive these endpoints —
+// the header requirement doubles as CSRF protection.
+
+const note = (msg) => { $("act-note").textContent = msg; };
+
+async function act(what, body, confirmMsg) {
+  if (confirmMsg && !window.confirm(confirmMsg)) return;
+  note("");
+  try {
+    const r = await fetch(`/action/${what}`, {
+      method: "POST",
+      headers: { "X-Palctl-Token": token, "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.status === 401) note("The daemon rejected the token — reopen with `palctl ui`.");
+    else if (r.status === 409) note(d.error || "Busy — another operation is in progress.");
+    else if (!r.ok) note(d.error ? `Failed: ${d.error}` : `Failed (HTTP ${r.status}).`);
+    else note("✓ Sent.");
+  } catch {
+    note("Lost the daemon — is it running?");
+  }
+  setTimeout(tick, 600);  // reflect the new state promptly
+}
+
+let running = false;  // service RUNNING, per the last /state
+
+$("a-startstop").addEventListener("click", () => {
+  if (running) {
+    act("stop", {}, "Stop the server? The world is saved first, and neither " +
+      "the watchdog nor the schedule will restart it until you start it again.");
+  } else {
+    act("start");
+  }
+});
+$("a-restart").addEventListener("click", () =>
+  act("restart", { reason: "Admin restart (web)" },
+    "Restart the server? Players get the in-game countdown first."));
+$("a-save").addEventListener("click", () => act("save"));
+$("a-backup").addEventListener("click", () => act("backup"));
+$("a-update").addEventListener("click", () =>
+  act("update-server", {},
+    "Update the server via SteamCMD? It is backed up, stopped, updated, and " +
+    "restarted — players get disconnected."));
+$("a-announce").addEventListener("click", () => {
+  const msg = $("a-msg").value.trim();
+  if (!msg) return;
+  act("announce", { message: msg });
+  $("a-msg").value = "";
+});
+$("a-msg").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") $("a-announce").click();
+});
+
+// ---------- backups ----------
+
+async function loadBackups() {
+  let list;
+  try {
+    const r = await fetch("/backups", { headers: { "X-Palctl-Token": token } });
+    if (!r.ok) { note(`Couldn't list backups (HTTP ${r.status}).`); return; }
+    list = await r.json();
+  } catch {
+    note("Lost the daemon — is it running?");
+    return;
+  }
+  $("b-refresh").textContent = "Refresh";
+  $("b-table").hidden = list.length === 0;
+  $("b-empty").hidden = list.length > 0;
+  $("b-rows").innerHTML = list.map((b) =>
+    `<tr><td>${esc(b.name)}</td>` +
+    `<td class="num">${Math.round(b.size_mb).toLocaleString()} MB</td>` +
+    `<td class="act"><button class="small danger" data-restore="${esc(b.name)}">` +
+    `Restore</button></td></tr>`).join("");
+}
+
+$("b-refresh").addEventListener("click", loadBackups);
+$("players").addEventListener("click", (ev) => {
+  const t = ev.target;
+  if (!t.getAttribute) return;
+  const name = t.getAttribute("data-name") || "";
+  const kick = t.getAttribute("data-kick"), ban = t.getAttribute("data-ban");
+  if (kick) act("kick", { user_id: kick, reason: "Kicked by admin" },
+    `Kick ${name}? They can rejoin.`);
+  else if (ban) act("ban", { user_id: ban, reason: "Banned by admin" },
+    `BAN ${name}? They cannot rejoin until unbanned.`);
+});
+$("b-rows").addEventListener("click", (ev) => {
+  const name = ev.target.getAttribute && ev.target.getAttribute("data-restore");
+  if (!name) return;
+  act("restore", { name },
+    `Restore backup "${name}" OVER the current world?\n\n` +
+    "The server is stopped first and the current world is snapshotted to a " +
+    "pre-restore backup, so this is undoable — but everything since this " +
+    "backup will be gone from the live world.");
+});
+
+// ---------- render ----------
+
 function render(state) {
   const alive = state.alive === true;
   $("dot").className = "dot " + (alive ? "up" : "down");
   $("svc").textContent = (state.service || "UNKNOWN") +
     (alive ? " · REST API answering" : " · REST API not answering");
   $("op").textContent = state.operation ? `${state.operation} in progress…` : "";
+
+  running = state.service === "RUNNING";
+  $("actions-sec").hidden = false;
+  $("backups-sec").hidden = false;
+  const busy = !!state.operation;
+  $("a-startstop").textContent = running ? "Stop" : "Start";
+  $("a-startstop").classList.toggle("danger", running);
+  // Server-cycle operations refuse to queue (the daemon answers 409); grey the
+  // buttons out so the refusal isn't a surprise. Save/announce just talk to
+  // the game API and stay available whenever it answers.
+  for (const id of ["a-startstop", "a-restart", "a-backup", "a-update"])
+    $(id).disabled = busy;
+  $("a-save").disabled = !alive;
+  $("a-announce").disabled = !alive;
 
   $("tiles").hidden = false;
   const m = state.metrics, p = state.process;
@@ -216,7 +380,7 @@ function render(state) {
   $("t-day").textContent = m ? `day ${m.days}` : "–";
   $("t-camps").textContent = m ? `${m.base_camps} base camps` : "";
 
-  history = (state.history || []).filter((s) => s.memory_mb > 0);
+  histData = (state.history || []).filter((s) => s.memory_mb > 0);
   drawSpark(state.memory_limit_mb || 0);
 
   const players = state.players || [];
@@ -225,7 +389,11 @@ function render(state) {
   $("players").innerHTML = players.map((pl) =>
     `<tr><td>${esc(pl.name)}</td><td class="num">${pl.level}</td>` +
     `<td class="num">${Math.round(pl.ping)}ms</td>` +
-    `<td class="num">${pl.building_count}</td></tr>`).join("");
+    `<td class="num">${pl.building_count}</td>` +
+    `<td class="act">` +
+    `<button class="small" data-kick="${esc(pl.user_id)}" data-name="${esc(pl.name)}">Kick</button> ` +
+    `<button class="small danger" data-ban="${esc(pl.user_id)}" data-name="${esc(pl.name)}">Ban</button>` +
+    `</td></tr>`).join("");
 
   const events = (state.events || []).slice(-20).reverse();
   $("events-sec").hidden = false;
@@ -237,13 +405,13 @@ function render(state) {
 
 function drawSpark(limitMb) {
   const svg = $("spark");
-  $("chart-sec").hidden = history.length < 2;
-  if (history.length < 2) return;
+  $("chart-sec").hidden = histData.length < 2;
+  if (histData.length < 2) return;
 
   const W = 880, H = 120, PAD = 14;
-  const ys = history.map((s) => s.memory_mb);
+  const ys = histData.map((s) => s.memory_mb);
   const yMax = Math.max(limitMb * 1.05 || 0, ...ys) || 1;
-  const x = (i) => (i / (history.length - 1)) * W;
+  const x = (i) => (i / (histData.length - 1)) * W;
   const y = (v) => H - PAD - (v / yMax) * (H - 2 * PAD);
 
   const pts = ys.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`);
@@ -266,13 +434,13 @@ function drawSpark(limitMb) {
 // Crosshair + tooltip on the sparkline.
 const box = document.querySelector(".chart-box");
 box.addEventListener("mousemove", (ev) => {
-  if (history.length < 2) return;
+  if (histData.length < 2) return;
   const svg = $("spark"), cursor = $("cursor"), tip = $("tip");
   const rect = svg.getBoundingClientRect();
   const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
-  const i = Math.round(frac * (history.length - 1));
-  const s = history[i];
-  const xv = (i / (history.length - 1)) * 880;
+  const i = Math.round(frac * (histData.length - 1));
+  const s = histData[i];
+  const xv = (i / (histData.length - 1)) * 880;
   cursor.setAttribute("x1", xv); cursor.setAttribute("x2", xv);
   cursor.style.opacity = 1;
   const when = s.at ? new Date(s.at * 1000).toLocaleTimeString() : "";

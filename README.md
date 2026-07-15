@@ -111,11 +111,28 @@ installer ships it as `palctl.exe` (tick "Add palctl to the PATH" to use it
 from any terminal); from source it's the `palctl` script pip installs.
 
 **Web dashboard** — `palctl ui`
-The daemon serves a read-only dashboard at `http://127.0.0.1:8830` (localhost
-only, like everything else): live status, FPS, players, a memory sparkline with
-the watchdog limit drawn in, and recent events. The page is static; the data
-calls need your per-user token, which `palctl ui` puts in the URL fragment —
-fragments never leave the browser.
+The daemon serves a dashboard at `http://127.0.0.1:8830` (localhost only, like
+everything else): live status, FPS, players, a memory sparkline with the
+watchdog limit drawn in, recent events — and the controls: start/stop/restart,
+save, backup, update, announce, kick/ban, and restore a backup (destructive
+actions confirm first, and a restore still snapshots the current world). The
+page is static; the data and action calls need your per-user token, which
+`palctl ui` puts in the URL fragment — fragments never leave the browser.
+
+**Manage it from your phone, safely.** The dashboard never leaves
+`127.0.0.1`, so remote access rides on a tunnel you already trust instead of
+palctl exposing a login to the network:
+
+- **ssh** — `ssh -L 8830:127.0.0.1:8830 your-server-box`, then run `palctl ui`
+  on the box and open the printed URL on your local machine. SSH is the
+  authentication.
+- **Tailscale** (or any WireGuard-style private network) — on the server box:
+  `tailscale serve 8830`. The dashboard is now reachable from your own devices
+  only, with HTTPS, at the URL `tailscale serve` prints. Get the tokened path
+  from `palctl ui` on the box.
+
+Both give you the full dashboard from anywhere with zero ports opened to the
+internet. Don't port-forward 8830 on your router — same rule as 8212.
 
 **Discord bot**
 `/status` `/players` `/playtime` `/announce` `/save` `/backup` `/backups` `/restore` `/restart` `/update` `/kick` `/ban`

@@ -19,6 +19,11 @@ Installers for every release are on the
   **Update requires a backup** in Config.
 
 ### Fixed
+- **The web dashboard actually works when opened via `palctl ui`.** A
+  variable named `history` shadowed the browser's `window.history`, so the
+  token-stripping line threw before any script ran — exactly (and only) when
+  the page was opened with a token in the URL, which is how `palctl ui` opens
+  it. The dashboard rendered nothing but its header in every shipped release.
 - **Hot backups are now consistency-checked.** A backup taken while the server
   is running fingerprints the world before and after the copy; if the server
   wrote mid-copy (a potentially torn backup), the copy is retried in a quiet
@@ -29,6 +34,14 @@ Installers for every release are on the
   silently skipped on every push.
 
 ### Added
+- **The web dashboard can act, not just watch.** `palctl ui` now has
+  start/stop/restart, save, backup, update, announce, kick/ban, and
+  restore-a-backup — the same daemon endpoints the GUI and CLI use, gated by
+  the same per-user token. Destructive actions confirm first; buttons grey out
+  while an operation holds the server lock. It still binds 127.0.0.1 only:
+  the README's new **"Manage it from your phone, safely"** section shows the
+  ssh-tunnel and Tailscale patterns for full remote admin with zero ports
+  exposed.
 - `SECURITY.md` — how to report a vulnerability privately, and where palctl
   draws its security boundaries.
 - This changelog, issue and pull-request templates.
