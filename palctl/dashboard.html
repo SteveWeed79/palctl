@@ -167,6 +167,18 @@
     .wrap { padding: 14px 10px 40px; }
     section { padding: 12px; }
   }
+  /* Confirm dialog — native <dialog> supplies focus trap / Esc / top layer. */
+  dialog {
+    background: var(--surface); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 14px;
+    padding: 18px 20px; max-width: min(420px, calc(100vw - 32px));
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.25);
+  }
+  dialog::backdrop { background: rgba(0, 0, 0, 0.45); backdrop-filter: blur(2px); }
+  dialog h3 { margin: 0 0 8px; font-size: 15px; }
+  dialog p { margin: 0; font-size: 13px; color: var(--ink-2); white-space: pre-line; }
+  .c-row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+  #c-ok.danger { border-color: var(--critical); }
 </style>
 </head>
 <body>
@@ -270,6 +282,16 @@
   </section>
 </div>
 
+<dialog id="confirm" aria-labelledby="c-title">
+  <h3 id="c-title"></h3>
+  <p id="c-body"></p>
+  <!-- Cancel first in DOM: showModal() focuses it, so Enter can't destroy. -->
+  <div class="c-row">
+    <button id="c-cancel" type="button">Cancel</button>
+    <button id="c-ok" type="button"></button>
+  </div>
+</dialog>
+
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -324,8 +346,25 @@ async function tick() {
 
 const note = (msg) => { $("act-note").textContent = msg; };
 
-async function act(what, body, confirmMsg) {
-  if (confirmMsg && !window.confirm(confirmMsg)) return;
+// In-page confirm on the native <dialog>: focus trap, Esc, and backdrop come
+// free. Cancel is first in the DOM so it takes initial focus — Enter can
+// never confirm a destructive action by accident. Resolves false on Esc/close.
+function ask({ title, body, ok, danger = true }) {
+  return new Promise((resolve) => {
+    $("c-title").textContent = title;
+    $("c-body").textContent = body;
+    const okBtn = $("c-ok"), dlg = $("confirm");
+    okBtn.textContent = ok;
+    okBtn.classList.toggle("danger", danger);
+    okBtn.onclick = () => { dlg.close(); resolve(true); };
+    $("c-cancel").onclick = () => dlg.close();
+    dlg.onclose = () => resolve(false);  // no-op if OK already resolved true
+    dlg.showModal();
+  });
+}
+
+async function act(what, body, confirmOpts) {
+  if (confirmOpts && !(await ask(confirmOpts))) return;
   note("");
   try {
     const r = await fetch(`/action/${what}`, {
@@ -348,21 +387,31 @@ let running = false;  // service RUNNING, per the last /state
 
 $("a-startstop").addEventListener("click", () => {
   if (running) {
-    act("stop", {}, "Stop the server? The world is saved first, and neither " +
-      "the watchdog nor the schedule will restart it until you start it again.");
+    act("stop", {}, {
+      title: "Stop the server?",
+      body: "The world is saved first. Neither the watchdog nor the schedule " +
+        "will restart it until you start it again.",
+      ok: "Stop server",
+    });
   } else {
     act("start");
   }
 });
 $("a-restart").addEventListener("click", () =>
-  act("restart", { reason: "Admin restart (web)" },
-    "Restart the server? Players get the in-game countdown first."));
+  act("restart", { reason: "Admin restart (web)" }, {
+    title: "Restart the server?",
+    body: "Players get the in-game countdown before it goes down.",
+    ok: "Restart", danger: false,
+  }));
 $("a-save").addEventListener("click", () => act("save"));
 $("a-backup").addEventListener("click", () => act("backup"));
 $("a-update").addEventListener("click", () =>
-  act("update-server", {},
-    "Update the server via SteamCMD? It is backed up, stopped, updated, and " +
-    "restarted — players get disconnected."));
+  act("update-server", {}, {
+    title: "Update the server?",
+    body: "SteamCMD run: backup, stop, update, restart. Players get " +
+      "disconnected while it runs.",
+    ok: "Update", danger: false,
+  }));
 $("a-announce").addEventListener("click", () => {
   const msg = $("a-msg").value.trim();
   if (!msg) return;
@@ -401,19 +450,27 @@ $("players").addEventListener("click", (ev) => {
   if (!t.getAttribute) return;
   const name = t.getAttribute("data-name") || "";
   const kick = t.getAttribute("data-kick"), ban = t.getAttribute("data-ban");
-  if (kick) act("kick", { user_id: kick, reason: "Kicked by admin" },
-    `Kick ${name}? They can rejoin.`);
-  else if (ban) act("ban", { user_id: ban, reason: "Banned by admin" },
-    `BAN ${name}? They cannot rejoin until unbanned.`);
+  if (kick) act("kick", { user_id: kick, reason: "Kicked by admin" }, {
+    title: `Kick ${name}?`,
+    body: "They can rejoin right away.",
+    ok: "Kick", danger: false,
+  });
+  else if (ban) act("ban", { user_id: ban, reason: "Banned by admin" }, {
+    title: `Ban ${name}?`,
+    body: "They cannot rejoin until unbanned.",
+    ok: "Ban",
+  });
 });
 $("b-rows").addEventListener("click", (ev) => {
   const name = ev.target.getAttribute && ev.target.getAttribute("data-restore");
   if (!name) return;
-  act("restore", { name },
-    `Restore backup "${name}" OVER the current world?\n\n` +
-    "The server is stopped first and the current world is snapshotted to a " +
-    "pre-restore backup, so this is undoable — but everything since this " +
-    "backup will be gone from the live world.");
+  act("restore", { name }, {
+    title: "Restore over the current world?",
+    body: `Backup: ${name}\n\nThe server is stopped first and the current ` +
+      "world is snapshotted to a pre-restore backup, so this is undoable — " +
+      "but everything since this backup will be gone from the live world.",
+    ok: "Restore",
+  });
 });
 
 // ---------- render ----------

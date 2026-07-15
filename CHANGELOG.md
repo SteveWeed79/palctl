@@ -44,7 +44,9 @@ Installers for every release are on the
 - **The web dashboard can act, not just watch.** `palctl ui` now has
   start/stop/restart, save, backup, update, announce, kick/ban, and
   restore-a-backup — the same daemon endpoints the GUI and CLI use, gated by
-  the same per-user token. Destructive actions confirm first; buttons grey out
+  the same per-user token. Destructive actions confirm in styled in-page
+  dialogs (Cancel holds focus so Enter can't confirm by accident; Esc
+  cancels); buttons grey out
   while an operation holds the server lock. It still binds 127.0.0.1 only:
   the README's new **"Manage it from your phone, safely"** section shows the
   ssh-tunnel and Tailscale patterns for full remote admin with zero ports
