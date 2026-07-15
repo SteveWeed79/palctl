@@ -1,0 +1,33 @@
+name: Feature request
+description: Something palctl should do that it doesn't.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One heads-up before you write: some often-requested features are
+        **impossible with Pocketpair's supported surface**, not just unbuilt —
+        chat relay (no chat-read endpoint), an entity/base manager (the
+        `gamedata` endpoint can't be enabled on dedicated servers), and a
+        plugin framework (closed UE5 binary). See the README's
+        "What it does NOT do, and can't" section. Anything else is fair game.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's the problem this solves?
+      description: The situation you're in, not the button you want. "My server fills up while I'm asleep and…" beats "add a setting for…".
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like palctl to do?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What do you do today instead?
+      description: Workarounds, other tools, manual steps — helps judge how much this matters.
+    validations:
+      required: false

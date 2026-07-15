@@ -42,6 +42,9 @@ you touch them.
 CI runs `pytest` on Windows and Linux for Python 3.11 and 3.12, and `ruff` on
 Linux (Python 3.11); keep both green.
 
+If your change is user-visible, add a line under **[Unreleased]** in
+[CHANGELOG.md](CHANGELOG.md) — release notes are assembled from it.
+
 ## Style
 
 Match the surrounding code. This codebase leans on comments that explain *why* a

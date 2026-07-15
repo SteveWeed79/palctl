@@ -1,0 +1,83 @@
+name: Bug report
+description: Something broke — a crash, a wrong behaviour, a setup dead-end.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The single most useful thing you can attach is a
+        **diagnostics bundle**: GUI → **Config tab → Export diagnostics**. It
+        zips the palctl logs and your config **with secrets stripped** — no
+        admin password, no Discord token — and answers most of the questions
+        below automatically.
+
+        *(Think you've found a security problem? Please don't file it here —
+        see [SECURITY.md](https://github.com/SteveWeed79/pal-it-up/blob/main/SECURITY.md)
+        for private reporting.)*
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did palctl do, and what did you expect instead?
+      placeholder: |
+        1. Opened the Console tab and clicked Restore on last night's backup
+        2. The countdown ran, but the server never came back
+        3. Expected it back up in a couple of minutes
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: palctl version
+      description: Bottom of the GUI window, or `palctl --version` / `palctl-daemon --version`.
+      placeholder: "0.1.13"
+    validations:
+      required: true
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: How is palctl installed?
+      options:
+        - Windows installer (palctl-setup.exe)
+        - Portable zip
+        - From source (pip / run-*.bat)
+        - Linux (headless daemon)
+    validations:
+      required: true
+  - type: dropdown
+    id: daemon-mode
+    attributes:
+      label: How does the daemon run?
+      options:
+        - Start at login (Run key — the wizard default)
+        - Windows service
+        - Windows service with --as-user
+        - systemd (Linux)
+        - I run it by hand / not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where did it go wrong?
+      options:
+        - First-run wizard / install
+        - Daemon (watchdog, scheduler, backups, updates)
+        - GUI
+        - CLI (palctl)
+        - Web dashboard
+        - Discord bot
+        - Installer / upgrade
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics bundle / logs
+      description: |
+        Drag the **Export diagnostics** zip here (Config tab), or paste the
+        relevant lines from `%APPDATA%\palctl\logs\`. Secrets are already
+        stripped from the bundle.
+    validations:
+      required: false

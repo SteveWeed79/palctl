@@ -15,6 +15,12 @@ class Backup:
     path: Path
     size_mb: float
     created: datetime
+    # False when the server wrote the world during every copy attempt, so the
+    # files may be from different moments (a "torn" backup). Kept anyway — a
+    # probably-fine backup beats none — but callers should warn. listing()
+    # can't know this after the fact, so it reports True; only the Backup
+    # returned by create() carries a real verdict.
+    consistent: bool = True
 
 
 def _stamp() -> str:
@@ -43,7 +49,39 @@ def _copytree_staged(src: Path, dest: Path) -> None:
         raise
 
 
-def create(savegames: Path, backup_root: Path, label: str = "manual") -> Backup:
+def _fingerprint(root: Path) -> dict[str, tuple[int, int]]:
+    """(size, mtime_ns) of every file under `root`, keyed by relative path.
+    Two identical fingerprints straddling a copy mean nothing was written
+    while the copy ran — every copied file is from the same moment."""
+    out: dict[str, tuple[int, int]] = {}
+    for f in root.rglob("*"):
+        if f.is_file():
+            st = f.stat()
+            out[f.relative_to(root).as_posix()] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def _copy_matches(before: dict[str, tuple[int, int]], copied: Path) -> bool:
+    """Every file the source had going in exists in the copy at the same size.
+    Catches a file the server deleted/replaced mid-copy and a short read the
+    filesystem didn't report — both of which mean this copy is torn."""
+    for rel, (size, _mtime) in before.items():
+        f = copied / rel
+        try:
+            if f.stat().st_size != size:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def create(
+    savegames: Path,
+    backup_root: Path,
+    label: str = "manual",
+    *,
+    consistency_retries: int = 2,
+) -> Backup:
     if not savegames.exists():
         raise FileNotFoundError(
             f"SaveGames not found at {savegames}. Check the server root path."
@@ -51,9 +89,32 @@ def create(savegames: Path, backup_root: Path, label: str = "manual") -> Backup:
 
     backup_root.mkdir(parents=True, exist_ok=True)
     dest = backup_root / f"{_stamp()}-{label}"
-    _copytree_staged(savegames, dest)
+    tmp = dest.parent / f"{dest.name}.partial"
 
-    return Backup(dest.name, dest, _dir_size_mb(dest), datetime.now())
+    # This is usually a HOT copy — the server keeps running (that's the point
+    # of scheduled backups). Saving first (the scheduler does) makes a torn
+    # copy unlikely, not impossible: Palworld can write a .sav mid-copy.
+    # Fingerprint the source before and after each attempt; identical
+    # fingerprints prove a quiet window, so retry a couple of times for one.
+    # Autosaves are minutes apart and the copy takes seconds, so a retry
+    # almost always lands clean. If every attempt was dirty, keep the last
+    # copy anyway — flagged, because a probably-fine backup beats none.
+    consistent = False
+    for _attempt in range(max(1, consistency_retries + 1)):
+        if tmp.exists():
+            shutil.rmtree(tmp)  # leftover from a previous failed/dirty attempt
+        before = _fingerprint(savegames)
+        try:
+            shutil.copytree(savegames, tmp)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        if _copy_matches(before, tmp) and _fingerprint(savegames) == before:
+            consistent = True
+            break
+
+    os.replace(tmp, dest)
+    return Backup(dest.name, dest, _dir_size_mb(dest), datetime.now(), consistent)
 
 
 def listing(backup_root: Path) -> list[Backup]:

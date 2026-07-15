@@ -18,9 +18,12 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       # The test suite covers the platform-neutral core (ini parser, backups,
-      # sessions, config, scheduler math) and deliberately skips the GUI and
-      # Discord bot, so PySide6/discord.py aren't needed here.
-      - run: pip install httpx psutil keyring pytest
+      # sessions, config, scheduler math) plus the daemon's pure decision
+      # helpers. Importing palctl.daemon pulls in aiohttp (its API server) and
+      # discord.py (the bot, imported at module level), so both are needed or
+      # test_daemon_helpers.py — the auth token gate and crash-auto-recovery
+      # tests — silently skips. The GUI stays out, so PySide6 isn't needed.
+      - run: pip install httpx psutil keyring aiohttp discord.py pytest
       - run: pytest -v
 
   lint:
