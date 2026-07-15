@@ -19,6 +19,11 @@ Installers for every release are on the
   **Update requires a backup** in Config.
 
 ### Fixed
+- **The web dashboard actually works when opened via `palctl ui`.** A
+  variable named `history` shadowed the browser's `window.history`, so the
+  token-stripping line threw before any script ran — exactly (and only) when
+  the page was opened with a token in the URL, which is how `palctl ui` opens
+  it. The dashboard rendered nothing but its header in every shipped release.
 - **Hot backups are now consistency-checked.** A backup taken while the server
   is running fingerprints the world before and after the copy; if the server
   wrote mid-copy (a potentially torn backup), the copy is retried in a quiet
@@ -29,6 +34,23 @@ Installers for every release are on the
   silently skipped on every push.
 
 ### Added
+- **The web dashboard got a visual overhaul** — the GUI's app icon and action
+  icons inlined (one brand across desktop and web), card layout on a page
+  plane, a favicon, a watchdog meter under the Memory tile that shifts
+  blue → amber → red as memory approaches the restart limit, time axis and a
+  current-value dot on the sparkline, and a phone-width layout (the Tailscale
+  / ssh-tunnel remote story is phone-first). Palette re-validated for both
+  light and dark modes.
+- **The web dashboard can act, not just watch.** `palctl ui` now has
+  start/stop/restart, save, backup, update, announce, kick/ban, and
+  restore-a-backup — the same daemon endpoints the GUI and CLI use, gated by
+  the same per-user token. Destructive actions confirm in styled in-page
+  dialogs (Cancel holds focus so Enter can't confirm by accident; Esc
+  cancels); buttons grey out
+  while an operation holds the server lock. It still binds 127.0.0.1 only:
+  the README's new **"Manage it from your phone, safely"** section shows the
+  ssh-tunnel and Tailscale patterns for full remote admin with zero ports
+  exposed.
 - `SECURITY.md` — how to report a vulnerability privately, and where palctl
   draws its security boundaries.
 - This changelog, issue and pull-request templates.
