@@ -10,7 +10,7 @@ are taken seriously.
 **Please do not open a public issue for a security problem.**
 
 Use GitHub's private vulnerability reporting instead:
-**[Security → Report a vulnerability](https://github.com/SteveWeed79/pal-it-up/security/advisories/new)**.
+**[Security → Report a vulnerability](https://github.com/SteveWeed79/palctl/security/advisories/new)**.
 That opens a private thread with the maintainer; nothing is public until a fix
 is out.
 

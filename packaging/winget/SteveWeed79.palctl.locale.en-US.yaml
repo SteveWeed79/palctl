@@ -1,12 +1,12 @@
 PackageIdentifier: SteveWeed79.palctl
-PackageVersion: 0.1.10
+PackageVersion: 1.0.0
 PackageLocale: en-US
 Publisher: SteveWeed79
-PublisherUrl: https://github.com/SteveWeed79/pal-it-up
+PublisherUrl: https://github.com/SteveWeed79/palctl
 PackageName: palctl
-PackageUrl: https://github.com/SteveWeed79/pal-it-up
+PackageUrl: https://github.com/SteveWeed79/palctl
 License: AGPL-3.0-or-later
-LicenseUrl: https://github.com/SteveWeed79/pal-it-up/blob/HEAD/LICENSE
+LicenseUrl: https://github.com/SteveWeed79/palctl/blob/HEAD/LICENSE
 ShortDescription: REST-native Palworld dedicated server control for Windows.
 Description: >-
   A Palworld dedicated server manager: memory-leak watchdog, one-click SteamCMD

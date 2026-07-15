@@ -14,8 +14,8 @@ say what you exercised by hand on Windows. -->
 - [ ] `pytest` passes
 - [ ] `ruff check palctl tests` passes
 - [ ] Commits are signed off (`git commit -s`) — opening this PR agrees to the
-      [CLA](https://github.com/SteveWeed79/pal-it-up/blob/main/CLA.md) for its
+      [CLA](https://github.com/SteveWeed79/palctl/blob/main/CLA.md) for its
       contributions (see
-      [CONTRIBUTING.md](https://github.com/SteveWeed79/pal-it-up/blob/main/CONTRIBUTING.md))
+      [CONTRIBUTING.md](https://github.com/SteveWeed79/palctl/blob/main/CONTRIBUTING.md))
 - [ ] User-visible changes have a line under **[Unreleased]** in
-      [CHANGELOG.md](https://github.com/SteveWeed79/pal-it-up/blob/main/CHANGELOG.md)
+      [CHANGELOG.md](https://github.com/SteveWeed79/palctl/blob/main/CHANGELOG.md)
