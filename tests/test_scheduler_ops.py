@@ -167,6 +167,59 @@ def test_update_server_mirrors_backup_when_configured(tmp_path, monkeypatch):
     assert primary == mirrored and len(mirrored) == 1
 
 
+def test_mirror_dispatches_to_rclone_for_a_remote_target(tmp_path, monkeypatch):
+    # A `remote:path` mirror goes through rclone (cloud), not the local copy.
+    from palctl import backups
+
+    cfg = Config()
+    cfg.backup_mirror = "gdrive:PalworldBackups"
+    cfg.schedule.backup_retain = 7
+
+    calls: list = []
+    monkeypatch.setattr(sched_mod.rclone, "mirror",
+                        lambda path, remote: calls.append(("mirror", str(path), remote)))
+    monkeypatch.setattr(sched_mod.rclone, "prune",
+                        lambda remote, retain: calls.append(("prune", remote, retain)))
+    # If dispatch is wrong and it falls through to the local copy, this fails loud.
+    def _boom(*a, **k):
+        raise AssertionError("local mirror used for a remote target")
+    monkeypatch.setattr(backups, "mirror", _boom)
+
+    bus = EventBus()
+    errors = _collect(bus)
+    b = backups.Backup("2026-07-15_10-00-00-scheduled", tmp_path / "b", 1.0,
+                       __import__("datetime").datetime.now())
+    ok = _run(sched_mod.Scheduler(cfg, FakeApi(), bus)._mirror(b))
+
+    assert ok is True
+    assert calls == [
+        ("mirror", str(tmp_path / "b"), "gdrive:PalworldBackups"),
+        ("prune", "gdrive:PalworldBackups", 7),
+    ]
+    assert not errors  # a clean run emits no error event
+
+
+def test_mirror_rclone_failure_is_non_fatal(tmp_path, monkeypatch):
+    # A cloud mirror failure must not fail the backup — it reports and returns False.
+    from palctl import backups
+
+    cfg = Config()
+    cfg.backup_mirror = "gdrive:PalworldBackups"
+
+    def _fail(*a, **k):
+        raise RuntimeError("rclone: quota exceeded")
+    monkeypatch.setattr(sched_mod.rclone, "mirror", _fail)
+
+    bus = EventBus()
+    errors = _collect(bus)
+    b = backups.Backup("2026-07-15_10-00-00-scheduled", tmp_path / "b", 1.0,
+                       __import__("datetime").datetime.now())
+    ok = _run(sched_mod.Scheduler(cfg, FakeApi(), bus)._mirror(b))
+
+    assert ok is False
+    assert any("quota exceeded" in e.message for e in errors)
+
+
 def test_update_server_aborts_when_server_wont_stop(tmp_path, monkeypatch):
     # SteamCMD rewriting the install under a still-running server corrupts it:
     # a stop that never confirms STOPPED must abort the update untouched.
