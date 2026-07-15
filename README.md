@@ -7,6 +7,18 @@ memory-leak watchdog and a **self-hosted Discord bot**.
 > are on the [Releases page](https://github.com/SteveWeed79/pal-it-up/releases),
 > with the history in [CHANGELOG.md](CHANGELOG.md). Issues and PRs welcome.
 
+<p align="center">
+  <img src="docs/screenshots/web-dashboard-dark.png"
+       alt="palctl web dashboard: server controls, live metrics tiles with a memory-vs-watchdog-limit meter, a two-hour memory sparkline with the restart limit drawn in, players with kick/ban, backups with restore, and recent events"
+       width="720">
+</p>
+<p align="center">
+  <img src="docs/screenshots/web-dashboard-phone.png"
+       alt="The same dashboard on a phone: full controls and metrics in a single-column layout"
+       width="260">
+</p>
+<p align="center"><em>The web dashboard (<code>palctl ui</code>) — desktop and phone, dark mode.</em></p>
+
 ---
 
 ## Why this exists
