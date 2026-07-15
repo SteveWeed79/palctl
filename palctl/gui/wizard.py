@@ -487,6 +487,32 @@ class SetupWizard(QDialog):
             return "none"
         return "service" if self.startup_service.isChecked() else "login"
 
+    def _setup_running(self) -> bool:
+        worker = getattr(self, "_worker", None)
+        return bool(worker and worker.isRunning())
+
+    def reject(self) -> None:
+        # Disabling the Close button doesn't stop Esc or the title-bar X from
+        # dismissing a QDialog — which would hide the log while SetupWorker
+        # keeps registering services and downloading gigabytes invisibly.
+        # Block dismissal until the run finishes.
+        if self._setup_running():
+            QMessageBox.information(
+                self, "Setup is running",
+                "Setup is still working — closing this window now would leave "
+                "it running invisibly in the background. Wait for it to finish "
+                "(the log below shows progress).",
+            )
+            return
+        super().reject()
+
+    def closeEvent(self, event) -> None:
+        if self._setup_running():
+            event.ignore()
+            self.reject()  # shows the same explanation
+            return
+        super().closeEvent(event)
+
     def _run(self) -> None:
         password = self.password.text().strip()
         if not password:

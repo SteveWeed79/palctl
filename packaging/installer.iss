@@ -80,6 +80,7 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
 [Code]
 var
   ServiceWasRegistered: Boolean;
+  LoginStartupWasRegistered: Boolean;
 
 function NeedsAddPath(Param: string): boolean;
 var
@@ -120,6 +121,15 @@ begin
   ServiceWasRegistered := ServiceExists('palctl-daemon');
   Exec(ExpandConstant('{sys}\net.exe'), 'stop palctl-daemon', '',
     SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  { The wizard's DEFAULT background mode is login startup: a plain
+    palctl-daemon.exe process in the user's session, invisible to the service
+    manager but holding the exe open just the same. Record its Run key (so the
+    [Run] section can bring the daemon back), then kill the process. taskkill
+    exits nonzero when there is no such process; that's fine. }
+  LoginStartupWasRegistered := RegValueExists(HKEY_CURRENT_USER,
+    'Software\Microsoft\Windows\CurrentVersion\Run', 'palctl-daemon');
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM palctl-daemon.exe', '',
+    SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Result := '';
 end;
 
@@ -131,6 +141,16 @@ begin
   Result := ServiceWasRegistered and not WizardIsTaskSelected('daemonservice');
 end;
 
+function NeedsLoginDaemonRestart: Boolean;
+begin
+  { Same idea for the login-startup mode: bring the daemon back after the
+    upgrade killed it, or the watchdog/scheduler/bot silently stay dead until
+    the next sign-in. Skipped if a service is (being) registered — one daemon
+    only. }
+  Result := LoginStartupWasRegistered and not ServiceWasRegistered
+    and not WizardIsTaskSelected('daemonservice');
+end;
+
 [Run]
 ; Self-register the daemon service (downloads NSSM on first use).
 Filename: "{app}\palctl-daemon.exe"; Parameters: "install-service"; Tasks: daemonservice; Flags: runhidden waituntilterminated; StatusMsg: "Registering the palctl service..."
@@ -138,6 +158,11 @@ Filename: "{app}\palctl-daemon.exe"; Parameters: "install-service"; Tasks: daemo
 ; stopped it to free the exe; start it back so the watchdog/scheduler/bot don't
 ; stay dead until reboot. Skipped when the daemonservice task above already did it.
 Filename: "{sys}\net.exe"; Parameters: "start palctl-daemon"; Check: NeedsServiceRestart; Flags: runhidden waituntilterminated; StatusMsg: "Restarting the palctl background service..."
+; Same for the login-startup mode (the wizard's DEFAULT): PrepareToInstall
+; killed the running daemon to free the exe; relaunch it the way the Run key
+; would at login — as the original, non-elevated user, so it reads that user's
+; config and DPAPI secrets (the Discord token).
+Filename: "{app}\palctl-daemon.exe"; Parameters: "run --headless"; Check: NeedsLoginDaemonRestart; Flags: runhidden nowait runasoriginaluser; StatusMsg: "Restarting palctl in the background..."
 ; Offer to launch the GUI (which runs the first-run wizard) at the end.
 Filename: "{app}\palctl-gui.exe"; Description: "Launch palctl"; Flags: nowait postinstall skipifsilent
 
@@ -145,6 +170,13 @@ Filename: "{app}\palctl-gui.exe"; Description: "Launch palctl"; Flags: nowait po
 ; Remove the service before the files go, so nothing is left pointing at a
 ; deleted exe. runhidden so an already-absent service fails quietly.
 Filename: "{app}\palctl-daemon.exe"; Parameters: "uninstall-service"; Flags: runhidden waituntilterminated; RunOnceId: "RemovePalctlService"
+; A login-mode daemon (and an open GUI) isn't a service, so nothing above
+; stops it — but it holds its exe open, which would leave orphaned files in
+; Program Files and a ghost daemon running from a half-deleted folder. The
+; service case is already stopped by uninstall-service, so this only ever
+; hits the login-mode process. taskkill exits nonzero when nothing matched.
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM palctl-daemon.exe"; Flags: runhidden waituntilterminated; RunOnceId: "KillPalctlDaemon"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM palctl-gui.exe"; Flags: runhidden waituntilterminated; RunOnceId: "KillPalctlGui"
 ; Also clear the login-startup HKCU Run key (the wizard's DEFAULT background
 ; mode), or an autorun pointing at the just-deleted exe is left behind.
 Filename: "{app}\palctl-daemon.exe"; Parameters: "uninstall-startup"; Flags: runhidden waituntilterminated; RunOnceId: "RemovePalctlStartup"

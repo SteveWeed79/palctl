@@ -72,23 +72,36 @@ def fmt_events(events: list[dict], n: int = 20) -> str:
     )
 
 
-def find_player(players: list[dict], name: str) -> dict | None:
-    """Resolve a player by in-game name (case-insensitive) — the daemon's
-    kick/ban actions want the user_id, which nobody types by hand."""
-    return next((p for p in players if p.get("name", "").lower() == name.lower()), None)
+def find_players(players: list[dict], name: str) -> list[dict]:
+    """All online players matching an in-game name (case-insensitive) — the
+    daemon's kick/ban actions want the user_id, which nobody types by hand.
+    Returns a list: Palworld names aren't unique, and moderation must refuse
+    an ambiguous match rather than hit whoever the API listed first."""
+    return [p for p in players if p.get("name", "").lower() == name.lower()]
 
 
 # ---------------- commands ----------------
 
 
 def _resolve_target(client: DaemonClient, name: str) -> str:
-    match = find_player(client.state().get("players", []), name)
-    if match is None:
+    players = client.state().get("players", [])
+    # An exact user ID passes straight through — it's the only unambiguous
+    # handle when two players share a name.
+    if any(p.get("user_id") == name for p in players):
+        return name
+    matches = find_players(players, name)
+    if not matches:
         raise DaemonError(
             f"Can't find '{name}' online. (Kick/ban needs the player on the "
             "server to resolve their user ID — check `palctl players`.)"
         )
-    return match["user_id"]
+    if len(matches) > 1:
+        listing = ", ".join(f"{p['name']} ({p['user_id']})" for p in matches)
+        raise DaemonError(
+            f"{len(matches)} online players are named '{name}': {listing}. "
+            "Re-run with the exact user ID so the right one is hit."
+        )
+    return matches[0]["user_id"]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -125,9 +138,16 @@ def main(argv: list[str] | None = None) -> int:
     an.add_argument("message", nargs="+")
 
     for verb in ("kick", "ban"):
-        k = sub.add_parser(verb, help=f"{verb} a player by name")
+        k = sub.add_parser(verb, help=f"{verb} a player by name (or exact user ID)")
         k.add_argument("name")
         k.add_argument("--reason", default=f"{verb.capitalize()}ed by admin")
+
+    ub = sub.add_parser(
+        "unban",
+        help="unban a player by user ID (they're offline, so the ID — shown in "
+        "the ban event and `palctl players` — is the only handle)",
+    )
+    ub.add_argument("user_id")
 
     sub.add_parser("ui", help="open the local web dashboard in a browser")
 
@@ -174,6 +194,9 @@ def main(argv: list[str] | None = None) -> int:
             user_id = _resolve_target(client, args.name)
             client.action(args.cmd, user_id=user_id, reason=args.reason)
             print(f"{args.cmd.capitalize()}ed {args.name}.")
+        elif args.cmd == "unban":
+            client.action("unban", user_id=args.user_id)
+            print(f"Unbanned {args.user_id}.")
         elif args.cmd == "ui":
             # The token rides in the URL fragment: fragments never leave the
             # browser, and the page needs it to call the daemon's API.

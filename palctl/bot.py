@@ -8,13 +8,15 @@ there can't be. Palworld exposes no chat-read endpoint and dedicated servers
 ship no log file. Chat is UE4SS-only territory.
 
 What you DO get, all reconstructed from polling /players and /metrics:
-  /status /players /announce /save /restart /backup /kick /ban /playtime
+  /status /players /playtime /announce /save /backup /backups /restore
+  /restart /update /kick /ban /unban
   join + leave alerts, level-up alerts, watchdog alerts, up/down alerts
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from datetime import timedelta
 
@@ -56,6 +58,10 @@ class PalBot(discord.Client):
         self._sched = scheduler
         self._bg_tasks: set[asyncio.Task] = set()
         self._status_started = False
+        # Events queue here; _event_pump does the actual Discord sends so
+        # EventBus.emit (the poll/watchdog/scheduler path) never waits on
+        # Discord. Bounded: a long Discord outage drops oldest, keeps newest.
+        self._events: asyncio.Queue[Event] = asyncio.Queue(maxsize=200)
         self._register()
         bus.on_any(self._on_event)
 
@@ -100,6 +106,32 @@ class PalBot(discord.Client):
         return ch if isinstance(ch, discord.abc.Messageable) else None
 
     async def _on_event(self, e: Event) -> None:
+        # Never do Discord I/O here: this runs inside EventBus.emit, i.e.
+        # inside the poll loop, the watchdog, and every operation that emits
+        # while holding the server lock. discord.py sleeps through rate
+        # limits inside send(), so one busy channel would stall all of them.
+        # Queue instead; _event_pump (a bot task) absorbs the latency.
+        try:
+            self._events.put_nowait(e)
+        except asyncio.QueueFull:
+            # Discord has been unreachable a while — drop the oldest, keep
+            # the newest; stale join/leave noise is worth less than "down".
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._events.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                self._events.put_nowait(e)
+
+    async def _event_pump(self) -> None:
+        while not self.is_closed():
+            e = await self._events.get()
+            try:
+                await self._relay_event(e)
+            except Exception:
+                logging.getLogger("palctl.bot").warning(
+                    "event relay to Discord failed", exc_info=True
+                )
+
+    async def _relay_event(self, e: Event) -> None:
         d = self._cfg.discord
         if not d.enabled:
             return
@@ -134,7 +166,12 @@ class PalBot(discord.Client):
             await ch.send(embed=discord.Embed(description=e.message, colour=colour))
             if e.kind == "join" and d.welcome_message:
                 name = e.data.get("name", "there")
-                await ch.send(d.welcome_message.replace("{name}", name))
+                # Player-chosen names are untrusted: never let one ping
+                # @everyone or roles through the welcome message.
+                await ch.send(
+                    d.welcome_message.replace("{name}", name),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
         except discord.DiscordException:
             pass
 
@@ -152,8 +189,10 @@ class PalBot(discord.Client):
     # ---------- status embed (shared by /status and the live message) ----------
 
     async def _status_embed(self) -> discord.Embed:
-        svc = procs.service_state(self._cfg.service_name)
-        stats = procs.proc_stats()
+        # Both are blocking (sc.exe / a full psutil scan) — keep them off the
+        # shared event loop.
+        svc = await asyncio.to_thread(procs.service_state, self._cfg.service_name)
+        stats = await asyncio.to_thread(procs.proc_stats)
 
         e = discord.Embed(title="Palworld Server", colour=BLUE)
         e.add_field(name="Service", value=svc)
@@ -354,6 +393,20 @@ class PalBot(discord.Client):
         ) -> None:
             await self._moderate(interaction, name, reason, "ban")
 
+        @tree.command(name="unban", description="Unban a player by user ID")
+        async def unban(interaction: discord.Interaction, user_id: str) -> None:
+            # Banned players are offline, so the user ID (from the ban
+            # message or /players) is the only handle — no name resolution.
+            if not self._is_admin(interaction):
+                await interaction.response.send_message("Not allowed.", ephemeral=True)
+                return
+            await interaction.response.defer()
+            try:
+                await self._api.unban(user_id)
+                await interaction.followup.send(f"✅ Unbanned `{user_id}`.")
+            except PalApiError as err:
+                await interaction.followup.send(f"❌ {err}")
+
     async def _moderate(
         self, interaction: discord.Interaction, name: str, reason: str, action: str
     ) -> None:
@@ -364,10 +417,23 @@ class PalBot(discord.Client):
 
         try:
             ps = await self._api.players()
-            match = next((p for p in ps if p.name.lower() == name.lower()), None)
+            # An exact user ID wins outright — it's the only unambiguous
+            # handle when two players share a name.
+            match = next((p for p in ps if p.user_id == name), None)
             if match is None:
-                await interaction.followup.send(f"**{name}** isn't online.")
-                return
+                matches = [p for p in ps if p.name.lower() == name.lower()]
+                if not matches:
+                    await interaction.followup.send(f"**{name}** isn't online.")
+                    return
+                if len(matches) > 1:
+                    ids = ", ".join(f"`{p.user_id}`" for p in matches)
+                    await interaction.followup.send(
+                        f"{len(matches)} online players are named **{name}** "
+                        f"({ids}) — re-run /{action} with the exact user ID so "
+                        "the right one is hit."
+                    )
+                    return
+                match = matches[0]
 
             if action == "kick":
                 await self._api.kick(match.user_id, reason)
@@ -381,6 +447,7 @@ class PalBot(discord.Client):
     # ---------- lifecycle ----------
 
     async def setup_hook(self) -> None:
+        self._spawn(self._event_pump())
         await self.tree.sync()
 
     async def on_ready(self) -> None:
@@ -408,17 +475,43 @@ async def run_bot(
     if not (cfg.discord.enabled and token):
         return  # bot is opt-in; daemon runs fine without it
 
-    bot = PalBot(cfg, api, bus, store, sched)
-    if on_created is not None:
-        # Hand the instance back to the daemon so reload-config can reach it.
-        on_created(bot)
-    try:
-        await bot.start(token)
-    except discord.LoginFailure:
-        await bus.emit(
-            Event("error", "Discord token rejected. Re-enter it in palctl Settings.")
-        )
-    except Exception as e:
-        # The bot is optional; it must never take the watchdog and scheduler
-        # down with it (they all run in the same asyncio.gather).
-        await bus.emit(Event("error", f"Discord bot stopped: {e}"))
+    # discord.py only auto-reconnects AFTER the first successful login; a
+    # network that isn't up yet at daemon start (boot order, DNS not ready)
+    # used to kill the bot until the daemon was restarted. Retry the initial
+    # connect with a backoff. A closed Client can't be started again, so each
+    # attempt rebuilds it (and unhooks the dead one from the bus).
+    attempt = 0
+    while True:
+        bot = PalBot(cfg, api, bus, store, sched)
+        if on_created is not None:
+            # Hand the instance back to the daemon so reload-config can reach it.
+            on_created(bot)
+        try:
+            await bot.start(token)
+            return  # clean shutdown
+        except discord.LoginFailure:
+            await bus.emit(
+                Event("error", "Discord token rejected. Re-enter it in palctl Settings.")
+            )
+            return  # retrying a bad token just fails again
+        except Exception as e:
+            # The bot is optional; it must never take the watchdog and scheduler
+            # down with it (they all run in the same asyncio.gather).
+            if bot._status_started:
+                # It WAS connected — discord.py's own reconnect gave up.
+                await bus.emit(Event("error", f"Discord bot stopped: {e}"))
+                return
+            attempt += 1
+            delay = min(300, 15 * 2 ** min(attempt - 1, 4))
+            await bus.emit(
+                Event(
+                    "error",
+                    f"Discord bot couldn't connect ({e}) — retrying in {delay}s.",
+                )
+            )
+        finally:
+            bus.off_any(bot._on_event)
+            if not bot.is_closed():
+                with contextlib.suppress(Exception):
+                    await bot.close()
+        await asyncio.sleep(delay)

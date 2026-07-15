@@ -61,6 +61,15 @@ class EventBus:
     def on_any(self, handler: Handler) -> None:
         self._handlers["*"].append(handler)
 
+    def off_any(self, handler: Handler) -> None:
+        """Detach a catch-all handler. Lets a reconnecting subscriber (the
+        Discord bot rebuilds its client per connect attempt) replace itself
+        instead of stacking dead handlers forever."""
+        try:
+            self._handlers["*"].remove(handler)
+        except ValueError:
+            pass
+
     async def emit(self, event: Event) -> None:
         self._recent.append(event)
         del self._recent[:-500]

@@ -24,6 +24,42 @@ Installers for every release are on the
   token-stripping line threw before any script ran — exactly (and only) when
   the page was opened with a token in the URL, which is how `palctl ui` opens
   it. The dashboard rendered nothing but its header in every shipped release.
+- **The Config and Settings tabs refresh after the setup wizard runs.** They
+  used to keep pre-wizard values, so the natural first-day flow — wizard, then
+  Config tab to paste a Discord token, Save — silently reverted the wizard's
+  paths/port and wiped the freshly stored admin password.
+- **Console buttons no longer freeze the window.** Stop/Start/etc. now run on
+  a worker thread with a timeout matching the daemon's own service-wait, so a
+  slow service stop can't lock the UI for 10 seconds and then claim the daemon
+  was unreachable when the stop had actually succeeded.
+- **Upgrades and uninstalls handle the default background mode.** The
+  installer now stops a login-startup daemon before copying files (not just
+  the Windows-service variant), restarts it afterwards, and the uninstaller
+  kills a running daemon/GUI so no orphaned files or ghost daemon are left.
+- **Headless Linux actually works as documented:** `install-service` now
+  registers the systemd unit to run as the sudo'ing user, not root, so the
+  daemon shares your `~/.config/palctl` and the `palctl` CLI can authenticate.
+- **One crashed loop no longer kills the whole daemon** — a failure in e.g.
+  the leak forecaster is logged and reported while polling, the watchdog, the
+  scheduler, and the control API keep running.
+- **Service control can't wedge the daemon:** sc.exe/systemctl calls are
+  bounded by a timeout, run off the event loop, and a Linux box without
+  systemd degrades to "UNKNOWN" instead of crashing the control API.
+- **Down/up flapping is debounced.** One slow poll (six-second timeout —
+  common under the very memory pressure palctl watches for) no longer
+  announces a false outage, splits playtime records, and resets the leak
+  forecaster's history.
+- The forecaster's empty-server pre-emptive restart can no longer queue behind
+  a watchdog restart and bounce the server twice back-to-back.
+- **The Discord bot retries its first connection** (network not ready at boot
+  used to kill it until the next daemon restart), and its messages are sent
+  from a queue so a Discord rate limit can't stall polling or the watchdog.
+- The setup wizard can no longer be dismissed with Esc / the title-bar X while
+  setup is still running invisibly in the background.
+- Kick/ban refuse an ambiguous player name (two players with the same name)
+  instead of hitting whichever the API listed first; an exact user ID always
+  works.
+- The welcome message can't be used to ping @everyone via a player-chosen name.
 - **Hot backups are now consistency-checked.** A backup taken while the server
   is running fingerprints the world before and after the copy; if the server
   wrote mid-copy (a potentially torn backup), the copy is retried in a quiet
@@ -34,6 +70,9 @@ Installers for every release are on the
   silently skipped on every push.
 
 ### Added
+- **`/unban`** — from the CLI (`palctl unban <user_id>`), the Discord bot, and
+  the daemon API. Bans issued through palctl were previously irreversible
+  in-app.
 - **The web dashboard got a visual overhaul** — the GUI's app icon and action
   icons inlined (one brand across desktop and web), card layout on a page
   plane, a favicon, a watchdog meter under the Memory tile that shifts

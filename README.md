@@ -249,8 +249,13 @@ control uses **systemd** instead of NSSM, SteamCMD comes from the Linux tarball,
 and paths resolve under `~/.steam` / `LinuxServer/`. Register the daemon with:
 
 ```
-python -m palctl.daemon install-service   # writes a systemd unit, enables it
+sudo python -m palctl.daemon install-service   # writes a systemd unit, enables it
 ```
+
+Writing the unit needs sudo, but the daemon itself runs as **you**, not root —
+the unit is registered with `User=$SUDO_USER`, so the daemon shares your
+`~/.config/palctl` (config, control token, secrets) and the `palctl` CLI you
+run from your own shell can talk to it.
 
 The desktop GUI/wizard are Windows-first; on a headless Linux host you drive
 the daemon with the **`palctl` CLI**, the **web dashboard** (`palctl ui`

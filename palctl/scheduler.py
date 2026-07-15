@@ -294,10 +294,21 @@ class Scheduler:
                 )
             )
 
-    async def restart_quick(self, reason: str) -> None:
+    async def restart_quick(self, reason: str, *, skip_if_busy: bool = False) -> None:
         """Save and restart with no countdown. For moments when there's nobody
-        to warn — the leak forecaster's empty-server pre-emptive restart."""
-        async with self._control.operation("restart"):
+        to warn — the leak forecaster's empty-server pre-emptive restart.
+
+        skip_if_busy: opportunistic callers (the forecaster) must never queue
+        behind another operation — control.py's own contract. By the time a
+        watchdog restart releases the lock, the server was just restarted; a
+        queued second restart would bounce it again for nothing."""
+        if skip_if_busy:
+            op = self._control.try_operation("restart")
+            if op is None:
+                return
+        else:
+            op = self._control.operation("restart")
+        async with op:
             await self._bus.emit(Event("restart", f"🔁 {reason}"))
             await self._control.save_best_effort(settle=3)
             ok = await self._control.restart_cycle()

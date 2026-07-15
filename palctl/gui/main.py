@@ -86,10 +86,10 @@ class DaemonDown(DaemonError):
     GUI is only a view onto the daemon, so 'it's not running' is the answer."""
 
 
-def call(path: str, body: dict | None = None) -> dict:
+def call(path: str, body: dict | None = None, *, timeout: float = 10) -> dict:
     headers = _auth_headers()
     try:
-        with httpx.Client(timeout=10) as c:
+        with httpx.Client(timeout=timeout) as c:
             r = (
                 c.post(f"{DAEMON}{path}", json=body or {}, headers=headers)
                 if body is not None or path.startswith("/action")
@@ -120,6 +120,30 @@ def call(path: str, body: dict | None = None) -> dict:
             reason = None
         raise DaemonError(reason or f"The daemon returned HTTP {r.status_code}.")
     return r.json()
+
+
+class CallWorker(QThread):
+    """One daemon call, off the UI thread.
+
+    /action/stop and /action/start block server-side until the Windows service
+    actually changes state — up to two minutes for a slow stop. Running that
+    synchronously from a button slot froze the window for httpx's 10s timeout
+    and then reported a false "daemon unreachable" for an operation that had
+    in fact succeeded. The long timeout matches the daemon's own service-wait."""
+
+    ok = Signal(str)
+    fail = Signal(str)
+
+    def __init__(self, path: str, body: dict, ok_line: str) -> None:
+        super().__init__()
+        self._path, self._body, self._ok_line = path, body, ok_line
+
+    def run(self) -> None:
+        try:
+            call(self._path, self._body, timeout=180)
+            self.ok.emit(self._ok_line)
+        except Exception as e:
+            self.fail.emit(str(e))
 
 
 class Poller(QThread):
@@ -329,6 +353,9 @@ class Players(QWidget):
 class Console(QWidget):
     def __init__(self) -> None:
         super().__init__()
+        # Strong refs to in-flight action workers: Qt threads are C++ objects
+        # that crash the app if Python garbage-collects them mid-run.
+        self._workers: set[CallWorker] = set()
         v = QVBoxLayout(self)
 
         row = QHBoxLayout()
@@ -380,27 +407,34 @@ class Console(QWidget):
         for btn, name in self._icon_buttons:
             btn.setIcon(icons.load_icon(name))
 
+    def _call_async(self, path: str, body: dict, ok_line: str, on_ok=None) -> None:
+        """Run one daemon call on a worker thread and log the outcome. The UI
+        thread must never wait on /action/stop-or-start — they block until the
+        service really changes state."""
+        w = CallWorker(path, body, ok_line)
+        self._workers.add(w)
+        w.ok.connect(self.log.append)
+        if on_ok is not None:
+            w.ok.connect(lambda _line: on_ok())
+        w.fail.connect(lambda err: self.log.append(f"❌ {err}"))
+        w.finished.connect(lambda: (self._workers.discard(w), w.deleteLater()))
+        w.start()
+
     def _announce(self) -> None:
         text = self.msg.text().strip()
         if not text:
             return
-        try:
-            call("/action/announce", {"message": text})
-            self.log.append(f"📣 {text}")
-            self.msg.clear()
-        except Exception as e:
-            self.log.append(f"❌ {e}")
+        self._call_async(
+            "/action/announce", {"message": text}, f"📣 {text}", on_ok=self.msg.clear
+        )
 
     def _act(self, action: str, confirm: str | None, label: str) -> None:
         if confirm:
             ok = QMessageBox.question(self, label, confirm)
             if ok != QMessageBox.StandardButton.Yes:
                 return
-        try:
-            call(f"/action/{action}", {})
-            self.log.append(f"→ {label}")
-        except Exception as e:
-            self.log.append(f"❌ {e}")
+        self.log.append(f"→ {label}…")
+        self._call_async(f"/action/{action}", {}, f"✓ {label}")
 
     def _restore(self) -> None:
         try:
@@ -427,11 +461,8 @@ class Console(QWidget):
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
-        try:
-            call("/action/restore", {"name": name})
-            self.log.append(f"→ restore {name}")
-        except Exception as e:
-            self.log.append(f"❌ {e}")
+        self.log.append(f"→ restore {name}…")
+        self._call_async("/action/restore", {"name": name}, f"✓ restore {name} queued")
 
 
 class PathPicker(QWidget):
@@ -809,6 +840,30 @@ class Main(QMainWindow):
             call("/action/reload-config", {})
         except Exception:
             pass
+        self._rebuild_config_tabs()
+
+    def _rebuild_config_tabs(self) -> None:
+        """Rebuild the Settings and Config tabs from the just-reloaded config.
+
+        They were built with pre-wizard state; leaving them stale breaks the
+        natural first-day flow — wizard, then Config tab to paste a Discord
+        token, Save — by silently writing the old paths/port back over the
+        wizard's work and set_admin_password("") wiping the keyring entry the
+        wizard just stored. The Settings editor likewise still points at the
+        old server root's ini."""
+        current = self.tabs.currentIndex()
+        old_editor, old_config = self.editor, self.config
+        self.editor = SettingsEditor(self.cfg.live_ini, self.cfg.default_ini)
+        self.config = ConfigTab(self.cfg)
+        for index, widget, icon, label in (
+            (3, self.editor, "tab-settings", "Settings"),
+            (4, self.config, "tab-config", "Config"),
+        ):
+            self.tabs.removeTab(index)
+            self.tabs.insertTab(index, widget, icons.load_icon(icon), label)
+        old_editor.deleteLater()
+        old_config.deleteLater()
+        self.tabs.setCurrentIndex(current)
 
     def changeEvent(self, event) -> None:
         # Re-tint the palette-following glyph icons when the OS light/dark theme

@@ -103,10 +103,18 @@ def proc_stats() -> ProcStats | None:
 # are pure so they're testable on any OS.
 
 
-def _run_capture(cmd: list[str]) -> str:
-    return subprocess.run(
-        cmd, capture_output=True, text=True, creationflags=_NO_WINDOW
-    ).stdout
+def _run_capture(cmd: list[str], timeout: float = 30.0) -> str:
+    """Run a service-control command and capture stdout. Bounded and
+    non-raising: a hung sc.exe/systemctl (or a Linux box with no systemd at
+    all — FileNotFoundError) must degrade to UNKNOWN, not wedge the daemon's
+    event loop or 500 the control API."""
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, creationflags=_NO_WINDOW,
+            timeout=timeout,
+        ).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
 
 
 def _parse_sc_state(out: str) -> str:
@@ -140,25 +148,31 @@ def service_state(service_name: str) -> str:
     return _parse_sc_state(out) if IS_WINDOWS else _parse_systemctl_state(out)
 
 
+# The async wrappers run every blocking subprocess call in a worker thread:
+# these coroutines execute on the daemon's single event loop, and a slow
+# sc.exe/systemctl on the loop thread stalls polling, the watchdog, and the
+# control API all at once.
+
+
 async def _wait_for(service_name: str, target: str, timeout: float = 120.0) -> bool:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
-        if service_state(service_name) == target:
+        if await asyncio.to_thread(service_state, service_name) == target:
             return True
         await asyncio.sleep(2)
     return False
 
 
 async def start_service(service_name: str) -> bool:
-    if service_state(service_name) == "RUNNING":
+    if await asyncio.to_thread(service_state, service_name) == "RUNNING":
         return True
-    _run_capture(_action_command("start", service_name))
+    await asyncio.to_thread(_run_capture, _action_command("start", service_name))
     return await _wait_for(service_name, "RUNNING")
 
 
 async def stop_service(service_name: str) -> bool:
-    if service_state(service_name) == "STOPPED":
+    if await asyncio.to_thread(service_state, service_name) == "STOPPED":
         return True
-    _run_capture(_action_command("stop", service_name))
+    await asyncio.to_thread(_run_capture, _action_command("stop", service_name))
     return await _wait_for(service_name, "STOPPED")
