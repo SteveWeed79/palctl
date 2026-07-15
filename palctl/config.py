@@ -111,8 +111,11 @@ class Config:
     server_root: str = r"C:\steamcmd\steamapps\common\PalServer"
     steamcmd_path: str = r"C:\steamcmd\steamcmd.exe"
     backup_root: str = r"D:\PalworldBackups"
-    # Optional second copy of every backup — another disk or a network share.
-    # Backups on the server's own disk don't survive the disk. Empty = off.
+    # Optional second copy of every backup. Backups on the server's own disk
+    # don't survive the disk. Either a local path (another disk or a network
+    # share) or an rclone remote for off-site/cloud storage, written as
+    # `remote:path` — e.g. `gdrive:PalworldBackups` after `rclone config`.
+    # Empty = off.
     backup_mirror: str = ""
     service_name: str = "PalServer"
     app_id: str = "2394010"

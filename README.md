@@ -61,8 +61,10 @@ PC, which is the situation most people are trying to get out of.
   empty, instead of at the threshold later with players mid-session
 - Scheduled restarts with in-game countdown, autosave, rotating backups —
   **consistency-checked** (a copy the server wrote through is retried, and
-  flagged if it stays dirty) and optionally **mirrored** to a second disk or
-  network share (backups on the server's own disk don't survive the disk)
+  flagged if it stays dirty) and optionally **mirrored** to a second disk, a
+  network share, or an **rclone cloud remote** (Google Drive, Dropbox, S3,
+  OneDrive …) for off-site copies — backups on the server's own disk don't
+  survive the disk, and a house fire takes the network share with it
 - Opt-in scheduled auto-update (Palworld patches constantly) — the same
   save → backup → SteamCMD → restart flow as a manual update, world backup
   included (updates are exactly when saves get eaten), and **no backup means
@@ -242,6 +244,26 @@ grab the installer from the
 Create an app at discord.com/developers → Bot → copy the token → invite it to your
 server with `applications.commands` and `bot` scopes. Paste the token into the
 GUI's Config tab. Restart the daemon.
+
+### Cloud / off-site backups (optional)
+
+The **backup mirror** takes a second copy of every backup. Point it at a local
+path (another disk or a `\\server\share`) for the simple case, or at an
+[rclone](https://rclone.org) remote to push backups off the box entirely —
+Google Drive, Dropbox, S3, OneDrive, and [dozens more](https://rclone.org/overview/).
+palctl never touches OAuth tokens or a cloud API itself; rclone owns the auth
+and the uploads.
+
+1. Install rclone (`rclone.org/downloads`) and put it on `PATH`.
+2. Run `rclone config` once to authorize your account — say you name the remote
+   `gdrive`.
+3. Set the backup mirror to `gdrive:PalworldBackups` (any `remote:path`).
+
+Each backup is uploaded under that path as its own dated folder, pruned to the
+same retention as your local backups. A mirror failure never fails the primary
+backup — it's logged and the local copy is untouched. If the mirror is a remote
+but rclone isn't installed, the daemon warns at startup instead of failing
+silently.
 
 ---
 
