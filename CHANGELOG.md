@@ -10,13 +10,13 @@ Installers for every release are on the
 
 ## [Unreleased]
 
-### Changed
-- **A failed pre-update backup now aborts the server update** (manual,
-  scheduled, and Discord-triggered) instead of warning and updating anyway —
-  updates are exactly when saves get corrupted, and without that backup a bad
-  update can't be rolled back. A fresh install with no world yet still updates
-  freely, and the old warn-and-continue behaviour is available by unticking
-  **Update requires a backup** in Config.
+## [1.0.0] — 2026-07-15
+
+The first stable release. The 0.1.x line closed with a full
+release-readiness audit — daemon lifecycle, data safety, API surface,
+GUI/wizard, security, packaging, docs, and tests — with every confirmed
+finding fixed, and the daemon, web dashboard, and CLI verified end-to-end
+at runtime before tagging.
 
 ### Fixed
 - **The web dashboard actually works when opened via `palctl ui`.** A
@@ -60,14 +60,6 @@ Installers for every release are on the
   instead of hitting whichever the API listed first; an exact user ID always
   works.
 - The welcome message can't be used to ping @everyone via a player-chosen name.
-- **Hot backups are now consistency-checked.** A backup taken while the server
-  is running fingerprints the world before and after the copy; if the server
-  wrote mid-copy (a potentially torn backup), the copy is retried in a quiet
-  window. If no quiet window is found the backup is kept but flagged, with a
-  warning suggesting a clean neighbour for restores.
-- CI now installs `aiohttp` and `discord.py` for the test job, so the daemon's
-  auth-token-gate and crash-auto-recovery tests actually run instead of being
-  silently skipped on every push.
 
 ### Added
 - **`/unban`** — from the CLI (`palctl unban <user_id>`), the Discord bot, and
@@ -90,6 +82,28 @@ Installers for every release are on the
   the README's new **"Manage it from your phone, safely"** section shows the
   ssh-tunnel and Tailscale patterns for full remote admin with zero ports
   exposed.
+
+## [0.1.14] — 2026-07-15
+
+### Changed
+- **A failed pre-update backup now aborts the server update** (manual,
+  scheduled, and Discord-triggered) instead of warning and updating anyway —
+  updates are exactly when saves get corrupted, and without that backup a bad
+  update can't be rolled back. A fresh install with no world yet still updates
+  freely, and the old warn-and-continue behaviour is available by unticking
+  **Update requires a backup** in Config.
+
+### Fixed
+- **Hot backups are now consistency-checked.** A backup taken while the server
+  is running fingerprints the world before and after the copy; if the server
+  wrote mid-copy (a potentially torn backup), the copy is retried in a quiet
+  window. If no quiet window is found the backup is kept but flagged, with a
+  warning suggesting a clean neighbour for restores.
+- CI now installs `aiohttp` and `discord.py` for the test job, so the daemon's
+  auth-token-gate and crash-auto-recovery tests actually run instead of being
+  silently skipped on every push.
+
+### Added
 - `SECURITY.md` — how to report a vulnerability privately, and where palctl
   draws its security boundaries.
 - This changelog, issue and pull-request templates.
