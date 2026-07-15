@@ -10,7 +10,20 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+### Changed
+- **A failed pre-update backup now aborts the server update** (manual,
+  scheduled, and Discord-triggered) instead of warning and updating anyway —
+  updates are exactly when saves get corrupted, and without that backup a bad
+  update can't be rolled back. A fresh install with no world yet still updates
+  freely, and the old warn-and-continue behaviour is available by unticking
+  **Update requires a backup** in Config.
+
 ### Fixed
+- **Hot backups are now consistency-checked.** A backup taken while the server
+  is running fingerprints the world before and after the copy; if the server
+  wrote mid-copy (a potentially torn backup), the copy is retried in a quiet
+  window. If no quiet window is found the backup is kept but flagged, with a
+  warning suggesting a clean neighbour for restores.
 - CI now installs `aiohttp` and `discord.py` for the test job, so the daemon's
   auth-token-gate and crash-auto-recovery tests actually run instead of being
   silently skipped on every push.

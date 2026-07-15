@@ -60,11 +60,13 @@ PC, which is the situation most people are trying to get out of.
   the limit — and, opt-in, restarts early at a moment the server happens to be
   empty, instead of at the threshold later with players mid-session
 - Scheduled restarts with in-game countdown, autosave, rotating backups —
-  optionally **mirrored** to a second disk or network share (backups on the
-  server's own disk don't survive the disk)
+  **consistency-checked** (a copy the server wrote through is retried, and
+  flagged if it stays dirty) and optionally **mirrored** to a second disk or
+  network share (backups on the server's own disk don't survive the disk)
 - Opt-in scheduled auto-update (Palworld patches constantly) — the same
   save → backup → SteamCMD → restart flow as a manual update, world backup
-  included (updates are exactly when saves get eaten)
+  included (updates are exactly when saves get eaten), and **no backup means
+  no update** unless you opt out
 - One **operation lock**: scheduled restarts, watchdog restarts, updates,
   restores, and crash recovery can't fire into the middle of each other
 - Notifies when a newer server build is available, or a newer palctl release

@@ -123,9 +123,28 @@ class Scheduler:
                     f"📦 Backup `{b.name}` ({b.size_mb:.0f} MB)"
                     + (f", pruned {len(pruned)}" if pruned else "")
                     + (", mirrored" if mirrored else ""),
-                    {"name": b.name, "size_mb": b.size_mb, "mirrored": mirrored},
+                    {
+                        "name": b.name,
+                        "size_mb": b.size_mb,
+                        "mirrored": mirrored,
+                        "consistent": b.consistent,
+                    },
                 )
             )
+            if not b.consistent:
+                # The server wrote the world during every copy attempt, so this
+                # backup's files may be from different moments. Keep it (it is
+                # almost certainly fine), but say so — if someone is choosing a
+                # backup to restore, a clean neighbour is the safer pick.
+                await self._bus.emit(
+                    Event(
+                        "backup",
+                        f"⚠️ Backup `{b.name}` was copied while the server was "
+                        "actively writing the world, so it may be internally "
+                        "inconsistent. It is kept and probably fine — but "
+                        "prefer the backup before or after it for a restore.",
+                    )
+                )
             return b
         except Exception as e:
             await self._bus.emit(Event("error", f"Backup failed: {e}"))
@@ -377,16 +396,40 @@ class Scheduler:
             Event("update", "⏬ Server update starting — backing up, saving, stopping.")
         )
         # Game updates are exactly when save migration or corruption
-        # happens; a world backup first makes a bad update undoable.
-        b = await self._do_backup("pre-update")
-        if b is None:
+        # happens; a world backup first makes a bad update undoable. A fresh
+        # install with no SaveGames yet has nothing to protect (same rule the
+        # wizard uses), so only a world that exists gates the update.
+        if not cfg.savegames_dir.exists():
             await self._bus.emit(
                 Event(
                     "update",
-                    "⚠️ Pre-update backup failed (see the error above) — "
-                    "continuing with the update anyway.",
+                    "No world to back up yet (SaveGames doesn't exist) — "
+                    "skipping the pre-update backup.",
                 )
             )
+        else:
+            b = await self._do_backup("pre-update")
+            if b is None:
+                if cfg.schedule.update_requires_backup:
+                    await self._bus.emit(
+                        Event(
+                            "error",
+                            "Update aborted: the pre-update backup failed (see "
+                            "the error above), so a bad update could not be "
+                            "rolled back. Nothing was changed. Fix the backup "
+                            "problem (disk space? backup folder path?) and "
+                            "retry — or untick 'Update requires a backup' in "
+                            "Config to proceed without a safety net.",
+                        )
+                    )
+                    return
+                await self._bus.emit(
+                    Event(
+                        "update",
+                        "⚠️ Pre-update backup failed (see the error above) — "
+                        "continuing with the update anyway.",
+                    )
+                )
         if not await self._control.stop():
             # SteamCMD rewriting the install under a still-running server
             # corrupts it. If the server didn't confirm STOPPED, don't update.

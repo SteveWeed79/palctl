@@ -82,6 +82,11 @@ class ScheduleConfig:
     # reusing the same stop -> backup -> update -> restart flow as manual updates.
     auto_update: bool = False
     auto_update_at: str = "05:00"
+    # Game updates are exactly when saves get eaten, so by default a failed
+    # pre-update backup ABORTS the update — a server one patch behind beats an
+    # updated server whose world can't be rolled back. Opt out only if you'd
+    # rather the update always proceed (e.g. backups live on a flaky share).
+    update_requires_backup: bool = True
 
 
 @dataclass

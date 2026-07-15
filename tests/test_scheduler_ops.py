@@ -205,6 +205,111 @@ def test_update_server_aborts_when_server_wont_stop(tmp_path, monkeypatch):
     assert any(e.kind == "error" and "did not stop" in e.message for e in events)
 
 
+def test_update_server_aborts_when_backup_of_existing_world_fails(tmp_path, monkeypatch):
+    # Updates are exactly when saves get eaten; if there IS a world and the
+    # pre-update backup fails, proceeding means a bad update can't be rolled
+    # back. Default behaviour: abort with the server untouched.
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path / "server")
+    cfg.backup_root = str(tmp_path / "backups")
+    sg = cfg.savegames_dir
+    sg.mkdir(parents=True)
+    (sg / "Level.sav").write_bytes(b"world")
+
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+        calls.append(("update",))
+        return 0
+
+    monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
+
+    def backup_dies(*a, **kw):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(sched_mod.backups, "create", backup_dies)
+
+    bus = EventBus()
+    events = _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+
+    assert calls == []  # never stopped, never updated, never blind-started
+    assert any(e.kind == "error" and "Update aborted" in e.message for e in events)
+
+
+def test_update_server_backup_failure_opt_out_continues(tmp_path, monkeypatch):
+    # The escape hatch: update_requires_backup=False restores the old
+    # warn-and-continue behaviour for people whose backups live somewhere flaky.
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path / "server")
+    cfg.backup_root = str(tmp_path / "backups")
+    cfg.schedule.update_requires_backup = False
+    sg = cfg.savegames_dir
+    sg.mkdir(parents=True)
+    (sg / "Level.sav").write_bytes(b"world")
+
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+        calls.append(("update",))
+        return 0
+
+    monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
+    monkeypatch.setattr(sched_mod.steamcmd, "backup_file", lambda p: None)
+    monkeypatch.setattr(sched_mod, "is_blank", lambda p: False)
+
+    def backup_dies(*a, **kw):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(sched_mod.backups, "create", backup_dies)
+
+    bus = EventBus()
+    events = _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+
+    assert [c[0] for c in calls] == ["stop", "update", "start"]
+    assert any("continuing with the update anyway" in e.message for e in events)
+
+
+def test_update_server_fresh_install_skips_backup_and_proceeds(tmp_path, monkeypatch):
+    # No SaveGames yet means nothing to protect (same rule as the wizard) —
+    # requiring a backup of a world that doesn't exist would wedge first-time
+    # installs.
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path / "server")
+    cfg.backup_root = str(tmp_path / "backups")
+
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+        calls.append(("update",))
+        return 0
+
+    monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
+    monkeypatch.setattr(sched_mod.steamcmd, "backup_file", lambda p: None)
+    monkeypatch.setattr(sched_mod, "is_blank", lambda p: False)
+
+    bus = EventBus()
+    events = _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+
+    assert [c[0] for c in calls] == ["stop", "update", "start"]
+    assert any("skipping the pre-update backup" in e.message for e in events)
+    assert not any(e.kind == "error" for e in events)
+
+
 def test_update_server_reports_update_exceptions(tmp_path, monkeypatch):
     # A GUI/bot-triggered update that throws used to restart the server and
     # announce success with no trace of the failure.

@@ -601,10 +601,17 @@ class ConfigTab(QWidget):
         self.sch_backup.setRange(1, 48)
         self.sch_backup.setSuffix(" h")
         self.sch_backup.setValue(cfg.schedule.backup_hours)
+        self.sch_upd_backup = QCheckBox(checked=cfg.schedule.update_requires_backup)
+        self.sch_upd_backup.setToolTip(
+            "Server updates are when saves get corrupted, so an update only "
+            "runs after a successful world backup. Untick to update anyway "
+            "when the backup fails — no rollback if the update goes bad."
+        )
         sf.addRow("Enabled", self.sch_enabled)
         sf.addRow("Daily restart", self.sch_restart)
         sf.addRow("At", self.sch_time)
         sf.addRow("Backup every", self.sch_backup)
+        sf.addRow("Update requires a backup", self.sch_upd_backup)
         v.addWidget(sch)
 
         dc = QGroupBox("Discord bot")
@@ -706,6 +713,7 @@ class ConfigTab(QWidget):
         c.schedule.daily_restart = self.sch_restart.isChecked()
         c.schedule.daily_restart_at = self.sch_time.time().toString("HH:mm")
         c.schedule.backup_hours = self.sch_backup.value()
+        c.schedule.update_requires_backup = self.sch_upd_backup.isChecked()
 
         c.discord.enabled = self.dc_enabled.isChecked()
         try:

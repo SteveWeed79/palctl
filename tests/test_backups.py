@@ -20,6 +20,7 @@ def test_create_and_listing(tmp_path: Path):
     assert b.path.exists()
     assert b.name.endswith("-manual")
     assert (b.path / "0" / "world" / "Level.sav").exists()
+    assert b.consistent is True  # nothing wrote to the source during the copy
 
     listed = backups.listing(root)
     assert [x.name for x in listed] == [b.name]
@@ -141,6 +142,82 @@ def test_restore_failure_leaves_live_world_untouched(tmp_path: Path, monkeypatch
 
     assert (sg / "0" / "world" / "Level.sav").read_bytes() == b"live-world"
     assert not (sg.parent / f"{sg.name}.partial-restore").exists()
+
+
+def test_create_retries_once_for_a_quiet_window(tmp_path: Path, monkeypatch):
+    # Backups are usually HOT — the server keeps running. If it writes a .sav
+    # while the copy runs, that attempt may be torn; create() must notice (the
+    # source fingerprint changed under it) and retry, and the retry lands clean.
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+
+    real_copytree = backups.shutil.copytree
+    attempts: list[int] = []
+
+    def server_writes_during_first_copy(src, dst, *a, **kw):
+        # copytree recurses through the module-level name, so the wrapper fires
+        # for every subdirectory too — only the top-level call is an "attempt".
+        if Path(src) != sg:
+            return real_copytree(src, dst, *a, **kw)
+        attempts.append(1)
+        result = real_copytree(src, dst, *a, **kw)
+        if len(attempts) == 1:  # mid-copy autosave, first attempt only
+            (sg / "0" / "world" / "Level.sav").write_bytes(b"y" * 2048)
+        return result
+
+    monkeypatch.setattr(backups.shutil, "copytree", server_writes_during_first_copy)
+    b = backups.create(sg, root, "scheduled")
+
+    assert len(attempts) == 2  # dirty attempt discarded, clean retry taken
+    assert b.consistent is True
+    # The backup is the retry's snapshot — the post-write world, intact.
+    assert (b.path / "0" / "world" / "Level.sav").read_bytes() == b"y" * 2048
+
+
+def test_create_keeps_but_flags_a_never_quiet_backup(tmp_path: Path, monkeypatch):
+    # If the server writes through every attempt, the last copy is kept anyway
+    # (a probably-fine backup beats none) but flagged, so the scheduler can
+    # warn and a restore can prefer a clean neighbour.
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+
+    real_copytree = backups.shutil.copytree
+    counter = iter(range(100))
+
+    def server_never_stops_writing(src, dst, *a, **kw):
+        result = real_copytree(src, dst, *a, **kw)
+        (sg / "0" / "world" / "Level.sav").write_bytes(b"z%d" % next(counter) * 512)
+        return result
+
+    monkeypatch.setattr(backups.shutil, "copytree", server_never_stops_writing)
+    b = backups.create(sg, root, "scheduled", consistency_retries=2)
+
+    assert b.consistent is False
+    assert b.path.exists()  # kept, not discarded
+    assert [x.name for x in backups.listing(root)] == [b.name]
+
+
+def test_create_flags_a_torn_copy_even_when_source_looks_quiet(tmp_path: Path, monkeypatch):
+    # The other tear: the copy itself is short (a file the server replaced
+    # mid-read) while the source fingerprint happens to match afterwards.
+    # _copy_matches compares the copied sizes against the pre-copy fingerprint
+    # and must flag it.
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+
+    real_copytree = backups.shutil.copytree
+
+    def truncates_the_copy(src, dst, *a, **kw):
+        result = real_copytree(src, dst, *a, **kw)
+        if Path(src) == sg:  # only after the top-level copy finished
+            (Path(dst) / "0" / "world" / "Level.sav").write_bytes(b"short")
+        return result
+
+    monkeypatch.setattr(backups.shutil, "copytree", truncates_the_copy)
+    b = backups.create(sg, root, "scheduled", consistency_retries=1)
+
+    assert b.consistent is False
+    assert b.path.exists()
 
 
 def test_prune_retain_zero_never_wipes_everything(tmp_path: Path):
