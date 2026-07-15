@@ -17,9 +17,18 @@ Installers for every release are on the
   pushed off the box to Google Drive, Dropbox, S3, OneDrive, and anything else
   rclone speaks. palctl shells out to the rclone binary the user configured
   with `rclone config` — it never handles OAuth tokens or a cloud API itself.
-  Uploads are idempotent and pruned to the same retention as local backups, a
-  mirror failure never fails the primary backup, and the daemon warns at
-  startup if a remote is configured but rclone isn't installed.
+  Uploads are idempotent, a mirror failure never fails the primary backup, and
+  the daemon warns at startup if a remote is configured but rclone isn't
+  installed.
+  - The **Config tab** now has a Backup mirror field with a **Test** button
+    that verifies the target works (rclone auth for a remote, writability for a
+    local path) before backups rely on it — run off the UI thread so it never
+    freezes the window.
+  - **Separate mirror retention**: the mirror can keep a different number of
+    copies than the local disk (fewer off-site to save cloud cost, or more on
+    cheap cold storage). New `Copies to keep (mirror)` setting; `0` = match the
+    local `Backups to keep` count. Local retention is now editable in the GUI
+    too.
 
 ### Changed
 - **A failed pre-update backup now aborts the server update** (manual,

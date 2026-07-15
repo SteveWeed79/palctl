@@ -96,6 +96,38 @@ def test_mirror_copies_backup_and_is_idempotent(tmp_path: Path):
     assert [x.name for x in backups.listing(mirror_root)] == [b.name]
 
 
+def test_test_mirror_local_path_ok_and_creates_it(tmp_path: Path):
+    target = tmp_path / "mirror" / "sub"  # doesn't exist yet
+    ok, msg = backups.test_mirror(str(target))
+    assert ok is True
+    assert target.is_dir()  # created for the test
+    assert not (target / ".palctl-write-test").exists()  # probe cleaned up
+
+
+def test_test_mirror_local_path_not_writable(tmp_path: Path):
+    # A file where a directory should be: mkdir under it fails (NotADirectoryError).
+    blocker = tmp_path / "afile"
+    blocker.write_text("not a dir")
+    ok, msg = backups.test_mirror(str(blocker / "mirror"))
+    assert ok is False
+    assert "Not writable" in msg
+
+
+def test_test_mirror_empty_target(tmp_path: Path):
+    ok, msg = backups.test_mirror("   ")
+    assert ok is False
+
+
+def test_test_mirror_delegates_remotes_to_rclone(monkeypatch):
+    from palctl import rclone
+
+    called: list = []
+    monkeypatch.setattr(rclone, "test_remote",
+                        lambda t: called.append(t) or (True, "ok"))
+    ok, msg = backups.test_mirror("gdrive:PalworldBackups")
+    assert ok is True and called == ["gdrive:PalworldBackups"]
+
+
 def test_listing_ignores_partial_copies(tmp_path: Path):
     # A mirror mid-copy leaves a "<name>.partial" dir; it must not be listed (or
     # restored/pruned) as if it were a finished backup.

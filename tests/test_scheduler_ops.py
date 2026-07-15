@@ -199,6 +199,51 @@ def test_mirror_dispatches_to_rclone_for_a_remote_target(tmp_path, monkeypatch):
     assert not errors  # a clean run emits no error event
 
 
+def test_mirror_retain_overrides_local_retention(tmp_path, monkeypatch):
+    # The mirror can keep a different number of copies than the local disk.
+    from palctl import backups
+
+    cfg = Config()
+    cfg.backup_mirror = "gdrive:PalworldBackups"
+    cfg.schedule.backup_retain = 24
+    cfg.schedule.mirror_retain = 5  # keep fewer off-site
+
+    seen: list = []
+    monkeypatch.setattr(sched_mod.rclone, "mirror", lambda path, remote: None)
+    monkeypatch.setattr(sched_mod.rclone, "prune",
+                        lambda remote, retain: seen.append(retain))
+
+    bus = EventBus()
+    _collect(bus)
+    b = backups.Backup("2026-07-15_10-00-00-scheduled", tmp_path / "b", 1.0,
+                       __import__("datetime").datetime.now())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus)._mirror(b))
+
+    assert seen == [5]  # mirror_retain, not backup_retain
+
+
+def test_mirror_retain_zero_falls_back_to_local_retention(tmp_path, monkeypatch):
+    from palctl import backups
+
+    cfg = Config()
+    cfg.backup_mirror = str(tmp_path / "mirror")
+    cfg.schedule.backup_retain = 12
+    cfg.schedule.mirror_retain = 0  # default: match local
+
+    seen: list = []
+    monkeypatch.setattr(sched_mod.backups, "mirror", lambda path, root: None)
+    monkeypatch.setattr(sched_mod.backups, "prune",
+                        lambda root, retain: seen.append(retain) or [])
+
+    bus = EventBus()
+    _collect(bus)
+    b = backups.Backup("2026-07-15_10-00-00-scheduled", tmp_path / "b", 1.0,
+                       __import__("datetime").datetime.now())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus)._mirror(b))
+
+    assert seen == [12]  # fell back to backup_retain
+
+
 def test_mirror_rclone_failure_is_non_fatal(tmp_path, monkeypatch):
     # A cloud mirror failure must not fail the backup — it reports and returns False.
     from palctl import backups

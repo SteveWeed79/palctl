@@ -78,6 +78,10 @@ class ScheduleConfig:
     autosave_minutes: int = 15
     backup_hours: int = 6
     backup_retain: int = 24
+    # How many backups to keep on the mirror (second copy). Cloud storage costs
+    # money, so you may want fewer copies off-site than on the local disk — or,
+    # with cheap cold storage, more. 0 = keep the same count as backup_retain.
+    mirror_retain: int = 0
     # Palworld patches constantly. Opt-in: run a SteamCMD update at a quiet hour,
     # reusing the same stop -> backup -> update -> restart flow as manual updates.
     auto_update: bool = False

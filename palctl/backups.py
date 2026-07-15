@@ -205,6 +205,27 @@ def mirror(backup_path: Path, mirror_root: Path) -> Path:
     return dest
 
 
+def test_mirror(target: str) -> tuple[bool, str]:
+    """Check a backup-mirror target is usable before backups start relying on
+    it. Remotes (`remote:path`) go through rclone (auth reachable); a local path
+    must be a directory we can create and write into. Returns (ok, message)."""
+    from . import rclone
+
+    if not target.strip():
+        return False, "No mirror target set."
+    if rclone.is_remote(target):
+        return rclone.test_remote(target)
+    root = Path(target)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / ".palctl-write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as e:
+        return False, f"Not writable: {e}"
+    return True, f"Writable — {root}"
+
+
 def delete(backup_root: Path, name: str) -> None:
     target = _safe_backup_path(backup_root, name)
     if not target.is_dir():

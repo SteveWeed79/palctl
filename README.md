@@ -257,13 +257,18 @@ and the uploads.
 1. Install rclone (`rclone.org/downloads`) and put it on `PATH`.
 2. Run `rclone config` once to authorize your account — say you name the remote
    `gdrive`.
-3. Set the backup mirror to `gdrive:PalworldBackups` (any `remote:path`).
+3. In the **Config** tab, set **Backup mirror** to `gdrive:PalworldBackups` (any
+   `remote:path`) and hit **Test** to confirm palctl can reach it.
 
-Each backup is uploaded under that path as its own dated folder, pruned to the
-same retention as your local backups. A mirror failure never fails the primary
-backup — it's logged and the local copy is untouched. If the mirror is a remote
-but rclone isn't installed, the daemon warns at startup instead of failing
-silently.
+Each backup is uploaded under that path as its own dated folder. A mirror
+failure never fails the primary backup — it's logged and the local copy is
+untouched. If the mirror is a remote but rclone isn't installed, the daemon
+warns at startup instead of failing silently.
+
+The mirror keeps its own retention: **Copies to keep (mirror)** in the Config
+tab can differ from the local **Backups to keep** — keep fewer off-site to save
+cloud cost, or more on cheap cold storage. Leave it at `0` to match the local
+count.
 
 ---
 

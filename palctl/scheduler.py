@@ -158,7 +158,9 @@ class Scheduler:
         root = self._cfg.backup_mirror
         if not root:
             return False
-        retain = self._cfg.schedule.backup_retain
+        # The mirror can keep a different number of copies than the local disk
+        # (cloud costs money, or cold storage is cheap). 0 = match local.
+        retain = self._cfg.schedule.mirror_retain or self._cfg.schedule.backup_retain
         try:
             if rclone.is_remote(root):
                 await asyncio.to_thread(rclone.mirror, b.path, root)
