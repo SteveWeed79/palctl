@@ -5,7 +5,7 @@ All notable changes to palctl are documented here. The format follows
 straight from git tags (setuptools-scm), so the tag *is* the version.
 
 Installers for every release are on the
-[Releases page](https://github.com/SteveWeed79/pal-it-up/releases), each with a
+[Releases page](https://github.com/SteveWeed79/palctl/releases), each with a
 `SHA256SUMS.txt` to verify the download.
 
 ## [Unreleased]
@@ -202,11 +202,13 @@ restarts and rotating backups, the settings editor, the Discord bot, the
 first-run wizard, and the Windows installer — plus rapid packaging and
 installer iteration. No per-release notes were published for these.
 
-[Unreleased]: https://github.com/SteveWeed79/pal-it-up/compare/0.1.13...HEAD
-[0.1.13]: https://github.com/SteveWeed79/pal-it-up/compare/0.1.12...0.1.13
-[0.1.12]: https://github.com/SteveWeed79/pal-it-up/compare/0.1.11...0.1.12
-[0.1.11]: https://github.com/SteveWeed79/pal-it-up/compare/0.1.10...0.1.11
-[0.1.10]: https://github.com/SteveWeed79/pal-it-up/compare/0.1.9...0.1.10
-[0.1.9]: https://github.com/SteveWeed79/pal-it-up/compare/0.1.6...0.1.9
-[0.1.0]: https://github.com/SteveWeed79/pal-it-up/releases/tag/0.1.0
-[0.1.6]: https://github.com/SteveWeed79/pal-it-up/compare/0.1.0...0.1.6
+[Unreleased]: https://github.com/SteveWeed79/palctl/compare/1.0.0...HEAD
+[1.0.0]: https://github.com/SteveWeed79/palctl/compare/0.1.14...1.0.0
+[0.1.14]: https://github.com/SteveWeed79/palctl/compare/0.1.13...0.1.14
+[0.1.13]: https://github.com/SteveWeed79/palctl/compare/0.1.12...0.1.13
+[0.1.12]: https://github.com/SteveWeed79/palctl/compare/0.1.11...0.1.12
+[0.1.11]: https://github.com/SteveWeed79/palctl/compare/0.1.10...0.1.11
+[0.1.10]: https://github.com/SteveWeed79/palctl/compare/0.1.9...0.1.10
+[0.1.9]: https://github.com/SteveWeed79/palctl/compare/0.1.6...0.1.9
+[0.1.0]: https://github.com/SteveWeed79/palctl/releases/tag/0.1.0
+[0.1.6]: https://github.com/SteveWeed79/palctl/compare/0.1.0...0.1.6

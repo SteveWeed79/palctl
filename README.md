@@ -4,7 +4,7 @@ Palworld dedicated server control for Windows. **REST-native**, with a real
 memory-leak watchdog and a **self-hosted Discord bot**.
 
 > **Status:** released and in active development — installers for every version
-> are on the [Releases page](https://github.com/SteveWeed79/pal-it-up/releases),
+> are on the [Releases page](https://github.com/SteveWeed79/palctl/releases),
 > with the history in [CHANGELOG.md](CHANGELOG.md). Issues and PRs welcome.
 
 <p align="center">
@@ -177,7 +177,7 @@ works if you'd rather drive it yourself.
 ### Option A — installer (recommended)
 
 Download `palctl-setup.exe` from the
-[latest release](https://github.com/SteveWeed79/pal-it-up/releases/latest)
+[latest release](https://github.com/SteveWeed79/palctl/releases/latest)
 (or build it yourself from `packaging/`, see
 [packaging/README.md](packaging/README.md)). No Python needed. It installs both
 binaries, adds shortcuts, and offers to register the palctl background service.
@@ -264,12 +264,12 @@ the Discord bot, and the service CLI.
 
 ### winget
 
-Not yet — a manifest template lives in [packaging/winget/](packaging/winget/),
-but it hasn't been submitted to
-[microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs), so
-`winget install SteveWeed79.palctl` won't find anything today. Until it lands,
-grab the installer from the
-[Releases page](https://github.com/SteveWeed79/pal-it-up/releases/latest).
+Almost — the manifest in [packaging/winget/](packaging/winget/) is filled in
+for 1.0.0 (real installer URL and SHA256), but it hasn't been merged into
+[microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) yet, so
+`winget install SteveWeed79.palctl` won't find anything today. Until that PR
+lands, grab the installer from the
+[Releases page](https://github.com/SteveWeed79/palctl/releases/latest).
 
 ### Discord (optional)
 

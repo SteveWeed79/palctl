@@ -14,7 +14,7 @@ import urllib.request
 
 from . import __version__
 
-REPO = "SteveWeed79/pal-it-up"
+REPO = "SteveWeed79/palctl"
 
 
 def _parse_version(v: str) -> tuple[int, ...]:
