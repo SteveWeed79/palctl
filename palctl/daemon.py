@@ -221,13 +221,22 @@ class Daemon:
             self.log.warning("%s", warning)
 
     def _warn_if_cloud_mirror_broken(self) -> None:
-        """If the backup mirror is an rclone remote but rclone isn't installed,
-        every scheduled mirror will fail. Say so once at startup rather than
-        only in a buried error event after the first backup."""
+        """If the backup mirror is an rclone remote that's misconfigured — no
+        dedicated folder, or rclone not installed — every scheduled mirror will
+        fail. Say so once at startup rather than only in a buried error event
+        after the first backup."""
         from . import rclone
 
         target = self.cfg.backup_mirror
         if not target or not rclone.is_remote(target):
+            return
+        if not rclone.has_subpath(target):
+            self.log.warning(
+                "backup mirror '%s' points at the remote root — set a dedicated "
+                "folder like `gdrive:PalworldBackups`, so retention only ever "
+                "touches palctl's own backups and never the rest of your drive.",
+                target,
+            )
             return
         ok, detail = rclone.check()
         if not ok:

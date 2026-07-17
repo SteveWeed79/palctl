@@ -296,18 +296,32 @@ and the uploads.
 1. Install rclone (`rclone.org/downloads`) and put it on `PATH`.
 2. Run `rclone config` once to authorize your account — say you name the remote
    `gdrive`.
-3. In the **Config** tab, set **Backup mirror** to `gdrive:PalworldBackups` (any
-   `remote:path`) and hit **Test** to confirm palctl can reach it.
+3. In the **Config** tab, set **Backup mirror** to a **dedicated folder** on the
+   remote — `gdrive:PalworldBackups`, not the bare `gdrive:` root — and hit
+   **Test** to confirm palctl can reach it.
 
-Each backup is uploaded under that path as its own dated folder. A mirror
-failure never fails the primary backup — it's logged and the local copy is
-untouched. If the mirror is a remote but rclone isn't installed, the daemon
-warns at startup instead of failing silently.
+palctl uploads to, and prunes within, **that one folder only**: it lists and
+deletes solely its own dated backup directories, so retention can never reach
+anything else on the drive even if the folder is shared. (Because of that,
+pointing the mirror at the bare remote root is refused — give it a folder of its
+own.) Each backup is uploaded under that folder as its own dated directory. A
+mirror failure never fails the primary backup — it's logged and the local copy
+is untouched. If the mirror is a remote but rclone isn't installed (or points at
+the bare root), the daemon warns at startup instead of failing silently.
 
 The mirror keeps its own retention: **Copies to keep (mirror)** in the Config
 tab can differ from the local **Backups to keep** — keep fewer off-site to save
 cloud cost, or more on cheap cold storage. Leave it at `0` to match the local
 count.
+
+> **rclone config is per-user.** `rclone config` stores the remote under the
+> account that ran it, so the palctl **daemon must run as that same user** to
+> find it — which it does in the default login-startup mode (and, on Linux, when
+> `install-service` registers the unit as your user). A daemon running as a
+> different account (e.g. a Windows *LocalSystem* service) won't see your remote;
+> run `rclone config` as that account, or keep the daemon on login startup. Note
+> the **Test** button runs as *you* (the logged-in user), so it's representative
+> only when the daemon also runs as you — the default.
 
 ---
 

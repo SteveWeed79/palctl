@@ -617,7 +617,9 @@ class ConfigTab(QWidget):
         mirror_help = QLabel(
             'A second copy survives a dead disk. For cloud (Google Drive, '
             'Dropbox, S3…), install <a href="https://rclone.org">rclone</a>, run '
-            "<code>rclone config</code>, then enter <code>remote:path</code>."
+            "<code>rclone config</code>, then enter a dedicated folder like "
+            "<code>gdrive:PalworldBackups</code> — palctl only ever touches that "
+            "one folder, never the rest of your drive."
         )
         mirror_help.setOpenExternalLinks(True)
         mirror_help.setWordWrap(True)

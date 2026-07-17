@@ -181,32 +181,12 @@ def check_single_server_instance() -> Check:
     )
 
 
-def check_backup_mirror(target: str) -> Check | None:
-    """When the backup mirror points at an rclone remote (`remote:path`), the
-    `rclone` binary must be installed or every mirror silently fails. Returns
-    None for a local-path or empty target — there's nothing to check."""
-    from . import rclone
-
-    if not target or not rclone.is_remote(target):
-        return None
-    ok, detail = rclone.check()
-    if ok:
-        return Check("rclone (cloud backup)", True, detail)
-    return Check(
-        "rclone (cloud backup)", False, detail,
-        fix="Your backup mirror is a cloud remote, but rclone isn't installed. "
-            "Install rclone from rclone.org and run `rclone config` to authorize "
-            "the account — otherwise backups never reach the cloud.",
-    )
-
-
 def run_all(
     server_root: str | Path,
     api_port: int,
     *,
     need_install: bool = True,
     need_admin: bool = True,
-    backup_mirror: str = "",
 ) -> list[Check]:
     """The checks relevant to what the user is about to do."""
     checks: list[Check] = []
@@ -217,9 +197,6 @@ def run_all(
     checks.append(check_single_server_instance())
     if need_admin:
         checks.append(check_admin())
-    mirror_check = check_backup_mirror(backup_mirror)
-    if mirror_check is not None:
-        checks.append(mirror_check)
     return checks
 
 
