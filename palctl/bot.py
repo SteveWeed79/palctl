@@ -10,8 +10,8 @@ ship no log file. Chat is UE4SS-only territory.
 What you DO get, all reconstructed from polling /players and /metrics:
   reads:   /status /health /players /whois /playtime /leaderboard /backups
            /events /next /help
-  admin:   /start /stop /restart /update /save /backup /restore /announce
-           /kick /ban /unban
+  admin:   /start /stop /restart /cancel /update /save /backup /restore
+           /announce /kick /ban /unban
   alerts:  join + leave, level-up, watchdog, up/down, update-available
 
 /playtime and /whois answer for offline players too (resolved from the session
@@ -75,6 +75,23 @@ def _fmt_last_seen(iso: str) -> str:
         return datetime.fromisoformat(iso).strftime("%Y-%m-%d %H:%M UTC")
     except (ValueError, TypeError):
         return "unknown"
+
+
+# Event kinds safe to show any member via /events. Everything else — notably
+# "error" (raw exceptions, cloud-remote paths) and "watchdog" internals — is
+# admins-only, so a public /events can't leak operator diagnostics.
+_PUBLIC_EVENT_KINDS = frozenset({
+    "join", "leave", "levelup", "server_up", "server_down",
+    "restart", "backup", "restore", "update", "update_available",
+})
+
+
+def _visible_events(events: list, is_admin: bool) -> list:
+    """Filter the event feed for /events: admins see everything, everyone else
+    sees only non-sensitive kinds (no raw error/watchdog internals)."""
+    if is_admin:
+        return list(events)
+    return [e for e in events if e.kind in _PUBLIC_EVENT_KINDS]
 
 
 def _match_choices(options: list[str], current: str, limit: int = 25) -> list[str]:
@@ -378,6 +395,21 @@ class PalBot(discord.Client):
                 value=f"{stats.memory_mb:,.0f} MB ({pct:.0f}% of watchdog limit)",
             )
             e.add_field(name="CPU", value=f"{stats.cpu_percent:.0f}%")
+
+        # The leak forecast, when there is one — so the live status embed (and
+        # /status) answers "is a restart coming?" at a glance, not just /health.
+        samples = [
+            (s["at"], s["memory_mb"])
+            for s in await asyncio.to_thread(self._store.recent_metrics, 720)
+            if s.get("memory_mb")
+        ]
+        ttl = leak.time_to_limit_minutes(samples, self._cfg.watchdog.memory_limit_mb)
+        if ttl is not None:
+            e.add_field(
+                name="Leak forecast",
+                value=f"memory hits the limit in {leak.fmt_minutes(ttl)}",
+                inline=False,
+            )
         return e
 
     async def _status_loop(self) -> None:
@@ -626,7 +658,10 @@ class PalBot(discord.Client):
         @app_commands.describe(count="How many to show (1–25, default 12)")
         async def events(interaction: discord.Interaction, count: int = 12) -> None:
             await interaction.response.defer()
-            evs = self._bus.recent(max(1, min(25, count)))
+            # Filter first (non-admins don't see error/watchdog internals), then
+            # take the most recent `count` of what's left.
+            evs = _visible_events(self._bus.recent(60), self._is_admin(interaction))
+            evs = evs[-max(1, min(25, count)):]
             if not evs:
                 await interaction.followup.send("No events recorded yet.")
                 return
@@ -636,6 +671,19 @@ class PalBot(discord.Client):
                     title="Recent events", description="\n".join(lines), colour=BLUE
                 )
             )
+
+        @tree.command(name="cancel", description="Cancel an in-progress restart countdown")
+        async def cancel(interaction: discord.Interaction) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message("Not allowed.", ephemeral=True)
+                return
+            await interaction.response.defer()
+            if self._sched.cancel_countdown():
+                await interaction.followup.send(
+                    "🚫 Cancelling the restart countdown — the server stays up."
+                )
+            else:
+                await interaction.followup.send("Nothing to cancel — no countdown is running.")
 
         @tree.command(
             name="next", description="Upcoming automatic restarts, backups, and updates"
@@ -666,8 +714,8 @@ class PalBot(discord.Client):
         )
         e.add_field(
             name="Admins",
-            value="/start · /stop · /restart · /update · /save · /backup · /restore "
-            "· /announce · /kick · /ban · /unban",
+            value="/start · /stop · /restart · /cancel · /update · /save · /backup "
+            "· /restore · /announce · /kick · /ban · /unban",
             inline=False,
         )
         e.set_footer(
@@ -782,16 +830,19 @@ class PalBot(discord.Client):
             e.add_field(name="Level", value=str(match.level))
             e.add_field(name="Ping", value=f"{match.ping:.0f} ms")
             e.add_field(name="Buildings", value=str(match.building_count))
-            e.add_field(name="Playtime (closed sessions)", value=f"{mins / 60:.1f}h")
-            # A player's live map position and platform ID (the ban handle) are
-            # admin-only — public they'd help grief someone or dox an account.
+            e.add_field(name="Playtime", value=f"{mins / 60:.1f}h")
+            await interaction.followup.send(embed=e)
+            # A player's live map position (a grief vector) and platform ID (the
+            # dox / ban handle) go ONLY to the admin who asked — a public embed
+            # would broadcast them to everyone in the channel.
             if admin:
-                e.add_field(
+                priv = discord.Embed(title=f"{match.name} — admin details", colour=BLUE)
+                priv.add_field(
                     name="Location",
                     value=f"{match.location_x:.0f}, {match.location_y:.0f}",
                 )
-                e.add_field(name="User ID", value=f"`{match.user_id}`")
-            await interaction.followup.send(embed=e)
+                priv.add_field(name="User ID", value=f"`{match.user_id}`")
+                await interaction.followup.send(embed=priv, ephemeral=True)
             return
 
         # Offline: fall back to what the session history remembers.
@@ -806,12 +857,14 @@ class PalBot(discord.Client):
         mins = await asyncio.to_thread(self._store.total_playtime_minutes, uid)
         display = seen[0] if seen else name
         e = discord.Embed(title=f"{display} — offline", colour=BLUE)
-        e.add_field(name="Playtime (closed sessions)", value=f"{mins / 60:.1f}h")
+        e.add_field(name="Playtime", value=f"{mins / 60:.1f}h")
         if seen:
             e.add_field(name="Last seen", value=_fmt_last_seen(seen[1]))
-        if admin:
-            e.add_field(name="User ID", value=f"`{uid}`")
         await interaction.followup.send(embed=e)
+        if admin:  # platform ID only to the admin who asked
+            await interaction.followup.send(
+                f"🔑 `{display}` user ID: `{uid}`", ephemeral=True
+            )
 
     async def _playtime(self, interaction: discord.Interaction, name: str) -> None:
         await interaction.response.defer()

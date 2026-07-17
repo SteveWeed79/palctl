@@ -572,3 +572,153 @@ def test_format_schedule_shows_backups_off_for_the_disable_sentinel():
     cfg.schedule.backup_hours = 0  # documented "off" escape hatch
     out = _format_schedule(cfg.schedule, datetime(2026, 7, 17, 12, 0))
     assert "Backups: off" in out  # not a misleading "every 0h"
+
+
+# ---------------- /events disclosure filter ----------------
+
+
+def test_visible_events_hides_sensitive_kinds_from_non_admins():
+    from palctl.bot import _visible_events
+
+    evs = [
+        Event("join", "j"),
+        Event("error", "secret /srv/path failed: gdrive:Backups"),
+        Event("watchdog", "w"),
+        Event("restart", "r"),
+    ]
+    assert [e.kind for e in _visible_events(evs, False)] == ["join", "restart"]
+    assert [e.kind for e in _visible_events(evs, True)] == ["join", "error", "watchdog", "restart"]
+
+
+# ---------------- /whois disclosure gating (online + offline) ----------------
+
+
+class _RecFollowup:
+    def __init__(self):
+        self.calls = []
+
+    async def send(self, content=None, *, embed=None, ephemeral=False, **kw):
+        self.calls.append({"content": content, "embed": embed, "ephemeral": ephemeral})
+
+
+class _RecResponse:
+    def __init__(self):
+        self.deferred = False
+
+    async def defer(self):
+        self.deferred = True
+
+
+class _RecInteraction:
+    def __init__(self, uid=1):
+        self.response = _RecResponse()
+        self.followup = _RecFollowup()
+        self.user = types.SimpleNamespace(id=uid)
+
+
+class _WhoisBot:
+    def __init__(self, api, store, admin):
+        self._api = api
+        self._store = store
+        self._admin = admin
+
+    def _is_admin(self, interaction):
+        return self._admin
+
+
+def _online_player(name="Steve", uid="u1"):
+    return types.SimpleNamespace(
+        name=name, user_id=uid, level=42, ping=25.0,
+        building_count=7, location_x=100.0, location_y=200.0,
+    )
+
+
+def _fields(embed):
+    return {f.name: f.value for f in embed.fields}
+
+
+def test_whois_online_admin_gets_sensitive_fields_ephemerally():
+    bot = _WhoisBot(_PlaytimeApi([_online_player()]), _HistStore(mins=120.0), admin=True)
+    it = _RecInteraction()
+    asyncio.run(PalBot._whois(bot, it, "steve"))
+    pub, priv = it.followup.calls
+    assert pub["ephemeral"] is False  # public card, no sensitive fields
+    assert "Location" not in _fields(pub["embed"]) and "User ID" not in _fields(pub["embed"])
+    assert priv["ephemeral"] is True  # sensitive fields only to the admin
+    assert "Location" in _fields(priv["embed"]) and "User ID" in _fields(priv["embed"])
+
+
+def test_whois_online_non_admin_never_sees_sensitive_fields():
+    bot = _WhoisBot(_PlaytimeApi([_online_player()]), _HistStore(mins=120.0), admin=False)
+    it = _RecInteraction()
+    asyncio.run(PalBot._whois(bot, it, "steve"))
+    assert len(it.followup.calls) == 1  # public card only — no ephemeral admin follow-up
+    f = _fields(it.followup.calls[0]["embed"])
+    assert "Location" not in f and "User ID" not in f
+
+
+def test_whois_offline_admin_gets_user_id_ephemerally():
+    store = _HistStore(uid="u7", mins=60.0, seen=("Ghost", "2026-01-01T00:00:00+00:00"))
+    it = _RecInteraction()
+    asyncio.run(PalBot._whois(_WhoisBot(_PlaytimeApi([]), store, admin=True), it, "ghost"))
+    pub, priv = it.followup.calls
+    assert pub["ephemeral"] is False
+    assert priv["ephemeral"] is True and "u7" in priv["content"]
+
+
+def test_whois_offline_non_admin_gets_no_user_id():
+    store = _HistStore(uid="u7", mins=60.0, seen=("Ghost", "2026-01-01T00:00:00+00:00"))
+    it = _RecInteraction()
+    asyncio.run(PalBot._whois(_WhoisBot(_PlaytimeApi([]), store, admin=False), it, "ghost"))
+    assert len(it.followup.calls) == 1 and it.followup.calls[0]["ephemeral"] is False
+
+
+def test_whois_unknown_player():
+    bot = _WhoisBot(_PlaytimeApi([]), _HistStore(uid=None), admin=True)
+    it = _RecInteraction()
+    asyncio.run(PalBot._whois(bot, it, "nobody"))
+    assert len(it.followup.calls) == 1 and "never seen" in it.followup.calls[0]["content"]
+
+
+# ---------------- _server_power stop branch ----------------
+
+
+class _StopBot:
+    def __init__(self, sched, *, admin=True, confirm=True):
+        self._sched = sched
+        self._admin = admin
+        self._confirm_val = confirm
+
+    def _is_admin(self, interaction):
+        return self._admin
+
+    async def _confirm(self, interaction, prompt):
+        return self._confirm_val
+
+
+def test_server_power_stop_confirmed_ok():
+    sched = _StubSched("ok")
+    it = _FakeInteraction()
+    asyncio.run(PalBot._server_power(_StopBot(sched), it, "stop"))
+    assert sched.stopped and "stopped" in it.followup.messages[-1].lower()
+
+
+def test_server_power_stop_reports_failed():
+    sched = _StubSched("failed")
+    it = _FakeInteraction()
+    asyncio.run(PalBot._server_power(_StopBot(sched), it, "stop"))
+    assert "hung" in it.followup.messages[-1].lower()
+
+
+def test_server_power_stop_busy():
+    sched = _StubSched("busy")
+    it = _FakeInteraction()
+    asyncio.run(PalBot._server_power(_StopBot(sched), it, "stop"))
+    assert "mid-operation" in it.followup.messages[-1].lower()
+
+
+def test_server_power_stop_cancelled_does_not_stop():
+    sched = _StubSched("ok")
+    it = _FakeInteraction()
+    asyncio.run(PalBot._server_power(_StopBot(sched, confirm=False), it, "stop"))
+    assert not sched.stopped and it.followup.messages == []

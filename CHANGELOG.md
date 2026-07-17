@@ -28,11 +28,18 @@ Installers for every release are on the
     grouped command list).
   - **`/playtime` and `/whois` answer for offline players too**, resolved from the
     session history palctl already keeps — the common case is checking on someone
-    who isn't on right now. A player's live map position and platform ID stay
-    admin-only.
+    who isn't on right now. Playtime now also counts the session in progress, not
+    just finished ones. A player's live map position and platform ID stay
+    admin-only, and are delivered to the requesting admin privately (an ephemeral
+    reply) so an admin's lookup doesn't broadcast them to the whole channel.
+  - **`/cancel`** aborts an in-progress restart countdown before the server
+    actually goes down — change your mind after `/restart` and call it off.
   - **Autocomplete** for player-name and backup-name arguments (`/kick` `/ban`
     `/playtime` `/whois` `/restore`), drawing on the live player list, the session
     history, and the backups on disk — so you're not typing exact names on a phone.
+  - The optional **live status embed** now carries the leak forecast, so a pinned
+    message answers "is a restart coming?" at a glance. `/events` shows only
+    non-sensitive event kinds to non-admins (no raw error/watchdog internals).
   - **Confirm/Cancel buttons** on the destructive commands (`/stop` `/update`
     `/restore`), gated to the admin who invoked them, so a mis-tap can't take the
     server down.
@@ -47,9 +54,13 @@ Installers for every release are on the
   `On this network:` URL to open on the other device, and the daemon logs a
   one-line warning at startup that the per-user token is the only credential
   once it's exposed. The safe default is unchanged — you opt in, and it takes
-  effect on the next daemon restart. Don't port-forward the port to the
-  internet; for anything past a trusted LAN, an SSH tunnel or Tailscale still
-  authenticates and encrypts the connection.
+  effect on the next daemon restart. On Windows the daemon also opens the
+  firewall for the dashboard port (private networks only) when LAN access is on
+  and it's running elevated — otherwise binding to the LAN was a silent no-op,
+  since the firewall drops the inbound connections — and closes it again when
+  LAN access is turned off. Don't port-forward the port to the internet; for
+  anything past a trusted LAN, an SSH tunnel or Tailscale still authenticates
+  and encrypts the connection.
 
 ## [1.1.0] — 2026-07-17
 

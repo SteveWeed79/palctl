@@ -140,7 +140,11 @@ server PC itself — a browser on another machine gets nothing. To reach it from
 other devices on your LAN, turn on **Config → Web dashboard → "Allow access
 from other devices on this network"** (or set `ui_bind_host` to `0.0.0.0` in
 `config.json`), then **restart the daemon** — the port is bound once at startup.
-`palctl ui` then prints an `On this network:` URL to open on the other device.
+On Windows the daemon also opens the firewall for that port (private networks
+only) when it starts elevated, so LAN access actually works instead of being
+silently blocked; if the daemon isn't elevated it logs the one `netsh` command
+to run by hand. `palctl ui` then prints an `On this network:` URL to open on the
+other device.
 The per-user token in that URL is the only credential and it rides plain HTTP,
 so keep this to a network you trust. Don't port-forward `8830` to the internet —
 same rule as `8212`.
@@ -164,7 +168,7 @@ internet.
 *Reads (anyone):*
 `/status` `/health` `/players` `/whois` `/playtime` `/leaderboard` `/backups` `/events` `/next` `/help`
 *Admin:*
-`/start` `/stop` `/restart` `/update` `/save` `/backup` `/restore` `/announce` `/kick` `/ban` `/unban`
+`/start` `/stop` `/restart` `/cancel` `/update` `/save` `/backup` `/restore` `/announce` `/kick` `/ban` `/unban`
 
 `/health` shows memory against the watchdog limit *and the leak forecast* — how
 long until a restart is due on the current trend. `/leaderboard` ranks players
@@ -174,7 +178,9 @@ live if they're online, from history if they're not. `/playtime` and `/whois`
 work for **offline** players too. Player-name and backup-name arguments
 **autocomplete**, and the destructive commands (`/stop` `/update` `/restore`)
 pop a **Confirm/Cancel** button first — all so the bot is safe to drive
-one-handed from a phone.
+one-handed from a phone. Changed your mind mid-countdown? `/cancel` aborts a
+restart before it takes the server down. The optional live status embed carries
+the leak forecast too, so a pinned message shows health at a glance.
 
 Plus join/leave, level-up, watchdog, server up/down, and update-available
 notifications — with an optional auto-refreshing status message and a

@@ -263,6 +263,36 @@ class Daemon:
         if warning:
             self.log.warning("%s", warning)
 
+    def _sync_dashboard_firewall(self, host: str) -> None:
+        """On Windows, a non-loopback bind still needs a firewall rule or other
+        devices on the LAN can't reach the dashboard — so binding 0.0.0.0 alone
+        is a silent no-op. Open the port (private networks) when LAN access is
+        on, and close it again when off. Best-effort: a non-elevated daemon can't
+        touch the firewall, so log the one-line manual command instead."""
+        if not sys.platform.startswith("win"):
+            return
+        from . import firewall
+
+        try:
+            if netinfo.is_loopback(host):
+                if firewall.remove_rule() == "removed":
+                    self.log.info("closed the dashboard firewall rule (LAN access off)")
+                return
+            outcome = firewall.ensure_rule(DAEMON_PORT)
+            if outcome == "added":
+                self.log.info(
+                    "opened the Windows Firewall for the dashboard on port %d "
+                    "(private networks only)", DAEMON_PORT,
+                )
+            elif outcome == "failed":
+                self.log.warning(
+                    "couldn't open the Windows Firewall for the dashboard — other "
+                    "devices on your LAN stay blocked until you run this once as "
+                    "administrator:\n    %s", firewall.manual_add_command(DAEMON_PORT),
+                )
+        except Exception as e:  # firewall trouble must never break startup
+            self.log.warning("dashboard firewall setup failed: %s", e)
+
     def _warn_if_cloud_mirror_broken(self) -> None:
         """If the backup mirror is an rclone remote that's misconfigured — no
         dedicated folder, or rclone not installed — every scheduled mirror will
@@ -740,6 +770,7 @@ class Daemon:
         warning = lan_exposure_warning(host)
         if warning:
             self.log.warning("%s", warning)
+        self._sync_dashboard_firewall(host)
         self._warn_if_cloud_mirror_broken()
 
         if self.cfg.check_for_updates:
@@ -910,6 +941,10 @@ def uninstall_service() -> None:
             return
         nssm = winservice.ensure_nssm(config_dir() / "bin")
         winservice.remove_service(nssm, SERVICE_NAME)
+        # Don't leave the dashboard firewall port open after uninstall.
+        from . import firewall
+
+        firewall.remove_rule()
     else:
         from . import systemd
 

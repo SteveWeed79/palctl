@@ -266,3 +266,36 @@ def test_recent_player_names_dedups_keeping_most_recent_order(tmp_path: Path):
     _insert_closed_session(store, "u1", "Alice", 5)  # Alice again, later
     # newest-first, each name once: Alice (its latest row) before Bob
     assert store.recent_player_names() == ["Alice", "Bob"]
+
+
+# ---------------- current (open) session counts toward playtime ----------------
+
+
+def test_total_playtime_includes_the_open_session(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    # one finished 60m session...
+    _insert_closed_session(store, "u1", "Alice", 60, base=base)
+    # ...plus a still-open session (left_at NULL) that started 30m before `now`
+    store._db.execute(
+        "INSERT INTO sessions (user_id, name, joined_at) VALUES (?,?,?)",
+        ("u1", "Alice", (base + timedelta(hours=2)).isoformat()),
+    )
+    store._db.commit()
+    now = base + timedelta(hours=2, minutes=30)
+    assert store.total_playtime_minutes("u1", now=now) == 90.0  # 60 closed + 30 open
+
+
+def test_top_playtime_counts_the_open_session(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    _insert_closed_session(store, "u1", "Alice", 10, base=base)
+    store._db.execute(
+        "INSERT INTO sessions (user_id, name, joined_at) VALUES (?,?,?)",
+        ("u2", "Bob", base.isoformat()),  # open session, no left_at
+    )
+    store._db.commit()
+    now = base + timedelta(minutes=120)  # Bob has been on 120m
+    top = store.top_playtime(now=now)
+    assert top[0] == ("Bob", 120.0)  # the online player leads on their live session
+    assert ("Alice", 10.0) in top

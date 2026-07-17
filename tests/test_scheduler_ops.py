@@ -753,3 +753,81 @@ def test_start_server_when_busy_returns_busy_without_claiming_intent(monkeypatch
     assert _run(go()) == "busy"
     assert intent == []  # never touched intent
     assert not any(c[0] == "start" for c in calls)
+
+
+# ---------------- /cancel an in-progress countdown ----------------
+
+
+def test_cancel_countdown_reports_whether_one_was_running():
+    sched = sched_mod.Scheduler(Config(), FakeApi(), EventBus())
+    assert sched.cancel_countdown() is False  # nothing armed
+    sched._cancel_restart = asyncio.Event()
+    assert sched.cancel_countdown() is True
+    assert sched._cancel_restart.is_set()
+    assert sched.cancel_countdown() is False  # already cancelled, don't re-fire
+
+
+def test_sleep_or_cancel_true_when_event_set_false_without_event():
+    async def with_set():
+        sched = sched_mod.Scheduler(Config(), FakeApi(), EventBus())
+        sched._cancel_restart = asyncio.Event()
+        sched._cancel_restart.set()
+        return await sched._sleep_or_cancel(0)
+
+    async def without_event():
+        sched = sched_mod.Scheduler(Config(), FakeApi(), EventBus())
+        return await sched._sleep_or_cancel(0)  # no event armed -> plain (0s) sleep
+
+    assert _run(with_set()) is True
+    assert _run(without_event()) is False
+
+
+def test_restart_countdown_can_be_cancelled_before_restart(monkeypatch):
+    monkeypatch.setattr(sched_mod, "COUNTDOWN_MARKS", (10,))  # one interruptible wait
+    cfg = Config()
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+    bus = EventBus()
+    events = _collect(bus)
+    intent: list = []
+    sched = sched_mod.Scheduler(cfg, FakeApi(), bus, set_intent=intent.append)
+
+    async def go():
+        task = asyncio.create_task(sched.restart_with_countdown("test"))
+        for _ in range(1000):  # wait until the countdown arms its cancel event
+            if sched._cancel_restart is not None:
+                break
+            await asyncio.sleep(0)
+        assert sched.cancel_countdown() is True
+        await task
+
+    _run(go())
+    assert not any(c[0] in ("stop", "start") for c in calls)  # never restarted
+    assert any("cancel" in e.message.lower() for e in events)
+    assert sched._cancel_restart is None  # cleaned up
+    assert True in intent  # a restart records 'server should be up' at entry
+
+
+def test_update_server_records_up_intent(tmp_path, monkeypatch):
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path / "server")
+    cfg.backup_root = str(tmp_path / "backups")
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+        if on_line:
+            on_line("done")
+        return 0
+
+    monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
+    monkeypatch.setattr(sched_mod.steamcmd, "backup_file", lambda p: None)
+    monkeypatch.setattr(sched_mod, "is_blank", lambda p: False)
+    intent: list = []
+    _run(
+        sched_mod.Scheduler(cfg, FakeApi(), EventBus(), set_intent=intent.append).update_server()
+    )
+    assert True in intent  # parity with the daemon's HTTP /action/update-server

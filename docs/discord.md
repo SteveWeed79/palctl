@@ -35,6 +35,7 @@ This page is the long form.
 | `/backup` | Take a backup now | **yes** |
 | `/restore <name>` | Restore a backup (asks first; restarts the server) | **yes** |
 | `/restart [reason]` | Restart with an in-game countdown | **yes** |
+| `/cancel` | Cancel an in-progress restart countdown | **yes** |
 | `/update` | Update via SteamCMD (asks first; stops the server) | **yes** |
 | `/kick <name> [reason]` | Kick a player | **yes** |
 | `/ban <name> [reason]` | Ban a player | **yes** |
@@ -193,8 +194,9 @@ looks like "commands work but alerts don't".
 
 ## Step 5 — Set who can run admin commands
 
-Admin-only commands (`/start`, `/stop`, `/announce`, `/restart`, `/kick`, `/ban`,
-`/save`, `/backup`, `/restore`, `/update`, `/unban`) are gated by **`admin_role_id`**.
+Admin-only commands (`/start`, `/stop`, `/announce`, `/restart`, `/cancel`,
+`/kick`, `/ban`, `/save`, `/backup`, `/restore`, `/update`, `/unban`) are gated
+by **`admin_role_id`**.
 
 Despite the name, this field accepts **either a role ID or a user ID** — palctl
 allows the caller if they *hold a role* with that ID **or** if they *are* the user

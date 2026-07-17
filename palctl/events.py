@@ -212,17 +212,24 @@ class SessionStore:
             self._db.commit()
             return (now - datetime.fromisoformat(joined_at)).total_seconds() / 60
 
-    def total_playtime_minutes(self, user_id: str) -> float:
+    def total_playtime_minutes(self, user_id: str, *, now: datetime | None = None) -> float:
+        """Total minutes played, INCLUDING the current session if the player is
+        online — an open row (left_at NULL) is counted up to `now`, so /playtime
+        reflects the session in progress instead of freezing at the last logout."""
+        now = now or datetime.now(UTC)
         with self._lock:
             rows = self._db.execute(
-                "SELECT joined_at, left_at FROM sessions WHERE user_id=? AND left_at IS NOT NULL",
+                "SELECT joined_at, left_at FROM sessions WHERE user_id=?",
                 (user_id,),
             ).fetchall()
         total = 0.0
         for joined, left in rows:
-            total += (
-                datetime.fromisoformat(left) - datetime.fromisoformat(joined)
-            ).total_seconds() / 60
+            try:
+                start = datetime.fromisoformat(joined)
+                end = datetime.fromisoformat(left) if left else now
+            except (ValueError, TypeError):
+                continue  # a half-written row shouldn't zero out a real total
+            total += (end - start).total_seconds() / 60
         return total
 
     def resolve_user_id(self, name: str) -> str | None:
@@ -267,22 +274,25 @@ class SessionStore:
                 break
         return out
 
-    def top_playtime(self, limit: int = 10) -> list[tuple[str, float]]:
+    def top_playtime(
+        self, limit: int = 10, *, now: datetime | None = None
+    ) -> list[tuple[str, float]]:
         """The `limit` players with the most total playtime, as (name, minutes)
-        highest first. The name is the most recent one seen for that account, so
-        a rename shows the current handle. Powers the Discord /leaderboard."""
+        highest first. Includes the current session for anyone online (an open
+        row counted up to `now`). The name is the most recent one seen for that
+        account, so a rename shows the current handle. Powers /leaderboard."""
+        now = now or datetime.now(UTC)
         with self._lock:
             rows = self._db.execute(
-                "SELECT user_id, name, joined_at, left_at FROM sessions "
-                "WHERE left_at IS NOT NULL ORDER BY rowid"
+                "SELECT user_id, name, joined_at, left_at FROM sessions ORDER BY rowid"
             ).fetchall()
         totals: dict[str, float] = {}
         latest_name: dict[str, str] = {}
         for user_id, name, joined, left in rows:
             try:
-                mins = (
-                    datetime.fromisoformat(left) - datetime.fromisoformat(joined)
-                ).total_seconds() / 60
+                start = datetime.fromisoformat(joined)
+                end = datetime.fromisoformat(left) if left else now
+                mins = (end - start).total_seconds() / 60
             except (ValueError, TypeError):
                 continue  # a malformed timestamp shouldn't sink the leaderboard
             totals[user_id] = totals.get(user_id, 0.0) + mins

@@ -68,6 +68,9 @@ class Scheduler:
         # Discord /start or /stop is remembered exactly like the GUI's buttons —
         # a /stop must not be undone by auto-recovery. None = no-op (standalone).
         self._set_intent = set_intent or (lambda _running: None)
+        # Armed for the duration of a countdown restart so /cancel can abort it
+        # before the server actually goes down. None = no countdown in flight.
+        self._cancel_restart: asyncio.Event | None = None
 
     def reconfigure(self, cfg: Config, api: PalApi) -> None:
         self._cfg = cfg
@@ -289,39 +292,82 @@ class Scheduler:
             return True
         return False
 
+    def cancel_countdown(self) -> bool:
+        """Ask an in-progress countdown restart to abort before it takes the
+        server down. Returns True if a countdown was running to cancel. Called
+        from the same event loop (the Discord /cancel command)."""
+        ev = self._cancel_restart
+        if ev is not None and not ev.is_set():
+            ev.set()
+            return True
+        return False
+
+    async def _sleep_or_cancel(self, delay: float) -> bool:
+        """Sleep `delay` seconds, returning True early if the countdown was
+        cancelled meanwhile. A plain sleep when no cancel event is armed."""
+        ev = self._cancel_restart
+        if ev is None:
+            await asyncio.sleep(max(0.0, delay))
+            return False
+        if delay <= 0:
+            return ev.is_set()
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=delay)
+            return True  # the event fired within the window = cancelled
+        except TimeoutError:
+            return False
+
     async def restart_with_countdown(self, reason: str) -> None:
         """Announce, count down, save, restart. Also used by the GUI/bot buttons.
 
         Holds the op lock for the whole countdown, so an update or a watchdog
-        restart can't fire into the middle of it."""
+        restart can't fire into the middle of it. Cancellable via /cancel right
+        up until the save+restart at the end."""
         async with self._control.operation("restart"):
-            await self._bus.emit(Event("restart", f"🔁 {reason} — counting down."))
-
-            prev = COUNTDOWN_MARKS[0]
-            for mark in COUNTDOWN_MARKS:
-                await asyncio.sleep(max(0, prev - mark))
-                prev = mark
-                label = f"{mark // 60} minute(s)" if mark >= 60 else f"{mark} seconds"
-                try:
-                    await self._api.announce(f"{reason} in {label}.")
-                except Exception:
-                    pass
-
-            await asyncio.sleep(prev)
-            await self._control.save_best_effort(settle=3)
-            ok = await self._control.restart_cycle(
-                escalate=True,
-                on_escalate=lambda m: self._bus.emit(
-                    Event("restart", f"🔨 {m}", {"action": "force_stop"})
-                ),
-            )
-            await self._bus.emit(
-                Event(
-                    "restart",
-                    "✅ Server back up." if ok else "❌ Server did not come back up.",
-                    {"recovered": ok},
+            # A restart intends the server up afterward — record that so it has
+            # parity with the daemon's HTTP /action/restart and a prior /stop
+            # can't leave auto-recovery thinking the server should stay down.
+            self._set_intent(True)
+            self._cancel_restart = asyncio.Event()
+            try:
+                await self._bus.emit(
+                    Event("restart", f"🔁 {reason} — counting down. (`/cancel` to abort)")
                 )
-            )
+
+                cancelled_msg = (
+                    f"🚫 Restart cancelled — '{reason}' called off. Server left running."
+                )
+                prev = COUNTDOWN_MARKS[0]
+                for mark in COUNTDOWN_MARKS:
+                    if await self._sleep_or_cancel(max(0, prev - mark)):
+                        await self._bus.emit(Event("restart", cancelled_msg))
+                        return
+                    prev = mark
+                    label = f"{mark // 60} minute(s)" if mark >= 60 else f"{mark} seconds"
+                    try:
+                        await self._api.announce(f"{reason} in {label}.")
+                    except Exception:
+                        pass
+
+                if await self._sleep_or_cancel(prev):
+                    await self._bus.emit(Event("restart", cancelled_msg))
+                    return
+                await self._control.save_best_effort(settle=3)
+                ok = await self._control.restart_cycle(
+                    escalate=True,
+                    on_escalate=lambda m: self._bus.emit(
+                        Event("restart", f"🔨 {m}", {"action": "force_stop"})
+                    ),
+                )
+                await self._bus.emit(
+                    Event(
+                        "restart",
+                        "✅ Server back up." if ok else "❌ Server did not come back up.",
+                        {"recovered": ok},
+                    )
+                )
+            finally:
+                self._cancel_restart = None
 
     async def restart_quick(self, reason: str, *, skip_if_busy: bool = False) -> None:
         """Save and restart with no countdown. For moments when there's nobody
@@ -338,6 +384,7 @@ class Scheduler:
         else:
             op = self._control.operation("restart")
         async with op:
+            self._set_intent(True)  # ends with the server up — record that intent
             await self._bus.emit(Event("restart", f"🔁 {reason}"))
             await self._control.save_best_effort(settle=3)
             ok = await self._control.restart_cycle(
@@ -400,6 +447,7 @@ class Scheduler:
             return
 
         async with self._control.operation("restore"):
+            self._set_intent(True)  # the server is meant to be up after a restore
             await self._bus.emit(
                 Event("restore", f"♻️ Restoring backup `{name}` — stopping the server.")
             )
@@ -463,6 +511,7 @@ class Scheduler:
             return
 
         async with self._control.operation("update"):
+            self._set_intent(True)  # the server is meant to be up after an update
             await self._update_locked(cfg, validate=validate)
 
     async def _update_locked(self, cfg: Config, *, validate: bool) -> None:
