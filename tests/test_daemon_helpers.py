@@ -183,3 +183,81 @@ def test_desired_running_tolerates_garbage_state(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon_mod, "_STATE_PATH", state)
     state.write_text("{not json")
     assert daemon_mod._load_desired_running() is True  # fail open to normal behavior
+
+
+# ---------------- reload-config vs. the Discord bot ----------------
+
+# The GUI's one save button hits /action/reload-config. The trap this pins:
+# enabling the bot (or fixing a rejected token) after the daemon is up used to
+# do nothing until a full daemon restart, because run_bot reads enabled+token
+# exactly once. _reload_bot must relaunch a finished run_bot, and must NOT
+# stack a second one on top of a live/retrying one.
+
+
+def _bare_daemon(bot, task):
+    d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)  # skip the heavy __init__
+    d.bot = bot
+    d._bot_task = task
+    d._started = 0
+    d._start_bot = lambda: setattr(d, "_started", d._started + 1)
+    return d
+
+
+class _FakeBot:
+    def __init__(self):
+        self.reconfigured_with = None
+
+    def reconfigure(self, cfg, api):
+        self.reconfigured_with = (cfg, api)
+
+
+class _FakeTask:
+    def __init__(self, done: bool):
+        self._done = done
+
+    def done(self) -> bool:
+        return self._done
+
+
+def test_reload_relaunches_finished_bot():
+    # Bot was never started (disabled / no token at boot), user saves settings.
+    d = _bare_daemon(bot=None, task=_FakeTask(done=True))
+    d._reload_bot()
+    assert d._started == 1
+
+
+def test_reload_clears_dead_client_before_relaunch():
+    # LoginFailure leaves run_bot returned but self.bot pointing at the dead
+    # client; a relaunch must not reconfigure that corpse instead of starting.
+    dead = _FakeBot()
+    d = _bare_daemon(bot=dead, task=_FakeTask(done=True))
+    d._reload_bot()
+    assert d._started == 1
+    assert d.bot is None  # run_bot's on_created will set the real one
+    assert dead.reconfigured_with is None
+
+
+def test_reload_reconfigures_live_bot_without_relaunch():
+    live = _FakeBot()
+    d = _bare_daemon(bot=live, task=_FakeTask(done=False))
+    d.cfg, d.api = object(), object()
+    d._reload_bot()
+    assert d._started == 0
+    assert live.reconfigured_with == (d.cfg, d.api)
+
+
+def test_reload_leaves_retrying_run_bot_alone():
+    # run_bot in its connect-retry backoff: task not done, and self.bot points
+    # at the latest attempt. Reconfigure it, don't start a second run_bot.
+    attempt = _FakeBot()
+    d = _bare_daemon(bot=attempt, task=_FakeTask(done=False))
+    d.cfg, d.api = object(), object()
+    d._reload_bot()
+    assert d._started == 0
+    assert attempt.reconfigured_with == (d.cfg, d.api)
+
+
+def test_reload_before_run_started_is_harmless():
+    d = _bare_daemon(bot=None, task=None)
+    d._reload_bot()  # no crash, nothing started
+    assert d._started == 0

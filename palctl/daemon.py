@@ -175,6 +175,10 @@ class Daemon:
         )
         self.watchdog = Watchdog(self.cfg, self.api, self.bus, self.control)
         self.bot = None  # set by run_bot if the Discord bot is enabled
+        # The run_bot task. reload-config relaunches it when it has finished
+        # (bot was disabled / token missing or rejected at the last attempt),
+        # so enabling the bot from the GUI doesn't need a daemon restart.
+        self._bot_task: asyncio.Task | None = None
 
         # None = haven't polled yet; don't announce "up" just because the
         # daemon (not the server) was restarted.
@@ -234,6 +238,37 @@ class Daemon:
     def _set_bot(self, bot) -> None:
         self.bot = bot
 
+    def _start_bot(self) -> None:
+        """Launch (or relaunch) the Discord bot task. run_bot itself returns
+        immediately when the bot is disabled or has no token, so calling this
+        is always safe — except while a previous task is still running, which
+        callers must rule out via ``self._bot_task``."""
+        self._bot_task = self._spawn(
+            self._supervised(
+                "discord bot",
+                run_bot(
+                    self.cfg, self.api, self.bus, self.store, self.scheduler,
+                    on_created=self._set_bot,
+                ),
+            )
+        )
+
+    def _reload_bot(self) -> None:
+        """Apply a config reload to the Discord bot.
+
+        A finished run_bot means the bot was disabled, had no token, or its
+        token was rejected at the last start — the GUI's "Save & reload" used
+        to leave it that way until a full daemon restart. Relaunch it with the
+        fresh config instead (run_bot's finally already unhooked the old
+        client from the bus, so the stale self.bot is just a dead reference).
+        A *running* bot only gets the new config pushed in; swapping the token
+        of a live client still needs a daemon restart."""
+        if self._bot_task is not None and self._bot_task.done():
+            self.bot = None
+            self._start_bot()
+        elif self.bot is not None:
+            self.bot.reconfigure(self.cfg, self.api)
+
     @property
     def _desired_running(self) -> bool:
         return self.__desired_running
@@ -243,11 +278,12 @@ class Daemon:
         self.__desired_running = value
         _save_desired_running(value)
 
-    def _spawn(self, coro) -> None:
+    def _spawn(self, coro) -> asyncio.Task:
         # asyncio holds only weak refs to tasks; keep one or it can be GC'd mid-run.
         t = asyncio.create_task(coro)
         self._tasks.add(t)
         t.add_done_callback(self._spawned_done)
+        return t
 
     def _spawned_done(self, t: asyncio.Task) -> None:
         self._tasks.discard(t)
@@ -565,8 +601,7 @@ class Daemon:
                     self.control.reconfigure(self.cfg, self.api)
                     self.scheduler.reconfigure(self.cfg, self.api)
                     self.watchdog.reconfigure(self.cfg, self.api)
-                    if self.bot is not None:
-                        self.bot.reconfigure(self.cfg, self.api)
+                    self._reload_bot()
                 else:
                     return web.json_response({"error": f"unknown action {what}"}, status=400)
             except Exception as e:
@@ -601,19 +636,13 @@ class Daemon:
         if self.cfg.check_for_updates:
             self._spawn(self._check_palctl_update())
 
+        self._start_bot()
         await asyncio.gather(
             self._supervised("poll loop", self._poll_loop()),
             self._supervised("watchdog", self.watchdog.run()),
             self._supervised("scheduler", self.scheduler.run()),
             self._supervised("leak forecaster", self._predict_loop()),
             self._supervised("update check", self._update_check_loop()),
-            self._supervised(
-                "discord bot",
-                run_bot(
-                    self.cfg, self.api, self.bus, self.store, self.scheduler,
-                    on_created=self._set_bot,
-                ),
-            ),
         )
 
     async def _supervised(self, name: str, coro) -> None:
