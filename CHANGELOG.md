@@ -63,6 +63,12 @@ Installers for every release are on the
   and encrypts the connection.
 
 ### Fixed
+- **Re-running the daemon install now actually restarts the daemon.** Installing
+  the service over an already-running daemon wrote the new unit/exe/params but
+  left the old process up: `systemctl start` no-ops on an active unit and
+  `nssm start` no-ops on a running service, so the stale binary and settings kept
+  running. Install now restarts on Linux (`systemctl restart`) and stops before
+  starting on Windows, so a reinstall picks up the new registration.
 - **CPU in `palctl status` (and the dashboard/bot) is no longer stuck at 0%.**
   Process metrics are sampled by re-finding PalServer on every poll, which handed
   psutil a brand-new `Process` object each time — and `cpu_percent(interval=None)`

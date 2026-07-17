@@ -68,7 +68,11 @@ def install_service(
     _run(["systemctl", "daemon-reload"])
     _run(["systemctl", "enable", name])
     if start:
-        _run(["systemctl", "start", name])
+        # `systemctl start` is a no-op when the unit is already active, so a
+        # re-install over a running daemon would leave the OLD process up with
+        # the stale unit/binary. `restart` starts it if stopped and re-launches
+        # it if running, so a reinstall actually picks up the rewritten unit.
+        _run(["systemctl", "restart", name])
 
 
 def remove_service(name: str) -> None:

@@ -148,6 +148,12 @@ def install_service(
     ):
         _run(cmd)
     if start:
+        # `nssm install` no-ops when the service already exists and `nssm start`
+        # no-ops when it's already running, so a re-install over a running daemon
+        # would keep the OLD process alive with the pre-`set` exe/params. Stop
+        # first (harmless if it isn't running) so the freshly-set Application and
+        # AppParameters actually take effect on start.
+        _run([str(nssm), "stop", name])
         _run([str(nssm), "start", name])
 
 

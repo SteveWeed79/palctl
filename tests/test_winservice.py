@@ -89,6 +89,31 @@ def test_install_commands_user_wins_over_appdata_redirect():
     assert not any("AppEnvironmentExtra" in j for j in joined)
 
 
+def test_install_service_stops_before_start_to_reload_the_daemon(monkeypatch):
+    # A re-install over a RUNNING daemon must stop it before starting, or the
+    # live process keeps the pre-`set` exe/params (`nssm start` no-ops when the
+    # service is already running).
+    calls: list[list[str]] = []
+    monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))
+
+    winservice.install_service("nssm.exe", "palctl-daemon", "svc.exe")
+
+    stop = ["nssm.exe", "stop", "palctl-daemon"]
+    start = ["nssm.exe", "start", "palctl-daemon"]
+    assert stop in calls and start in calls
+    assert calls.index(stop) < calls.index(start)
+
+
+def test_install_service_start_false_skips_stop_and_start(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))
+
+    winservice.install_service("nssm.exe", "svc", "svc.exe", start=False)
+
+    assert not any(c[1:2] == ["stop"] for c in calls)
+    assert not any(c[1:2] == ["start"] for c in calls)
+
+
 # ---------- NSSM download checksum pin ----------
 
 
