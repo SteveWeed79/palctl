@@ -84,8 +84,10 @@ class PalBot(discord.Client):
     def reconfigure(self, cfg: Config, api: PalApi) -> None:
         """Pick up a config reload: channel, notification toggles, API endpoint.
 
-        Enabling the bot when it never started, or changing its token, still
-        needs a daemon restart — discord.py can't swap tokens on a live client.
+        Only reaches a *live* bot — when run_bot has already returned (bot was
+        disabled, no token, token rejected) the daemon relaunches it on reload
+        instead. Changing the token of a running bot still needs a daemon
+        restart: discord.py can't swap tokens on a live client.
         """
         self._cfg = cfg
         self._api = api

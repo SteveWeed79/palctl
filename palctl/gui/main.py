@@ -768,7 +768,9 @@ class ConfigTab(QWidget):
             QMessageBox.information(
                 self, "Saved",
                 "Config saved and daemon reloaded.\n\n"
-                "Discord bot changes need a daemon restart to take effect.",
+                "If the Discord bot was off, it is starting now — allow a few "
+                "seconds to connect. Changing the token of a bot that is "
+                "already connected still needs a daemon restart.",
             )
         except Exception:
             QMessageBox.information(

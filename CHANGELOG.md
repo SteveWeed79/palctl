@@ -11,6 +11,15 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Fixed
+- **"Save config & reload daemon" now actually starts the Discord bot.**
+  The daemon read the bot's enabled flag and token exactly once, at startup —
+  so the natural flow (paste token, tick Enabled, hit Save) silently did
+  nothing until the daemon was restarted, and the dialog's small-print
+  restart warning was easy to miss. A config reload now relaunches the bot
+  when it isn't running (never enabled, missing token, or a previously
+  rejected token that's since been fixed). The one remaining restart case is
+  swapping the token of a bot that is already connected, and the save dialog
+  now says exactly that.
 - **The installer (and frozen exes) show their icon everywhere in Explorer.**
   `app-icon.ico` was written with every frame PNG-compressed, but Windows only
   reads PNG icon frames at 256×256 — so any Explorer view that wanted a
