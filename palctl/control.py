@@ -26,11 +26,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 
 from . import procs
 from .api import PalApi
 from .config import Config
+
+# Awaited once per escalation step with a human-readable message, so the caller
+# (which owns an event bus; the controller does not) can surface a hard kill to
+# the operator. None means "nobody's listening" — the escalation still happens.
+EscalateNotify = Callable[[str], Awaitable[None]]
+
+
+async def _notify(cb: EscalateNotify | None, message: str) -> None:
+    if cb is not None:
+        await cb(message)
 
 
 class ServerController:
@@ -87,16 +97,71 @@ class ServerController:
             await asyncio.sleep(settle)
         return True
 
-    async def stop(self) -> bool:
-        return await procs.stop_service(self._cfg.service_name)
+    async def stop(
+        self, *, escalate: bool = False, on_escalate: EscalateNotify | None = None
+    ) -> bool:
+        """Stop the service and confirm it reached STOPPED.
+
+        escalate=False (default): a plain service stop. A server hung in
+        STOP_PENDING honestly returns False and a human deals with it — the
+        right behaviour for the user's own Stop button.
+
+        escalate=True: for unattended callers (watchdog, auto-recovery,
+        scheduled restart) where honest failure fixes nothing — the watchdog
+        would just retry the same ineffective stop every cooldown. If the
+        service stop times out with the process still alive, terminate() then
+        kill() the PID find_process() knows — the only thing that can actually
+        clear a PalServer that ignores the SCM stop. `on_escalate` is notified
+        at each step so the operator learns a hard kill happened (which can lose
+        the last unsaved interval — callers run save_best_effort first)."""
+        if await procs.stop_service(self._cfg.service_name):
+            return True
+        if not escalate:
+            return False
+        return await self._force_stop(on_escalate)
+
+    async def _force_stop(self, on_escalate: EscalateNotify | None) -> bool:
+        """The terminate → kill ladder, reached only when stop(escalate=True)
+        times out. Confirms the service manager reaches STOPPED at the end."""
+        proc = await asyncio.to_thread(procs.find_process)
+        if proc is None:
+            # Nothing to signal — the service is wedged with no process behind
+            # it, or the process died between the stop timeout and now. Give the
+            # service manager a moment to settle on STOPPED.
+            return await procs.wait_stopped(self._cfg.service_name)
+
+        pid = proc.pid
+        await _notify(
+            on_escalate,
+            f"Server ignored the stop (PID {pid} still alive after the timeout) "
+            "— terminating it. The last unsaved interval may be lost; a save was "
+            "attempted first.",
+        )
+        if await procs.terminate_process(proc):
+            return await procs.wait_stopped(self._cfg.service_name)
+
+        await _notify(
+            on_escalate,
+            f"PID {pid} survived terminate — hard-killing it.",
+        )
+        await procs.kill_process(proc)
+        return await procs.wait_stopped(self._cfg.service_name)
 
     async def start(self) -> bool:
         return await procs.start_service(self._cfg.service_name)
 
-    async def restart_cycle(self, *, stop_delay: float = 3.0, timeout: float = 240.0) -> bool:
+    async def restart_cycle(
+        self,
+        *,
+        stop_delay: float = 3.0,
+        timeout: float = 240.0,
+        escalate: bool = False,
+        on_escalate: EscalateNotify | None = None,
+    ) -> bool:
         """Stop, breathe, start, and wait for the REST API to answer again.
-        Returns whether the server actually came back."""
-        await self.stop()
+        Returns whether the server actually came back. `escalate`/`on_escalate`
+        are forwarded to stop() — see there for the hung-server force-kill."""
+        await self.stop(escalate=escalate, on_escalate=on_escalate)
         await asyncio.sleep(stop_delay)
         await self.start()
         return await self._api.wait_until_alive(timeout=timeout)

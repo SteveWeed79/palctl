@@ -5,6 +5,7 @@ server gets stopped mid-update or started mid-restore — so the lock semantics
 are pinned here. Skips cleanly on the minimal-deps CI job."""
 
 import asyncio
+import types
 
 import pytest
 
@@ -101,3 +102,125 @@ def test_save_best_effort_never_raises():
 
     ctl = ServerController(Config(), BadApi())
     assert asyncio.run(ctl.save_best_effort()) is False
+
+
+# ---------- force-kill escalation for a hung server ----------
+
+
+def _hung_stop_service(monkeypatch):
+    """Patch the service stop to time out (never reaches STOPPED)."""
+    async def stop_service(name):
+        return False
+
+    monkeypatch.setattr(control_mod.procs, "stop_service", stop_service)
+
+
+def test_plain_stop_reports_failure_and_never_kills(monkeypatch):
+    # The user's own Stop button: a hung server honestly returns False so a
+    # human can step in. No PID gets terminated behind their back.
+    _hung_stop_service(monkeypatch)
+    touched = []
+    monkeypatch.setattr(control_mod.procs, "find_process", lambda: touched.append("find"))
+    ctl = ServerController(Config(), FakeApi())
+    assert asyncio.run(ctl.stop()) is False
+    assert touched == []  # escalation never even looked for the process
+
+
+def test_stop_escalates_to_terminate_when_service_stop_times_out(monkeypatch):
+    _hung_stop_service(monkeypatch)
+    proc = types.SimpleNamespace(pid=4321)
+    monkeypatch.setattr(control_mod.procs, "find_process", lambda: proc)
+    steps = []
+
+    async def terminate(p, timeout=10.0):
+        steps.append(("terminate", p.pid))
+        return True  # terminate was enough
+
+    async def kill(p, timeout=10.0):
+        steps.append(("kill", p.pid))
+        return True
+
+    async def wait_stopped(name, timeout=60.0):
+        steps.append("wait_stopped")
+        return True
+
+    monkeypatch.setattr(control_mod.procs, "terminate_process", terminate)
+    monkeypatch.setattr(control_mod.procs, "kill_process", kill)
+    monkeypatch.setattr(control_mod.procs, "wait_stopped", wait_stopped)
+
+    msgs = []
+
+    async def notify(m):
+        msgs.append(m)
+
+    ctl = ServerController(Config(), FakeApi())
+    assert asyncio.run(ctl.stop(escalate=True, on_escalate=notify)) is True
+    assert steps == [("terminate", 4321), "wait_stopped"]  # no hard kill needed
+    assert len(msgs) == 1  # only the terminate notice was surfaced
+
+
+def test_stop_hard_kills_when_terminate_is_ignored(monkeypatch):
+    _hung_stop_service(monkeypatch)
+    proc = types.SimpleNamespace(pid=99)
+    monkeypatch.setattr(control_mod.procs, "find_process", lambda: proc)
+    steps = []
+
+    async def terminate(p, timeout=10.0):
+        steps.append("terminate")
+        return False  # survived — must escalate to a hard kill
+
+    async def kill(p, timeout=10.0):
+        steps.append("kill")
+        return True
+
+    async def wait_stopped(name, timeout=60.0):
+        steps.append("wait_stopped")
+        return True
+
+    monkeypatch.setattr(control_mod.procs, "terminate_process", terminate)
+    monkeypatch.setattr(control_mod.procs, "kill_process", kill)
+    monkeypatch.setattr(control_mod.procs, "wait_stopped", wait_stopped)
+
+    msgs = []
+
+    async def notify(m):
+        msgs.append(m)
+
+    ctl = ServerController(Config(), FakeApi())
+    assert asyncio.run(ctl.stop(escalate=True, on_escalate=notify)) is True
+    assert steps == ["terminate", "kill", "wait_stopped"]
+    assert len(msgs) == 2  # terminate notice + hard-kill notice
+
+
+def test_stop_escalation_with_no_process_just_waits(monkeypatch):
+    # Wedged service with nothing behind it (or the process died in the gap):
+    # there's nothing to signal, so confirm the service state instead of crashing.
+    _hung_stop_service(monkeypatch)
+    monkeypatch.setattr(control_mod.procs, "find_process", lambda: None)
+    waited = []
+
+    async def wait_stopped(name, timeout=60.0):
+        waited.append(name)
+        return False
+
+    monkeypatch.setattr(control_mod.procs, "wait_stopped", wait_stopped)
+    ctl = ServerController(Config(), FakeApi())
+    assert asyncio.run(ctl.stop(escalate=True)) is False
+    assert waited == [Config().service_name]
+
+
+def test_restart_cycle_forwards_escalation(monkeypatch):
+    seen = {}
+
+    async def fake_stop(self, *, escalate=False, on_escalate=None):
+        seen["escalate"] = escalate
+        return True
+
+    async def fake_start(self):
+        return True
+
+    monkeypatch.setattr(ServerController, "stop", fake_stop)
+    monkeypatch.setattr(ServerController, "start", fake_start)
+    ctl = ServerController(Config(), FakeApi(alive=True))
+    assert asyncio.run(ctl.restart_cycle(stop_delay=0, escalate=True)) is True
+    assert seen["escalate"] is True

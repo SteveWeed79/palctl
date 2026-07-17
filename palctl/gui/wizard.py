@@ -20,7 +20,6 @@ steamcmd, winservice); this file is just the form and a worker thread.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
@@ -42,20 +41,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import (
-    Config,
-    config_dir,
-    get_discord_token,
-    set_admin_password,
-    set_discord_token,
-)
+from ..config import Config, get_discord_token
 from ..discovery import detect_server_roots, detect_steamcmd, is_server_root, is_steamcmd
+from ..setup_flow import SetupPlan, run_setup
 from . import icons
 from .main import PathPicker, _MirrorTestWorker
 from .widgets import NoScrollSpinBox
-
-# Widely-recommended launch flags for the Palworld dedicated server.
-PALSERVER_ARGS = "-useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS"
 
 
 def _default_backup_dir(cfg: Config) -> str:
@@ -76,34 +67,13 @@ def _default_backup_dir(cfg: Config) -> str:
     return str(Path.home() / "PalworldBackups")
 
 
-@dataclass
-class SetupPlan:
-    server_root: str
-    steamcmd_path: str
-    api_port: int
-    password: str
-    install_server: bool
-    install_vcredist: bool
-    register_server_service: bool
-    # How the daemon starts in the background: "login" (password-free HKCU Run
-    # key, the default), "service" (Windows service, starts on boot), or "none".
-    daemon_startup: str
-    service_name: str
-    # Backups. Local always runs (folder + cadence written unconditionally); the
-    # off-site copy is the opt-in part, gated by backup_mirror_enabled.
-    backup_root: str = ""
-    backup_hours: int = 6
-    backup_mirror_enabled: bool = False
-    backup_mirror: str = ""
-    # Discord is optional — only written when its section is ticked.
-    setup_discord: bool = False
-    discord_token: str = ""
-    discord_channel_id: int = 0
-    discord_admin_id: int = 0
-
-
 class SetupWorker(QThread):
-    """Runs the (slow, networked) setup steps off the UI thread."""
+    """Runs the (slow, networked) setup steps off the UI thread.
+
+    A thin QThread wrapper: the actual orchestration lives in the GUI-free
+    ``setup_flow.run_setup`` so it can be tested without Qt or Windows. This
+    class only turns the log callback into a Qt signal and the result into the
+    ``done`` signal / ``server_registered`` flag the completion dialog reads."""
 
     line = Signal(str)
     done = Signal(bool)
@@ -116,292 +86,10 @@ class SetupWorker(QThread):
         # install skips it); read by the completion dialog so it stays truthful.
         self.server_registered = False
 
-    def _log(self, msg: str) -> None:
-        self.line.emit(msg)
-
     def run(self) -> None:
-        plan = self._plan
-        cfg = self._cfg
-        try:
-            if not self._preflight(plan):
-                self.done.emit(False)
-                return
-
-            self._log("Saving configuration…")
-            cfg.server_root = plan.server_root
-            cfg.steamcmd_path = plan.steamcmd_path
-            cfg.api_port = plan.api_port
-            cfg.service_name = plan.service_name
-            # Local backups always run — write the folder and cadence
-            # unconditionally; the off-site copy is the opt-in part.
-            cfg.backup_root = plan.backup_root
-            cfg.schedule.backup_hours = plan.backup_hours
-            cfg.backup_mirror_enabled = plan.backup_mirror_enabled
-            cfg.backup_mirror = plan.backup_mirror
-            # Write the enabled flag both ways: on a re-run the Discord group
-            # starts ticked when it was already on, so unticking it must actually
-            # turn the bot off — not silently leave the saved enabled=True. When
-            # disabling, the token, channel, and role are left in place so the bot
-            # can be switched back on later without re-entering them.
-            cfg.discord.enabled = plan.setup_discord
-            if plan.setup_discord:
-                cfg.discord.channel_id = plan.discord_channel_id
-                cfg.discord.admin_role_id = plan.discord_admin_id
-            cfg.save()
-            set_admin_password(plan.password)
-            if plan.setup_discord:
-                set_discord_token(plan.discord_token)
-
-            self._log(
-                f"  Backups: every {plan.backup_hours}h to {plan.backup_root}."
-            )
-            if plan.backup_mirror_enabled and plan.backup_mirror:
-                self._log(f"  Off-site copy: {plan.backup_mirror}.")
-            if plan.setup_discord:
-                self._log(
-                    "  Discord bot configured — it will come online shortly "
-                    "after palctl starts."
-                )
-
-            if plan.install_server:
-                self._install_server(cfg, plan)
-
-            self._log("Enabling the REST API in PalWorldSettings.ini…")
-            from ..serversetup import ensure_rest_api
-
-            ensure_rest_api(
-                cfg.live_ini, cfg.default_ini,
-                port=plan.api_port, password=plan.password,
-            )
-            self._log("  REST API enabled, port and admin password set.")
-
-            server_registered = False
-            if plan.register_server_service:
-                server_registered = self._register_server_service(cfg, plan)
-            self.server_registered = server_registered
-            if plan.daemon_startup == "login":
-                self._setup_login_startup()
-            elif plan.daemon_startup == "service":
-                self._register_daemon_service()
-
-            self._verify_and_report(plan, server_registered)
-
-            self._log("\n✅ Setup complete.")
-            self.done.emit(True)
-        except Exception as e:
-            self._log(f"\n❌ Setup failed: {e}")
-            self.done.emit(False)
-
-    def _preflight(self, plan: SetupPlan) -> bool:
-        """Run readiness checks. Returns False (abort) only on a blocking failure —
-        no disk space to install into, or no admin rights to register services.
-        Everything else is a warning the run can proceed past."""
-        from .. import preflight
-
-        self._log("Running readiness checks…")
-        checks = preflight.run_all(
-            plan.server_root, plan.api_port,
-            need_install=plan.install_server,
-            # Login startup needs no elevation; only a service does.
-            need_admin=plan.register_server_service or plan.daemon_startup == "service",
-        )
-        blocking = False
-        for c in checks:
-            self._log(f"  {c.icon} {c.name}: {c.detail}")
-            if c.ok is not False:
-                continue
-            if c.name.startswith("Visual C++") and plan.install_vcredist:
-                self._install_vcredist()
-            else:
-                self._log(f"     → {c.fix}")
-                if c.name in ("Disk space", "Administrator"):
-                    blocking = True
-        if blocking:
-            self._log("\n❌ Fix the ❌ item(s) above, then run setup again.")
-        return not blocking
-
-    def _install_vcredist(self) -> None:
-        from .. import preflight
-
-        code = preflight.install_vcredist(on_line=lambda m: self._log(f"     {m}"))
-        self._log(f"     Visual C++ runtime installer finished (exit {code}).")
-
-    def _install_server(self, cfg: Config, plan: SetupPlan) -> None:
-        import asyncio
-        import shutil
-
-        from .. import backups, procs, steamcmd
-        from ..inifile import is_blank
-
-        steam = Path(plan.steamcmd_path)
-        if not is_steamcmd(steam):
-            target_dir = steam.parent if plan.steamcmd_path else config_dir() / "steamcmd"
-            self._log(f"Downloading SteamCMD into {target_dir}…")
-            steam = steamcmd.download_steamcmd(target_dir)
-            cfg.steamcmd_path = str(steam)
-            cfg.save()
-            self._log(f"  SteamCMD ready at {steam}")
-
-        # Re-running setup over an existing install is supported (our own error
-        # messages say "run setup again"), so this path needs the same guards
-        # the scheduled update has: never let SteamCMD rewrite files under a
-        # running server, and keep the world and the tuned ini safe across
-        # `validate` (which blanks PalWorldSettings.ini).
-        if procs.find_process() is not None:
-            self._log("The server is running — stopping it before the update…")
-            try:
-                asyncio.run(procs.stop_service(plan.service_name))
-            except Exception as e:
-                self._log(f"  couldn't stop the service: {e}")
-            if procs.find_process() is not None:
-                raise RuntimeError(
-                    "The Palworld server is still running — updating its files "
-                    "now could corrupt them. Stop the server, then run setup "
-                    "again."
-                )
-
-        savegames = cfg.savegames_dir
-        if savegames.exists():
-            self._log("Backing up the world before the update…")
-            b = backups.create(savegames, Path(cfg.backup_root), "pre-update")
-            self._log(f"  world backed up to {b.path}")
-
-        ini_backup = steamcmd.backup_file(cfg.live_ini)
-
-        self._log(
-            f"Installing / updating the Palworld server into {plan.server_root} "
-            "(this downloads a few GB the first time)…"
-        )
-        self._last_pct = -1
-        try:
-            code = steamcmd.run_update(
-                steam, plan.server_root, app_id=cfg.app_id, on_line=self._steam_sink
-            )
-        finally:
-            if ini_backup and is_blank(cfg.live_ini):
-                shutil.copy2(ini_backup, cfg.live_ini)
-                self._log(
-                    "  SteamCMD blanked PalWorldSettings.ini — restored it from "
-                    "the pre-update backup."
-                )
-        self._log(f"  SteamCMD finished (exit {code}).")
-
-        # SteamCMD's exit code is famously unreliable, so verify the actual
-        # artifact: if the server files aren't there, the download didn't finish.
-        # Abort with the real reason instead of falling through to ensure_rest_api's
-        # misleading "is the server installed at that path?" error a step later.
-        if not cfg.default_ini.exists():
-            raise RuntimeError(
-                f"The Palworld server files aren't present after SteamCMD ran "
-                f"(exit {code}). The download didn't finish — usually a dropped "
-                "internet connection or the disk filling up. Check both, then run "
-                "setup again."
-            )
-
-    def _steam_sink(self, line: str) -> None:
-        """Turn SteamCMD's chatty output into a single, updating percentage so a
-        multi-GB download doesn't look frozen or spam the log."""
-        from .. import steamcmd
-
-        pct = steamcmd.parse_progress(line)
-        if pct is not None:
-            whole = int(pct)
-            if whole != self._last_pct:
-                self._last_pct = whole
-                self._log(f"  downloading… {whole}%")
-        elif line.strip():
-            self._log(f"  {line}")
-
-    def _verify_and_report(self, plan: SetupPlan, server_registered: bool) -> None:
-        """The payoff: actually start the server and confirm the REST API answers,
-        then print the address players connect to. 'It works' beats 'it's set up'.
-
-        Only starts/verifies when the server service was actually registered —
-        on a partial install (server files present but PalServer.exe missing)
-        registration is skipped, and starting a service that doesn't exist would
-        hang for the full timeout and then falsely claim it 'Registered'."""
-        import asyncio
-
-        from .. import netinfo, procs
-        from ..api import PalApi
-
-        if server_registered:
-            self._log("Starting the server to check it actually works…")
-            try:
-                asyncio.run(procs.start_service(plan.service_name))
-            except Exception as e:
-                self._log(f"  couldn't start the service: {e}")
-
-            self._log("  waiting for the server to answer (this can take a minute)…")
-            api = PalApi("127.0.0.1", plan.api_port, plan.password)
-            ok = False
-            try:
-                ok = asyncio.run(api.wait_until_alive(timeout=240))
-            except Exception as e:
-                self._log(f"  REST check error: {e}")
-            self._log(
-                "  ✅ Server is up and answering — it works."
-                if ok
-                else "  ⚠️ Registered, but the server hasn't answered yet. Give "
-                "it a minute (Palworld is slow to boot) and watch the Dashboard. "
-                "If it never answers, confirm RESTAPIEnabled=True landed in the "
-                "live PalWorldSettings.ini under Saved/Config — not the Default "
-                "one — and check the log."
-            )
-
-        lan = netinfo.lan_ip()
-        pub = netinfo.public_ip()
-        port = netinfo.GAME_PORT_DEFAULT
-        self._log("\nTell your friends to connect to:")
-        if lan:
-            self._log(f"  On your network:   {lan}:{port}")
-        if pub:
-            self._log(f"  Over the internet:  {pub}:{port}")
-        self._log(
-            f"  For internet play you must forward UDP port {port} on your router "
-            "to this PC — palctl can't do that part for you."
-        )
-
-    def _register_server_service(self, cfg: Config, plan: SetupPlan) -> bool:
-        """Register the PalServer Windows service. Returns False (skipped) when
-        PalServer.exe isn't there yet, so the caller doesn't try to start a
-        service that was never created."""
-        from .. import winservice
-
-        exe = Path(plan.server_root) / "PalServer.exe"
-        if not exe.exists():
-            self._log(
-                f"  ⚠️ {exe} not found — skipping the server service. Install the "
-                "server (tick “Install / update the server”) or fix the server "
-                "root, then run setup again."
-            )
-            return False
-        self._log(f"Registering the '{plan.service_name}' Windows service…")
-        nssm = winservice.ensure_nssm(config_dir() / "bin")
-        winservice.install_service(
-            nssm, plan.service_name, exe, PALSERVER_ARGS, plan.server_root, start=False
-        )
-        self._log(f"  Service '{plan.service_name}' registered.")
-        return True
-
-    def _register_daemon_service(self) -> None:
-        from .. import daemon
-
-        self._log(f"Registering the '{daemon.SERVICE_NAME}' Windows service…")
-        daemon.install_service()
-        self._log(f"  Service '{daemon.SERVICE_NAME}' registered and started.")
-
-    def _setup_login_startup(self) -> None:
-        from .. import daemon
-
-        self._log("Setting palctl to start when you log in (no password needed)…")
-        daemon.install_startup()
-        # Register-only would wait for the next login; start it now so the
-        # dashboard works immediately.
-        if daemon.start_detached():
-            self._log("  Done — palctl is running now and will start at each login.")
-        else:
-            self._log("  Done — palctl will start at your next login.")
+        result = run_setup(self._cfg, self._plan, self.line.emit)
+        self.server_registered = result.server_registered
+        self.done.emit(result.ok)
 
 
 class SetupWizard(QDialog):

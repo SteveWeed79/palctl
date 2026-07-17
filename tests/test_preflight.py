@@ -6,6 +6,7 @@ raising."""
 import socket
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -110,3 +111,23 @@ def test_single_instance_fails_and_names_pids_when_two_running(monkeypatch):
     assert c.ok is False
     assert "1000" in c.detail and "2000" in c.detail  # points at the culprits
     assert c.fix  # tells them to disable the extra service
+
+
+def test_vcredist_signature_gate_fails_closed_on_tamper():
+    # The bytes don't match a signature that should be there -> refuse to run it.
+    assert preflight._signature_is_tampered("HashMismatch") is True
+    assert preflight._signature_is_tampered("NotSigned") is True
+    assert preflight._signature_is_tampered("notsigned") is True  # case-insensitive
+
+
+def test_vcredist_signature_gate_fails_open_on_unknown():
+    # A machine that just can't verify (missing certs -> NotTrusted, no
+    # PowerShell -> "") must still be able to install the runtime it needs.
+    for status in ("Valid", "", "NotTrusted", "UnknownError"):
+        assert preflight._signature_is_tampered(status) is False
+
+
+def test_authenticode_status_is_empty_off_windows():
+    if sys.platform.startswith("win"):
+        return  # on Windows it shells out to PowerShell; nothing to assert here
+    assert preflight._authenticode_status(Path("whatever.exe")) == ""

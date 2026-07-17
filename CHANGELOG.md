@@ -47,6 +47,21 @@ Installers for every release are on the
     cheap cold storage). New `Copies to keep (mirror)` setting; `0` = match the
     local `Backups to keep` count. Local retention is now editable in the GUI
     too.
+- **The watchdog can now force-kill a server that ignores the stop.** A truly
+  wedged `PalServer` — the classic memory-leak hang — can sit in `STOP_PENDING`
+  forever, and every automatic recovery (memory watchdog, crash auto-recovery,
+  scheduled/pre-emptive restart) was reduced to the same ineffective service
+  stop, retried each cooldown. Those unattended restarts now escalate when the
+  stop times out: `terminate()` the server process, then a hard `kill()` if it
+  survives, then confirm the service reached STOPPED — with an event at each
+  step so it's clear a hard kill happened (a world save is attempted first). The
+  user's own **Stop** button is unchanged: it still reports an honest failure so
+  a human can decide, rather than force-killing behind your back.
+- **Releases now include version-stamped downloads.** Alongside the canonical
+  `palctl-setup.exe` / `palctl-portable.zip` (unchanged, so winget and the docs
+  still resolve them), each release also carries `palctl-setup-<version>.exe` and
+  `palctl-portable-<version>.zip`, so a saved file's version is obvious from its
+  name.
 
 ### Changed
 - **Local backups always run, at least once a day.** Local backups are the
@@ -77,6 +92,40 @@ Installers for every release are on the
   smaller frame (the Downloads folder, details view, small/medium icons) fell
   back to the generic-exe icon while 256px contexts looked fine. Frames below
   256 are now classic 32-bit BMPs, per the ICO spec.
+- **A broken system keyring no longer crash-loops the daemon.** On a box with a
+  broken `cryptography` backend, reading the admin password made keyring's pyo3
+  layer raise a `PanicException` — which derives from `BaseException`, so it
+  slipped past the "reads must never crash the daemon" guard and killed the
+  process before it even started, which under NSSM/systemd is a restart loop.
+  Secret reads now survive it, fall back to the ini admin password, and log the
+  `PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring` workaround. Saving a
+  secret still surfaces the error, as before.
+- **The daemon API answers malformed requests with a useful 4xx.** A control
+  action missing its body field (`kick`/`ban`/`unban`/`announce`/`restore`) used
+  to return `500 {"error": "'user_id'"}` — a bare `KeyError`; it now returns
+  `400 {"error": "missing required field: user_id"}`, and a non-JSON or
+  non-object body gets a clear 400 too. `/favicon.ico`, which browsers fetch on
+  their own, is served instead of returning 401 and littering the console with a
+  spurious auth error on every dashboard visit.
+- **`SHA256SUMS.txt` on the Releases page now verifies on Linux/macOS.** It was
+  written with CRLF line endings, which `sha256sum -c` / `shasum -c` reject with
+  "no properly formatted checksum lines"; it's now LF, with lower-cased hashes
+  in the exact `sha256sum` on-disk format.
+
+### Security
+- **The NSSM download is now pinned to a checksum.** `ensure_nssm` fetched
+  `nssm-2.24.zip` from nssm.cc with no verification and then registered the
+  unpacked binary as a LocalSystem service — so a compromised nssm.cc or a
+  man-in-the-middle on that download was a path to SYSTEM-level code execution.
+  The download is now verified against a hard-coded SHA-256 (NSSM 2.24 is
+  immutable) and refused if it doesn't match. The Visual C++ redistributable,
+  whose Microsoft `aka.ms` URL is evergreen and so can't be hash-pinned, now has
+  its Authenticode signature checked before it runs: a positively tampered
+  installer is refused, while a machine that simply can't verify still installs.
+- **The release workflow pins its GitHub Actions by commit SHA.** The workflow
+  that builds and attaches the shipped binaries runs with `contents: write` and
+  used mutable tags (`@v4`, `@v2`); each is now pinned to a full commit SHA, so a
+  retargeted tag can't slip new code into a release build.
 
 ## [1.0.0] — 2026-07-15
 

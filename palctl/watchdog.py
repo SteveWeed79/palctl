@@ -184,7 +184,12 @@ class Watchdog:
                 pass
 
             await asyncio.sleep(warn + 15)
-            came_back = await self._control.restart_cycle()
+            came_back = await self._control.restart_cycle(
+                escalate=True,
+                on_escalate=lambda m: self._bus.emit(
+                    Event("watchdog", f"🔨 {m}", {"action": "force_stop"})
+                ),
+            )
             self._last_restart = datetime.now(UTC)
             self._over = 0
             self._hold_notified = False

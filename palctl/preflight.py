@@ -17,6 +17,7 @@ from __future__ import annotations
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import urllib.request
 from dataclasses import dataclass
@@ -200,6 +201,37 @@ def run_all(
     return checks
 
 
+def _authenticode_status(path: Path) -> str:
+    """The Windows Authenticode signature status of `path` ('Valid',
+    'HashMismatch', 'NotSigned', …), lower-cased. Returns '' when it can't be
+    determined — not on Windows, no PowerShell, or any error — which callers
+    treat as 'unknown', never as 'bad'."""
+    if not sys.platform.startswith("win"):
+        return ""
+    try:
+        out = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                f"(Get-AuthenticodeSignature -LiteralPath '{path}').Status",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        return out.stdout.strip().lower()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _signature_is_tampered(status: str) -> bool:
+    """Whether to refuse an installer based on its signature status. Fail CLOSED
+    only on a positive tamper signal (the bytes don't match a signature that
+    should be there); fail OPEN on anything else — a machine that simply can't
+    verify (missing PowerShell, an incomplete cert store → NotTrusted, offline)
+    must still be able to install the runtime it needs. The evergreen aka.ms URL
+    can't be hash-pinned like NSSM, so the Microsoft signature is the integrity
+    anchor we have."""
+    return status.strip().lower() in {"hashmismatch", "notsigned"}
+
+
 def install_vcredist(on_line=None) -> int:
     """Download and silently install the VC++ x64 runtime. Windows-only; returns
     the installer's exit code."""
@@ -208,10 +240,21 @@ def install_vcredist(on_line=None) -> int:
     try:
         if on_line:
             on_line("Downloading the Visual C++ runtime…")
-        # Timeout so a hung CDN can't stall the wizard indefinitely. Integrity
-        # relies on the TLS connection to Microsoft's aka.ms host.
+        # Timeout so a hung CDN can't stall the wizard indefinitely.
         with urllib.request.urlopen(VCREDIST_URL, timeout=120) as resp, path.open("wb") as f:
             shutil.copyfileobj(resp, f)
+        # We can't pin a checksum (aka.ms is evergreen — Microsoft reissues this
+        # exe every servicing update), so verify its Authenticode signature
+        # before running it: refuse a positively tampered installer, but proceed
+        # when the signature just can't be checked (see _signature_is_tampered).
+        status = _authenticode_status(path)
+        if _signature_is_tampered(status):
+            raise RuntimeError(
+                "The downloaded Visual C++ runtime failed Authenticode "
+                f"verification (signature status: {status}). Refusing to run a "
+                "possibly tampered installer — check your network/proxy for "
+                "interference and try again."
+            )
         if on_line:
             on_line("Installing the Visual C++ runtime…")
         return subprocess.run(

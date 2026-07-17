@@ -39,6 +39,7 @@ MODULES = [
     "palctl.systemd",
     "palctl.profiles",
     "palctl.serversetup",
+    "palctl.setup_flow",
     "palctl.preflight",
     "palctl.netinfo",
     "palctl.localauth",

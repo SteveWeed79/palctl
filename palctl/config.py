@@ -233,6 +233,26 @@ def _get_secret(name: str) -> str:
         return keyring.get_password(SERVICE_ID, name) or ""
     except keyring.errors.KeyringError:
         return ""
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:  # noqa: BLE001
+        # A *broken* keyring backend (not keyring itself) can fail outside the
+        # Exception hierarchy, sailing past the guard above. The one seen in the
+        # wild: a system `cryptography` with a missing _cffi_backend makes pyo3
+        # raise pyo3_runtime.PanicException, which derives from BaseException.
+        # That would kill the daemon before asyncio.run — a crash loop under
+        # NSSM/systemd. Reads must never do that (see the module note above), so
+        # log the workaround and fall back to "no secret".
+        logging.getLogger("palctl.config").warning(
+            "keyring backend failed reading %r (%s: %s); treating as no secret. "
+            "If the system keyring is broken, set "
+            "PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring in the daemon's "
+            "environment.",
+            name,
+            type(e).__name__,
+            e,
+        )
+        return ""
 
 
 def set_admin_password(password: str) -> None:

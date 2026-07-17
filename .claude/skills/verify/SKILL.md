@@ -30,7 +30,7 @@ PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring python -m palctl.cli status
 
 Gotchas:
 - GUI (PySide6) does not import here — container lacks libEGL; CI covers it.
-- `/favicon.ico` 401s by design (token gate) — harmless console noise.
+- `/favicon.ico` is served (200, an SVG) without a token, so no console noise.
 - Anything calling service control reads "UNKNOWN" (no systemd in container).
 - A real `stop`/`start` action blocks up to 120 s waiting on service state —
   don't drive it live here.

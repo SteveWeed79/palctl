@@ -10,11 +10,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest]
-        python: ["3.11", "3.12"]
+        # requires-python is ">=3.11"; test every version we claim to support
+        # rather than stopping at 3.12 with the upper end untested.
+        python: ["3.11", "3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: ${{ matrix.python }}
       # The test suite covers the platform-neutral core (ini parser, backups,
@@ -24,13 +26,17 @@ jobs:
       # test_daemon_helpers.py — the auth token gate and crash-auto-recovery
       # tests — silently skips. The GUI stays out, so PySide6 isn't needed.
       - run: pip install httpx psutil keyring aiohttp discord.py pytest
+      # discord.py imports the stdlib `audioop`, which was removed in 3.13; the
+      # audioop-lts backport puts it back so the bot module still imports.
+      - if: matrix.python == '3.13'
+        run: pip install audioop-lts
       - run: pytest -v
 
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.11"
       - run: pip install ruff
@@ -43,10 +49,10 @@ jobs:
     # system libs even just to import under the offscreen platform.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
         with:
           fetch-depth: 0   # setuptools-scm needs tags/history to resolve the version
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.12"
       - name: Install Qt runtime libraries for headless PySide6
