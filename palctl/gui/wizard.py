@@ -89,11 +89,13 @@ class SetupPlan:
     # key, the default), "service" (Windows service, starts on boot), or "none".
     daemon_startup: str
     service_name: str
-    # Optional sections — only written when the user ticked their group. Left
-    # off, the wizard doesn't touch the corresponding config at all.
-    configure_backups: bool = False
+    # Backups. Local always runs (folder + cadence written unconditionally); the
+    # off-site copy is the opt-in part, gated by backup_mirror_enabled.
     backup_root: str = ""
+    backup_hours: int = 6
+    backup_mirror_enabled: bool = False
     backup_mirror: str = ""
+    # Discord is optional — only written when its section is ticked.
     setup_discord: bool = False
     discord_token: str = ""
     discord_channel_id: int = 0
@@ -130,9 +132,12 @@ class SetupWorker(QThread):
             cfg.steamcmd_path = plan.steamcmd_path
             cfg.api_port = plan.api_port
             cfg.service_name = plan.service_name
-            if plan.configure_backups:
-                cfg.backup_root = plan.backup_root
-                cfg.backup_mirror = plan.backup_mirror
+            # Local backups always run — write the folder and cadence
+            # unconditionally; the off-site copy is the opt-in part.
+            cfg.backup_root = plan.backup_root
+            cfg.schedule.backup_hours = plan.backup_hours
+            cfg.backup_mirror_enabled = plan.backup_mirror_enabled
+            cfg.backup_mirror = plan.backup_mirror
             if plan.setup_discord:
                 cfg.discord.enabled = True
                 cfg.discord.channel_id = plan.discord_channel_id
@@ -142,10 +147,11 @@ class SetupWorker(QThread):
             if plan.setup_discord:
                 set_discord_token(plan.discord_token)
 
-            if plan.configure_backups:
-                self._log(f"  Backups will be saved to {plan.backup_root}.")
-                if plan.backup_mirror:
-                    self._log(f"  Off-site mirror: {plan.backup_mirror}.")
+            self._log(
+                f"  Backups: every {plan.backup_hours}h to {plan.backup_root}."
+            )
+            if plan.backup_mirror_enabled and plan.backup_mirror:
+                self._log(f"  Off-site copy: {plan.backup_mirror}.")
             if plan.setup_discord:
                 self._log(
                     "  Discord bot configured — it will come online shortly "
@@ -411,8 +417,8 @@ class SetupWizard(QDialog):
             "can — fix anything with a red ✗, then run setup.\n\n"
             "The Palworld dedicated server itself comes from Steam. If it isn't "
             "installed yet, tick “Install / update the server” and this will fetch "
-            "it with SteamCMD for you. The last two sections — off-site backups "
-            "and the Discord bot — are optional; leave them unchecked to skip."
+            "it with SteamCMD for you. Backups run automatically once set up; "
+            "off-site copies and the Discord bot are optional extras below."
             if first_run
             else "Re-run any part of setup. Detected paths are pre-filled."
         )
@@ -531,45 +537,65 @@ class SetupWizard(QDialog):
         root.addLayout(buttons)
 
     def _build_backups_group(self, cfg: Config) -> QGroupBox:
-        """Optional. Ticked (the default), the wizard writes the backup folder
-        and an off-site mirror; unticked, it leaves backup config untouched.
-        Default-on and pre-filled with a folder that exists, because scheduled
-        backups run by default and the built-in D:\\ default fails on a box
-        without that drive."""
-        bk = QGroupBox("Back up my world  —  optional, recommended")
-        bk.setCheckable(True)
-        bk.setChecked(True)
+        """Local backups always run — this group sets where and how often, and
+        offers an optional off-site copy. Not checkable, unlike Discord: backups
+        are the safety net, not something to skip. Pre-filled with a folder that
+        exists, because scheduled backups run by default and the built-in D:\\
+        default silently fails on a box without that drive."""
+        bk = QGroupBox("Backups")
         bkf = QFormLayout(bk)
         self.backup_root = PathPicker(_default_backup_dir(cfg), pick_file=False)
         bkf.addRow("Backup folder", self.backup_root)
+
+        # Capped at 24h: local backups always happen at least once a day.
+        self.backup_hours = NoScrollSpinBox()
+        self.backup_hours.setRange(1, 24)
+        self.backup_hours.setSuffix(" h")
+        self.backup_hours.setValue(min(24, max(1, cfg.schedule.backup_hours)))
+        self.backup_hours.setToolTip(
+            "Local backups always run — this is only how often. At least once a "
+            "day; pick anything more frequent."
+        )
+        bkf.addRow("Back up every", self.backup_hours)
+
+        # Off-site copy: opt-in, off by default. The location can be typed while
+        # disabled, but only takes effect once the box is ticked.
+        self.mirror_enabled = QCheckBox(
+            "Also copy each backup off-site (survives a dead disk)"
+        )
+        self.mirror_enabled.setChecked(cfg.backup_mirror_enabled)
+        bkf.addRow(self.mirror_enabled)
 
         # Not a PathPicker: an rclone remote like gdrive:Pal isn't a filesystem
         # path. Test proves the target works before backups rely on it.
         mirror_row = QHBoxLayout()
         self.backup_mirror = QLineEdit(cfg.backup_mirror)
         self.backup_mirror.setPlaceholderText(
-            r"Off — or D:\Backups, \\nas\pal, or gdrive:PalworldBackups"
+            r"D:\Backups, \\nas\pal, or gdrive:PalworldBackups"
         )
         self._mirror_test = QPushButton("Test")
         self._mirror_test.clicked.connect(self._test_mirror)
         mirror_row.addWidget(self.backup_mirror, 1)
         mirror_row.addWidget(self._mirror_test)
-        mirror_widget = QWidget()
-        mirror_widget.setLayout(mirror_row)
-        bkf.addRow("Off-site mirror", mirror_widget)
+        self._mirror_widget = QWidget()
+        self._mirror_widget.setLayout(mirror_row)
+        bkf.addRow("Off-site location", self._mirror_widget)
 
         bk_help = QLabel(
-            "A second copy survives a dead disk. For cloud (Google Drive, "
-            'Dropbox, S3…), install <a href="https://rclone.org">rclone</a>, run '
+            "An off-site copy — another disk, a network share, or the cloud — "
+            "survives this disk failing. For cloud (Google Drive, Dropbox, S3…), "
+            'install <a href="https://rclone.org">rclone</a>, run '
             "<code>rclone config</code>, then enter a dedicated folder like "
             "<code>gdrive:PalworldBackups</code> — palctl only ever touches that "
-            "one folder. Use <b>Test</b> to check it first. Leave the mirror "
-            "blank to keep backups on this disk only."
+            "one folder. Use <b>Test</b> to check it first."
         )
         bk_help.setOpenExternalLinks(True)
         bk_help.setWordWrap(True)
         bkf.addRow("", bk_help)
-        self._backups_group = bk
+
+        # Grey out the location until off-site is ticked.
+        self.mirror_enabled.toggled.connect(self._mirror_widget.setEnabled)
+        self._mirror_widget.setEnabled(self.mirror_enabled.isChecked())
         return bk
 
     def _build_discord_group(self, cfg: Config) -> QGroupBox:
@@ -707,6 +733,19 @@ class SetupWizard(QDialog):
             )
             return
 
+        # Off-site copy is opt-in: if ticked, it needs a location to copy to.
+        mirror_enabled = self.mirror_enabled.isChecked()
+        backup_mirror = self.backup_mirror.text().strip()
+        if mirror_enabled and not backup_mirror:
+            QMessageBox.warning(
+                self, "Off-site location needed",
+                "You ticked “Also copy each backup off-site”, but there's no "
+                "location. Enter another disk, a network share, or a cloud "
+                "remote (remote:path) — or untick it to keep backups on this "
+                "disk only.",
+            )
+            return
+
         # Optional Discord section: only validate its fields when it's ticked,
         # so junk left in an unused section can't block setup.
         setup_discord = self._discord_group.isChecked()
@@ -743,9 +782,10 @@ class SetupWizard(QDialog):
             register_server_service=self.reg_server.isChecked(),
             daemon_startup=self._daemon_startup(),
             service_name=self._cfg.service_name or "PalServer",
-            configure_backups=self._backups_group.isChecked(),
             backup_root=self.backup_root.text().strip(),
-            backup_mirror=self.backup_mirror.text().strip(),
+            backup_hours=self.backup_hours.value(),
+            backup_mirror_enabled=mirror_enabled,
+            backup_mirror=backup_mirror,
             setup_discord=setup_discord,
             discord_token=discord_token,
             discord_channel_id=channel_id,
@@ -807,8 +847,8 @@ class SetupWizard(QDialog):
                 "The Discord bot is configured — it comes online a few seconds "
                 "after palctl starts."
             )
-        if plan and plan.configure_backups and plan.backup_mirror:
-            extras.append("Off-site backup mirror is set up.")
+        if plan and plan.backup_mirror_enabled and plan.backup_mirror:
+            extras.append("Off-site backup copies are set up.")
         extra = ("\n\n" + " ".join(extras)) if extras else ""
         return lead + extra + tail
 

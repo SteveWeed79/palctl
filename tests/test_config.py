@@ -49,6 +49,31 @@ def test_unknown_keys_from_other_versions_ignored(cfg_path: Path):
     assert loaded.watchdog.memory_limit_mb == 9000
 
 
+def test_pre_toggle_config_with_a_mirror_path_stays_enabled(cfg_path: Path):
+    # Back-compat: a config written before the off-site on/off switch existed had
+    # a mirror path but no `backup_mirror_enabled` key. A set path used to mean
+    # "on", so an upgrade must keep mirroring — not silently stop.
+    cfg = Config.from_dict({"backup_mirror": "gdrive:PalworldBackups"})
+    assert cfg.backup_mirror == "gdrive:PalworldBackups"
+    assert cfg.backup_mirror_enabled is True
+
+
+def test_config_without_a_mirror_defaults_off_site_off(cfg_path: Path):
+    cfg = Config.from_dict({"api_port": 9000})
+    assert cfg.backup_mirror == ""
+    assert cfg.backup_mirror_enabled is False
+
+
+def test_explicit_off_site_disable_is_respected_even_with_a_path(cfg_path: Path):
+    # An explicit False must win — disabling off-site backups keeps the path but
+    # stops the copying, and reloading the config must not flip it back on.
+    cfg = Config.from_dict(
+        {"backup_mirror": "gdrive:PalworldBackups", "backup_mirror_enabled": False}
+    )
+    assert cfg.backup_mirror == "gdrive:PalworldBackups"
+    assert cfg.backup_mirror_enabled is False
+
+
 def test_corrupt_config_quarantined_not_fatal(cfg_path: Path):
     cfg_path.write_text("{not json", encoding="utf-8")
     loaded = Config.load()

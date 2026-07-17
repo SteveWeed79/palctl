@@ -76,6 +76,9 @@ class ScheduleConfig:
     daily_restart: bool = True
     daily_restart_at: str = "06:00"
     autosave_minutes: int = 15
+    # Local backups always run — this is only how often. Capped at 24h (the GUI
+    # and the scheduler both enforce it) so backups happen at least once a day;
+    # the admin can choose anything more frequent.
     backup_hours: int = 6
     backup_retain: int = 24
     # How many backups to keep on the mirror (second copy). Cloud storage costs
@@ -115,12 +118,18 @@ class Config:
     server_root: str = r"C:\steamcmd\steamapps\common\PalServer"
     steamcmd_path: str = r"C:\steamcmd\steamcmd.exe"
     backup_root: str = r"D:\PalworldBackups"
-    # Optional second copy of every backup. Backups on the server's own disk
-    # don't survive the disk. Either a local path (another disk or a network
-    # share) or an rclone remote for off-site/cloud storage, written as
+    # Optional off-site copy of every backup. Local backups always run (they're
+    # the safety net); this is the *second*, off-machine copy, because backups on
+    # the server's own disk don't survive that disk. Either a local path (another
+    # disk or a network share) or an rclone remote for cloud storage, written as
     # `remote:path` — e.g. `gdrive:PalworldBackups` after `rclone config`.
-    # Empty = off.
+    #
+    # `backup_mirror_enabled` is the on/off switch, kept separate from the path so
+    # off-site backups can be turned off without losing the configured target —
+    # flip it back on later without re-typing the remote. Off by default; the path
+    # is only mirrored to when the switch is on AND non-empty.
     backup_mirror: str = ""
+    backup_mirror_enabled: bool = False
     service_name: str = "PalServer"
     app_id: str = "2394010"
 
@@ -165,7 +174,7 @@ class Config:
     def from_dict(cls, raw: dict) -> Config:
         """Build a Config from a raw dict, dropping keys from other versions and
         rebuilding the nested dataclasses. Shared by load() and profiles."""
-        return cls(
+        cfg = cls(
             **{
                 **_known(cls, raw, exclude=("watchdog", "schedule", "discord")),
                 "watchdog": WatchdogConfig(**_known(WatchdogConfig, raw.get("watchdog", {}))),
@@ -173,6 +182,13 @@ class Config:
                 "discord": DiscordConfig(**_known(DiscordConfig, raw.get("discord", {}))),
             }
         )
+        # Back-compat: a config written before the off-site on/off switch existed
+        # had a mirror path but no `backup_mirror_enabled` key. A set path used to
+        # mean "on", so treat it that way — otherwise an upgrade would silently
+        # stop mirroring the backups the user was already sending off-site.
+        if "backup_mirror_enabled" not in raw and cfg.backup_mirror:
+            cfg.backup_mirror_enabled = True
+        return cfg
 
     @classmethod
     def load(cls) -> Config:

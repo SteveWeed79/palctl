@@ -19,6 +19,14 @@ from .inifile import is_blank
 COUNTDOWN_MARKS = (600, 300, 60, 30, 10)
 
 
+def backup_interval_hours(raw: int) -> int:
+    """Effective hours between local backups. Capped at 24 so local backups —
+    the safety net — always happen at least once a day, even if a stale or
+    hand-edited config asks for less. A value <= 0 is the explicit "off" escape
+    hatch (not exposed in the GUI) and is preserved as-is."""
+    return raw if raw <= 0 else min(24, max(1, raw))
+
+
 def next_daily(now: datetime, time_str: str, fallback_hour: int = 6) -> datetime:
     """The next occurrence of HH:MM after `now`. A malformed time falls back to
     `fallback_hour`:00 rather than raising, so bad config can't kill the loop."""
@@ -85,7 +93,10 @@ class Scheduler:
 
     async def _backup_loop(self) -> None:
         while True:
-            hours = self._cfg.schedule.backup_hours
+            # Local backups run at least once a day: the interval is capped at
+            # 24h so a stale or hand-edited config can't push them below the daily
+            # floor the GUI enforces.
+            hours = backup_interval_hours(self._cfg.schedule.backup_hours)
             await asyncio.sleep(max(1, hours) * 3600)
             if not self._cfg.schedule.enabled or hours <= 0:
                 continue
@@ -156,7 +167,7 @@ class Scheduler:
         mirror target is a `remote:path` string instead of a local path. A mirror
         failure must not fail the backup — the primary copy already exists."""
         root = self._cfg.backup_mirror
-        if not root:
+        if not (self._cfg.backup_mirror_enabled and root):
             return False
         # The mirror can keep a different number of copies than the local disk
         # (cloud costs money, or cold storage is cheap). 0 = match local.

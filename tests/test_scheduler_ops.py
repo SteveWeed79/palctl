@@ -145,6 +145,7 @@ def test_update_server_mirrors_backup_when_configured(tmp_path, monkeypatch):
     cfg.server_root = str(tmp_path / "server")
     cfg.backup_root = str(tmp_path / "backups")
     cfg.backup_mirror = str(tmp_path / "mirror")
+    cfg.backup_mirror_enabled = True
     sg = cfg.savegames_dir
     sg.mkdir(parents=True)
     (sg / "Level.sav").write_bytes(b"world")
@@ -173,6 +174,7 @@ def test_mirror_dispatches_to_rclone_for_a_remote_target(tmp_path, monkeypatch):
 
     cfg = Config()
     cfg.backup_mirror = "gdrive:PalworldBackups"
+    cfg.backup_mirror_enabled = True
     cfg.schedule.backup_retain = 7
 
     calls: list = []
@@ -205,6 +207,7 @@ def test_mirror_retain_overrides_local_retention(tmp_path, monkeypatch):
 
     cfg = Config()
     cfg.backup_mirror = "gdrive:PalworldBackups"
+    cfg.backup_mirror_enabled = True
     cfg.schedule.backup_retain = 24
     cfg.schedule.mirror_retain = 5  # keep fewer off-site
 
@@ -227,6 +230,7 @@ def test_mirror_retain_zero_falls_back_to_local_retention(tmp_path, monkeypatch)
 
     cfg = Config()
     cfg.backup_mirror = str(tmp_path / "mirror")
+    cfg.backup_mirror_enabled = True
     cfg.schedule.backup_retain = 12
     cfg.schedule.mirror_retain = 0  # default: match local
 
@@ -250,6 +254,7 @@ def test_mirror_rclone_failure_is_non_fatal(tmp_path, monkeypatch):
 
     cfg = Config()
     cfg.backup_mirror = "gdrive:PalworldBackups"
+    cfg.backup_mirror_enabled = True
 
     def _fail(*a, **k):
         raise RuntimeError("rclone: quota exceeded")
@@ -263,6 +268,31 @@ def test_mirror_rclone_failure_is_non_fatal(tmp_path, monkeypatch):
 
     assert ok is False
     assert any("quota exceeded" in e.message for e in errors)
+
+
+def test_mirror_skipped_when_off_site_disabled(tmp_path, monkeypatch):
+    # A configured mirror target that's switched off must not be copied to — the
+    # path is kept for later, but backup_mirror_enabled=False means no off-site
+    # copy and no rclone/local-mirror call at all.
+    from palctl import backups
+
+    cfg = Config()
+    cfg.backup_mirror = "gdrive:PalworldBackups"
+    cfg.backup_mirror_enabled = False
+
+    def _boom(*a, **k):
+        raise AssertionError("mirror ran while off-site backups were disabled")
+    monkeypatch.setattr(sched_mod.rclone, "mirror", _boom)
+    monkeypatch.setattr(sched_mod.backups, "mirror", _boom)
+
+    bus = EventBus()
+    errors = _collect(bus)
+    b = backups.Backup("2026-07-15_10-00-00-scheduled", tmp_path / "b", 1.0,
+                       __import__("datetime").datetime.now())
+    ok = _run(sched_mod.Scheduler(cfg, FakeApi(), bus)._mirror(b))
+
+    assert ok is False
+    assert not errors  # disabled is a clean no-op, not an error
 
 
 def test_update_server_aborts_when_server_wont_stop(tmp_path, monkeypatch):

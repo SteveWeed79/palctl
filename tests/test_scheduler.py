@@ -1,8 +1,26 @@
 from datetime import datetime
 
+import pytest
+
 from palctl.config import Config
 from palctl.events import EventBus
-from palctl.scheduler import Scheduler, next_daily
+from palctl.scheduler import Scheduler, backup_interval_hours, next_daily
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (6, 6),    # a normal, more-frequent-than-daily choice is untouched
+        (1, 1),    # hourly is fine
+        (24, 24),  # exactly daily
+        (25, 24),  # anything over a day is pulled back to the daily floor
+        (48, 24),  # a stale pre-cap config, too
+        (0, 0),    # the explicit "off" sentinel is preserved
+        (-3, -3),  # negatives likewise
+    ],
+)
+def test_backup_interval_hours_enforces_daily_floor(raw, expected):
+    assert backup_interval_hours(raw) == expected
 
 
 def test_next_daily_later_today():
