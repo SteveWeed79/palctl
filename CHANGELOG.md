@@ -10,6 +10,8 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-07-17
+
 ### Added
 - **The first-run wizard now covers backups and the Discord bot.** A **Backups**
   section (a backup folder, how often, and an optional off-site copy with a
@@ -86,12 +88,6 @@ Installers for every release are on the
   rejected token that's since been fixed). The one remaining restart case is
   swapping the token of a bot that is already connected, and the save dialog
   now says exactly that.
-- **The installer (and frozen exes) show their icon everywhere in Explorer.**
-  `app-icon.ico` was written with every frame PNG-compressed, but Windows only
-  reads PNG icon frames at 256×256 — so any Explorer view that wanted a
-  smaller frame (the Downloads folder, details view, small/medium icons) fell
-  back to the generic-exe icon while 256px contexts looked fine. Frames below
-  256 are now classic 32-bit BMPs, per the ICO spec.
 - **A broken system keyring no longer crash-loops the daemon.** On a box with a
   broken `cryptography` backend, reading the admin password made keyring's pyo3
   layer raise a `PanicException` — which derives from `BaseException`, so it
@@ -126,6 +122,16 @@ Installers for every release are on the
   that builds and attaches the shipped binaries runs with `contents: write` and
   used mutable tags (`@v4`, `@v2`); each is now pinned to a full commit SHA, so a
   retargeted tag can't slip new code into a release build.
+
+## [1.0.1] — 2026-07-16
+
+### Fixed
+- **The installer (and frozen exes) show their icon everywhere in Explorer.**
+  `app-icon.ico` was written with every frame PNG-compressed, but Windows only
+  reads PNG icon frames at 256×256 — so any Explorer view that wanted a
+  smaller frame (the Downloads folder, details view, small/medium icons) fell
+  back to the generic-exe icon while 256px contexts looked fine. Frames below
+  256 are now classic 32-bit BMPs, per the ICO spec.
 
 ## [1.0.0] — 2026-07-15
 
