@@ -469,8 +469,16 @@ class Daemon:
                         {"action": "autorecover"},
                     )
                 )
-                # Stop first, in case it's hung rather than gone — then start clean.
-                ok = await self.control.restart_cycle(stop_delay=2)
+                # Stop first, in case it's hung rather than gone — then start
+                # clean. Escalate: an unreachable server is exactly the hang the
+                # plain service stop can't clear, so force-kill if it won't die.
+                ok = await self.control.restart_cycle(
+                    stop_delay=2,
+                    escalate=True,
+                    on_escalate=lambda m: self.bus.emit(
+                        Event("watchdog", f"🔨 {m}", {"action": "force_stop"})
+                    ),
+                )
                 await self.bus.emit(
                     Event(
                         "watchdog",

@@ -303,7 +303,12 @@ class Scheduler:
 
             await asyncio.sleep(prev)
             await self._control.save_best_effort(settle=3)
-            ok = await self._control.restart_cycle()
+            ok = await self._control.restart_cycle(
+                escalate=True,
+                on_escalate=lambda m: self._bus.emit(
+                    Event("restart", f"🔨 {m}", {"action": "force_stop"})
+                ),
+            )
             await self._bus.emit(
                 Event(
                     "restart",
@@ -329,7 +334,12 @@ class Scheduler:
         async with op:
             await self._bus.emit(Event("restart", f"🔁 {reason}"))
             await self._control.save_best_effort(settle=3)
-            ok = await self._control.restart_cycle()
+            ok = await self._control.restart_cycle(
+                escalate=True,
+                on_escalate=lambda m: self._bus.emit(
+                    Event("restart", f"🔨 {m}", {"action": "force_stop"})
+                ),
+            )
             await self._bus.emit(
                 Event(
                     "restart",

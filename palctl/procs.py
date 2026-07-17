@@ -176,3 +176,57 @@ async def stop_service(service_name: str) -> bool:
         return True
     await asyncio.to_thread(_run_capture, _action_command("stop", service_name))
     return await _wait_for(service_name, "STOPPED")
+
+
+async def wait_stopped(service_name: str, timeout: float = 60.0) -> bool:
+    """Wait for the service manager to report STOPPED, without re-issuing a stop.
+    Used by the force-kill escalation: once the process is dead, the SCM/systemd
+    catches up to STOPPED on its own."""
+    return await _wait_for(service_name, "STOPPED", timeout)
+
+
+# ---------------- force-kill escalation ----------------
+#
+# A truly wedged PalServer-Win64-Shipping.exe — the classic memory-leak hang —
+# can sit in STOP_PENDING forever, ignoring the SCM/systemd stop. When that
+# happens for an unattended caller (watchdog, auto-recovery, scheduled restart),
+# we escalate to signalling the process directly by the PID find_process()
+# already knows: terminate() first (SIGTERM on POSIX, so a healthy-enough server
+# can still flush and exit; on Windows this is TerminateProcess), then kill()
+# (SIGKILL) if it survives.
+
+
+def _signal_and_wait(proc: psutil.Process, *, hard: bool, timeout: float) -> bool:
+    """Send terminate()/kill() to a process and wait up to `timeout` for it to
+    actually exit. Returns True if it's gone. Never raises: a process that
+    vanished (on its own or from the signal) counts as success; a signal we
+    can't send (AccessDenied) falls through to the wait, which reports the truth."""
+    try:
+        proc.kill() if hard else proc.terminate()
+    except psutil.NoSuchProcess:
+        return True  # already gone — the goal
+    except psutil.Error:
+        pass  # couldn't signal (e.g. AccessDenied); the wait below tells the truth
+    try:
+        proc.wait(timeout=timeout)
+        return True
+    except psutil.TimeoutExpired:
+        pass
+    except psutil.NoSuchProcess:
+        return True
+    except psutil.Error:
+        pass
+    try:
+        return not proc.is_running()
+    except psutil.Error:
+        return False
+
+
+async def terminate_process(proc: psutil.Process, timeout: float = 10.0) -> bool:
+    """Graceful stop: terminate() the process and wait for it to go."""
+    return await asyncio.to_thread(_signal_and_wait, proc, hard=False, timeout=timeout)
+
+
+async def kill_process(proc: psutil.Process, timeout: float = 10.0) -> bool:
+    """Hard stop: kill() the process and wait for it to go."""
+    return await asyncio.to_thread(_signal_and_wait, proc, hard=True, timeout=timeout)
