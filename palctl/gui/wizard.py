@@ -138,8 +138,13 @@ class SetupWorker(QThread):
             cfg.schedule.backup_hours = plan.backup_hours
             cfg.backup_mirror_enabled = plan.backup_mirror_enabled
             cfg.backup_mirror = plan.backup_mirror
+            # Write the enabled flag both ways: on a re-run the Discord group
+            # starts ticked when it was already on, so unticking it must actually
+            # turn the bot off — not silently leave the saved enabled=True. When
+            # disabling, the token, channel, and role are left in place so the bot
+            # can be switched back on later without re-entering them.
+            cfg.discord.enabled = plan.setup_discord
             if plan.setup_discord:
-                cfg.discord.enabled = True
                 cfg.discord.channel_id = plan.discord_channel_id
                 cfg.discord.admin_role_id = plan.discord_admin_id
             cfg.save()
