@@ -201,6 +201,106 @@ def test_desired_running_tolerates_garbage_state(tmp_path, monkeypatch):
     assert daemon_mod._load_desired_running() is True  # fail open to normal behavior
 
 
+# ---------------- login-startup daemon replacement ----------------
+
+# start_detached is the login-startup counterpart to the service-reinstall fix:
+# any daemon already up is the OLD build/config, so it must be replaced, not
+# skipped. Order is the dangerous part — a leftover service registration must
+# go before the process is killed, or the service manager resurrects it.
+
+
+def _startup_env(monkeypatch, *, service: bool, reachable: bool) -> list[str]:
+    import subprocess
+
+    import palctl.winservice as winservice
+
+    calls: list[str] = []
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+    monkeypatch.setattr(winservice, "service_exists", lambda name: service)
+    monkeypatch.setattr(daemon_mod, "uninstall_service", lambda: calls.append("uninstall"))
+    monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: reachable)
+    monkeypatch.setattr(daemon_mod, "_stop_daemon_process", lambda: calls.append("stop"))
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: calls.append("spawn"))
+    return calls
+
+
+def test_start_detached_replaces_running_daemon(monkeypatch):
+    calls = _startup_env(monkeypatch, service=True, reachable=True)
+    assert daemon_mod.start_detached() is True
+    # Service first (its manager would resurrect a killed daemon and fight the
+    # new one over the port), then the process, then the fresh spawn.
+    assert calls == ["uninstall", "stop", "spawn"]
+
+
+def test_start_detached_fresh_spawn_touches_nothing(monkeypatch):
+    calls = _startup_env(monkeypatch, service=False, reachable=False)
+    assert daemon_mod.start_detached() is True
+    assert calls == ["spawn"]
+
+
+def test_start_detached_noop_off_windows(monkeypatch):
+    calls = _startup_env(monkeypatch, service=True, reachable=True)
+    monkeypatch.setattr(daemon_mod.sys, "platform", "linux")
+    assert daemon_mod.start_detached() is False
+    assert calls == []
+
+
+def _fake_conn(pid, port, status):
+    return types.SimpleNamespace(
+        pid=pid, status=status, laddr=types.SimpleNamespace(port=port)
+    )
+
+
+def _stop_daemon_env(monkeypatch):
+    import psutil
+
+    from palctl.client import DAEMON_PORT
+
+    listen = psutil.CONN_LISTEN
+    conns = [
+        _fake_conn(111, DAEMON_PORT, listen),  # the old daemon — must die
+        _fake_conn(222, 8212, listen),  # unrelated listener — untouched
+        _fake_conn(daemon_mod.os.getpid(), DAEMON_PORT, listen),  # never kill ourselves
+        _fake_conn(333, DAEMON_PORT, "ESTABLISHED"),  # a client, not the listener
+    ]
+    monkeypatch.setattr(psutil, "net_connections", lambda kind="tcp": conns)
+    monkeypatch.setattr(psutil, "Process", lambda pid: pid)
+
+
+def test_stop_daemon_process_kills_only_the_port_listener(monkeypatch):
+    from palctl import procs
+
+    _stop_daemon_env(monkeypatch)
+    terminated: list[int] = []
+
+    async def fake_terminate(proc, timeout=10.0):
+        terminated.append(proc)
+        return True
+
+    monkeypatch.setattr(procs, "terminate_process", fake_terminate)
+    daemon_mod._stop_daemon_process()
+    assert terminated == [111]
+
+
+def test_stop_daemon_process_escalates_to_kill(monkeypatch):
+    from palctl import procs
+
+    _stop_daemon_env(monkeypatch)
+    killed: list[int] = []
+
+    async def fake_terminate(proc, timeout=10.0):
+        return False  # survived SIGTERM/TerminateProcess
+
+    async def fake_kill(proc, timeout=10.0):
+        killed.append(proc)
+        return True
+
+    monkeypatch.setattr(procs, "terminate_process", fake_terminate)
+    monkeypatch.setattr(procs, "kill_process", fake_kill)
+    daemon_mod._stop_daemon_process()
+    assert killed == [111]
+
+
 # ---------------- reload-config vs. the Discord bot ----------------
 
 # The GUI's one save button hits /action/reload-config. The trap this pins:

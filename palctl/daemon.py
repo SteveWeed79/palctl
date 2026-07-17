@@ -991,17 +991,54 @@ def _daemon_reachable() -> bool:
         return s.connect_ex(("127.0.0.1", DAEMON_PORT)) == 0
 
 
+def _stop_daemon_process() -> None:
+    """Stop whatever process is serving the daemon control port, so a freshly
+    spawned daemon can bind it. Best-effort: anything we can't see or can't
+    kill is left alone rather than guessed at. Uses the same terminate → kill
+    ladder the server force-stop uses."""
+    import psutil
+
+    try:
+        conns = psutil.net_connections(kind="tcp")
+    except Exception:
+        return
+    pids = {
+        c.pid
+        for c in conns
+        if c.pid
+        and c.pid != os.getpid()
+        and c.status == psutil.CONN_LISTEN
+        and c.laddr
+        and c.laddr.port == DAEMON_PORT
+    }
+    for pid in pids:
+        try:
+            proc = psutil.Process(pid)
+            if not asyncio.run(procs.terminate_process(proc)):
+                asyncio.run(procs.kill_process(proc))
+        except Exception:
+            pass
+
+
 def start_detached() -> bool:
     """Launch the daemon now, in the background, hidden — used right after
     registering login startup so the user doesn't have to log out and back in
     first. Returns whether a daemon is running afterward. Windows-only.
 
-    Skips the spawn if one is already up (e.g. a leftover service), so switching
-    to login startup can't end up with two daemons fighting over the port."""
+    Re-running setup lands here too, and any daemon already up is the OLD
+    build/config — so it must be replaced, not skipped. Order matters: a
+    leftover *service* registration has to go first, because its manager would
+    resurrect anything we kill and the resurrected copy would fight the fresh
+    daemon over the port (it would also double-start the daemon at next boot).
+    Only then is it safe to stop a surviving detached daemon and spawn."""
     if not sys.platform.startswith("win"):
         return False
+    from . import winservice
+
+    if winservice.service_exists(SERVICE_NAME):
+        uninstall_service()
     if _daemon_reachable():
-        return True
+        _stop_daemon_process()
     import subprocess
 
     exe, args, app_dir = service_target()

@@ -68,7 +68,11 @@ Installers for every release are on the
   left the old process up: `systemctl start` no-ops on an active unit and
   `nssm start` no-ops on a running service, so the stale binary and settings kept
   running. Install now restarts on Linux (`systemctl restart`) and stops before
-  starting on Windows, so a reinstall picks up the new registration.
+  starting on Windows, so a reinstall picks up the new registration. The
+  Windows login-startup path had the same gap — it skipped the launch whenever
+  a daemon was already answering — and now replaces the running daemon instead,
+  removing any leftover daemon *service* registration first so the service
+  manager can't resurrect the old process (or double-start it at the next boot).
 - **CPU in `palctl status` (and the dashboard/bot) is no longer stuck at 0%.**
   Process metrics are sampled by re-finding PalServer on every poll, which handed
   psutil a brand-new `Process` object each time — and `cpu_percent(interval=None)`
