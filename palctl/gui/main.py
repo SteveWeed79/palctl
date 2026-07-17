@@ -600,22 +600,31 @@ class ConfigTab(QWidget):
         pf.addRow("Backup folder", self.backup_root)
         pf.addRow("Service name", self.service)
 
-        # Optional second copy of every backup. A local path (another disk or a
-        # \\server\share) OR an rclone remote (remote:path) for off-site/cloud
-        # storage. The Test button proves the target works before backups rely
-        # on it. Not a PathPicker: a remote like gdrive:Pal isn't a filesystem path.
+        # Local backups always run to the backup folder above. This is the
+        # optional *off-site* second copy: a local path (another disk or a
+        # \\server\share) OR an rclone remote (remote:path) for cloud storage.
+        # The enable switch is separate from the location so it can be turned off
+        # without losing the configured target. Not a PathPicker: a remote like
+        # gdrive:Pal isn't a filesystem path. Test proves the target works first.
+        self.mirror_enabled = QCheckBox(
+            "Also copy each backup off-site (survives a dead disk)"
+        )
+        self.mirror_enabled.setChecked(cfg.backup_mirror_enabled)
+        pf.addRow("Off-site backups", self.mirror_enabled)
         mirror_row = QHBoxLayout()
         self.backup_mirror = QLineEdit(cfg.backup_mirror)
         self.backup_mirror.setPlaceholderText(
-            r"Off — or D:\Backups, \\nas\pal, or gdrive:PalworldBackups"
+            r"D:\Backups, \\nas\pal, or gdrive:PalworldBackups"
         )
         self._mirror_test = QPushButton("Test")
         self._mirror_test.clicked.connect(self._test_mirror)
         mirror_row.addWidget(self.backup_mirror, 1)
         mirror_row.addWidget(self._mirror_test)
-        pf.addRow("Backup mirror", mirror_row)
+        self._mirror_row_widget = QWidget()
+        self._mirror_row_widget.setLayout(mirror_row)
+        pf.addRow("Off-site location", self._mirror_row_widget)
         mirror_help = QLabel(
-            'A second copy survives a dead disk. For cloud (Google Drive, '
+            "An off-site copy survives a dead disk. For cloud (Google Drive, "
             'Dropbox, S3…), install <a href="https://rclone.org">rclone</a>, run '
             "<code>rclone config</code>, then enter a dedicated folder like "
             "<code>gdrive:PalworldBackups</code> — palctl only ever touches that "
@@ -624,6 +633,9 @@ class ConfigTab(QWidget):
         mirror_help.setOpenExternalLinks(True)
         mirror_help.setWordWrap(True)
         pf.addRow("", mirror_help)
+        # Grey out the location until off-site is enabled.
+        self.mirror_enabled.toggled.connect(self._mirror_row_widget.setEnabled)
+        self._mirror_row_widget.setEnabled(self.mirror_enabled.isChecked())
         v.addWidget(paths)
 
         api = QGroupBox("REST API")
@@ -674,9 +686,14 @@ class ConfigTab(QWidget):
         hh, _, mm = cfg.schedule.daily_restart_at.partition(":")
         self.sch_time.setTime(QTime(int(hh), int(mm or 0)))
         self.sch_backup = NoScrollSpinBox()
-        self.sch_backup.setRange(1, 48)
+        # Capped at 24h so local backups always happen at least once a day.
+        self.sch_backup.setRange(1, 24)
         self.sch_backup.setSuffix(" h")
-        self.sch_backup.setValue(cfg.schedule.backup_hours)
+        self.sch_backup.setValue(min(24, max(1, cfg.schedule.backup_hours)))
+        self.sch_backup.setToolTip(
+            "Local backups always run — this is only how often. At least once a "
+            "day; pick anything more frequent."
+        )
         self.sch_retain = NoScrollSpinBox()
         self.sch_retain.setRange(1, 999)
         self.sch_retain.setValue(cfg.schedule.backup_retain)
@@ -838,6 +855,7 @@ class ConfigTab(QWidget):
         c.steamcmd_path = self.steamcmd.text()
         c.backup_root = self.backup_root.text()
         c.backup_mirror = self.backup_mirror.text().strip()
+        c.backup_mirror_enabled = self.mirror_enabled.isChecked()
         c.service_name = self.service.text()
         c.api_port = self.api_port.value()
 

@@ -228,7 +228,7 @@ class Daemon:
         from . import rclone
 
         target = self.cfg.backup_mirror
-        if not target or not rclone.is_remote(target):
+        if not target or not self.cfg.backup_mirror_enabled or not rclone.is_remote(target):
             return
         if not rclone.has_subpath(target):
             self.log.warning(

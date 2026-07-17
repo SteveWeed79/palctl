@@ -11,6 +11,16 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Added
+- **The first-run wizard now covers backups and the Discord bot.** A **Backups**
+  section (a backup folder, how often, and an optional off-site copy with a
+  **Test** button) and an optional, opt-in **Discord bot** section (token,
+  channel ID, admin role/user ID, with the same in-line help as the Config tab)
+  are set up right in the wizard, so a first-run user discovers and enables them
+  without hunting through the Config tab afterwards. The backup folder is
+  pre-filled with one that actually exists — the built-in `D:\PalworldBackups`
+  default silently failed scheduled backups (which run by default) on the common
+  single-`C:`-drive box, because the folder's `mkdir` can't create a drive that
+  isn't there.
 - **Cloud / off-site backup mirror via rclone.** The backup mirror now accepts
   an [rclone](https://rclone.org) remote (`remote:path`, e.g.
   `gdrive:PalworldBackups`) in addition to a local path, so backups can be
@@ -37,6 +47,19 @@ Installers for every release are on the
     cheap cold storage). New `Copies to keep (mirror)` setting; `0` = match the
     local `Backups to keep` count. Local retention is now editable in the GUI
     too.
+
+### Changed
+- **Local backups always run, at least once a day.** Local backups are the
+  safety net, so they're no longer something the UI can switch off or space out
+  past daily: the backup interval is capped at 24h (the wizard, the Config tab,
+  *and* the daemon all enforce it, so a stale or hand-edited config still honours
+  the floor). The admin still chooses any more-frequent cadence.
+- **Off-site backups are now an explicit on/off switch**, separate from the
+  location. Turning off-site copies off keeps the configured target
+  (`gdrive:PalworldBackups`, a `\\nas\` share, …) so it can be flipped back on
+  later without re-typing it, instead of the old "clear the field to disable".
+  Existing configs that had a mirror path set are treated as **on** across the
+  upgrade, so nothing that was being copied off-site silently stops.
 
 ### Fixed
 - **"Save config & reload daemon" now actually starts the Discord bot.**

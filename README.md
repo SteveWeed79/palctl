@@ -71,12 +71,13 @@ PC, which is the situation most people are trying to get out of.
 - Leak **forecasting**: fits the actual memory growth curve and warns *before*
   the limit — and, opt-in, restarts early at a moment the server happens to be
   empty, instead of at the threshold later with players mid-session
-- Scheduled restarts with in-game countdown, autosave, rotating backups —
-  **consistency-checked** (a copy the server wrote through is retried, and
-  flagged if it stays dirty) and optionally **mirrored** to a second disk, a
-  network share, or an **rclone cloud remote** (Google Drive, Dropbox, S3,
-  OneDrive …) for off-site copies — backups on the server's own disk don't
-  survive the disk, and a house fire takes the network share with it
+- Scheduled restarts with in-game countdown, autosave, and rotating **local
+  backups that always run, at least once a day** (pick any more-frequent
+  cadence) — **consistency-checked** (a copy the server wrote through is retried,
+  and flagged if it stays dirty). Turn on an optional **off-site copy** to a
+  second disk, a network share, or an **rclone cloud remote** (Google Drive,
+  Dropbox, S3, OneDrive …) — backups on the server's own disk don't survive the
+  disk, and a house fire takes the network share with it
 - Opt-in scheduled auto-update (Palworld patches constantly) — the same
   save → backup → SteamCMD → restart flow as a manual update, world backup
   included (updates are exactly when saves get eaten), and **no backup means
@@ -193,6 +194,12 @@ Then it opens the GUI, and the **first-run wizard** does the rest:
 - **registers the game server** as a Windows service and sets **palctl itself
   to run in the background** — password-free login startup by default, or a
   Windows service — so your server keeps being managed after a reboot or sign-in
+- **sets up backups** — a local backup folder and how often (local backups
+  always run, at least daily), plus an optional **off-site copy** you can turn on
+  for another disk, a network share, or the cloud
+- **optionally sets up the Discord bot** — tick that section and the wizard walks
+  you through the bot token, channel, and admin role; leave it unchecked to skip
+  and set it up later from the Config tab
 
 You still need to point it at, or let it install, a Palworld **dedicated
 server** — that software comes from Steam (app `2394010`). The wizard is happy to
@@ -218,8 +225,9 @@ run-daemon.bat      creates a venv, installs deps, starts the daemon
 run-gui.bat         opens the GUI  (first launch pops the setup wizard)
 ```
 
-The wizard handles detection, the REST API, an optional server install, and how
-the daemon runs in the background. Prefer to do it by hand?
+The wizard handles detection, the REST API, an optional server install, how the
+daemon runs in the background, backups (local always-on, off-site optional), and
+— as an optional section — the Discord bot. Prefer to do it by hand?
 
 ```
 palctl-daemon.exe install-startup      # start at login — password-free (recommended)
@@ -277,7 +285,9 @@ lands, grab the installer from the
 
 Quick version: create an app at discord.com/developers → Bot → copy the token →
 invite it to your server with the `bot` and `applications.commands` scopes → paste
-the token into the GUI's **Config → Discord bot** tab → Save & reload.
+the token into the GUI's **Config → Discord bot** tab → Save & reload. (The
+first-run wizard has the same fields under its optional **Set up the Discord
+bot** section, if you'd rather do it there.)
 
 For the full walkthrough — inviting with the right **channel permissions**, the
 **role-ID vs user-ID** gotcha behind `/announce` saying *"Not allowed"*, every
@@ -286,19 +296,23 @@ notification toggle, headless-Linux config, and troubleshooting — see the
 
 ### Cloud / off-site backups (optional)
 
-The **backup mirror** takes a second copy of every backup. Point it at a local
-path (another disk or a `\\server\share`) for the simple case, or at an
-[rclone](https://rclone.org) remote to push backups off the box entirely —
-Google Drive, Dropbox, S3, OneDrive, and [dozens more](https://rclone.org/overview/).
-palctl never touches OAuth tokens or a cloud API itself; rclone owns the auth
-and the uploads.
+Local backups always run to the backup folder. **Off-site backups are an
+opt-in second copy** — tick **Off-site backups** on and give it a location.
+Point it at a local path (another disk or a `\\server\share`) for the simple
+case, or at an [rclone](https://rclone.org) remote to push backups off the box
+entirely — Google Drive, Dropbox, S3, OneDrive, and
+[dozens more](https://rclone.org/overview/). palctl never touches OAuth tokens or
+a cloud API itself; rclone owns the auth and the uploads. Turning off-site
+backups off keeps the location you entered, so you can flip them back on later
+without re-typing it.
 
 1. Install rclone (`rclone.org/downloads`) and put it on `PATH`.
 2. Run `rclone config` once to authorize your account — say you name the remote
    `gdrive`.
-3. In the **Config** tab, set **Backup mirror** to a **dedicated folder** on the
-   remote — `gdrive:PalworldBackups`, not the bare `gdrive:` root — and hit
-   **Test** to confirm palctl can reach it.
+3. In the **Config** tab (or the wizard's **Backups** section), tick **Off-site
+   backups** and set the location to a **dedicated folder** on the remote —
+   `gdrive:PalworldBackups`, not the bare `gdrive:` root — then hit **Test** to
+   confirm palctl can reach it.
 
 palctl uploads to, and prunes within, **that one folder only**: it lists and
 deletes solely its own dated backup directories, so retention can never reach
