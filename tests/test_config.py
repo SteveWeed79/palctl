@@ -94,3 +94,29 @@ def test_secret_reads_survive_missing_keyring_backend(monkeypatch: pytest.Monkey
     monkeypatch.setattr(config_mod.keyring, "get_password", explode)
     assert config_mod.get_admin_password() == ""
     assert config_mod.get_discord_token() == ""
+
+
+def test_secret_reads_survive_a_backend_panic(monkeypatch: pytest.MonkeyPatch):
+    # A broken system keyring backend (e.g. cryptography with a missing
+    # _cffi_backend) makes pyo3 raise a PanicException that derives from
+    # BaseException, not Exception — so it escapes the KeyringError guard and
+    # would kill the daemon before asyncio.run. A read must still degrade to "".
+    class FakePanic(BaseException):
+        pass
+
+    def panic(service, name):
+        raise FakePanic("cffi backend missing")
+
+    monkeypatch.setattr(config_mod.keyring, "get_password", panic)
+    assert config_mod.get_admin_password() == ""
+    assert config_mod.get_discord_token() == ""
+
+
+def test_secret_reads_still_propagate_keyboard_interrupt(monkeypatch: pytest.MonkeyPatch):
+    # The broad BaseException guard must not swallow real control-flow signals.
+    def interrupt(service, name):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(config_mod.keyring, "get_password", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        config_mod.get_admin_password()
