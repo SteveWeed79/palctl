@@ -309,3 +309,416 @@ def test_run_bot_gives_up_after_a_connected_session_ends(monkeypatch):
     assert len(created) == 1  # a real session that dropped is discord.py's job
     assert sleeps == []
     assert any("stopped" in e.message for e in bus.events)
+
+
+# ---------------- pure helpers (autocomplete / health / leaderboard / schedule) ----
+
+from datetime import datetime  # noqa: E402
+
+from palctl.api import PalApiError  # noqa: E402
+from palctl.bot import (  # noqa: E402
+    _ConfirmView,
+    _format_leaderboard,
+    _format_schedule,
+    _health_fields,
+    _match_choices,
+)
+
+
+def test_match_choices_prefix_before_contains():
+    opts = ["Steve", "SteveW", "Steven", "bob", "misteve"]
+    # prefix matches first (in input order), then substring matches
+    assert _match_choices(opts, "ste") == ["Steve", "SteveW", "Steven", "misteve"]
+
+
+def test_match_choices_empty_current_returns_all_capped():
+    assert _match_choices(["a", "b", "c"], "", limit=2) == ["a", "b"]
+
+
+def test_match_choices_case_insensitive_and_capped():
+    opts = [f"p{i}" for i in range(30)]
+    assert _match_choices(opts, "P", limit=25) == opts[:25]
+
+
+def test_health_fields_warns_near_the_memory_limit():
+    fields, warn = _health_fields(
+        memory_mb=11500, limit_mb=12000, cpu=10, fps=60, frame_time=16.0, ttl_minutes=None
+    )
+    assert warn is True
+    assert any("96%" in v for _, v in fields)
+
+
+def test_health_fields_warns_on_a_short_leak_forecast():
+    _, warn = _health_fields(
+        memory_mb=5000, limit_mb=12000, cpu=10, fps=60, frame_time=16.0, ttl_minutes=45
+    )
+    assert warn is True
+
+
+def test_health_fields_calm_when_low_and_stable():
+    fields, warn = _health_fields(
+        memory_mb=5000, limit_mb=12000, cpu=10, fps=60, frame_time=16.0, ttl_minutes=None
+    )
+    assert warn is False
+    assert any("no restart forecast" in v for _, v in fields)
+
+
+def test_format_leaderboard_medals_then_numbers():
+    out = _format_leaderboard([("A", 120.0), ("B", 60.0), ("C", 30.0), ("D", 6.0)])
+    lines = out.splitlines()
+    assert lines[0].startswith("🥇") and "2.0h" in lines[0]
+    assert "4." in lines[3] and "0.1h" in lines[3]
+
+
+def test_format_schedule_off_when_disabled():
+    cfg = Config()
+    cfg.schedule.enabled = False
+    assert "off" in _format_schedule(cfg.schedule, datetime(2026, 7, 17, 12, 0)).lower()
+
+
+def test_format_schedule_lists_restart_and_backups():
+    out = _format_schedule(Config().schedule, datetime(2026, 7, 17, 12, 0))
+    assert "Daily restart" in out and "Backups every" in out
+
+
+# ---------------- _server_power (start / stop delegation + gating) ----------------
+
+
+class _StubSched:
+    def __init__(self, result):
+        self.result = result
+        self.started = False
+        self.stopped = False
+
+    async def start_server(self):
+        self.started = True
+        return self.result
+
+    async def stop_server(self):
+        self.stopped = True
+        return self.result
+
+
+class _PowerBot:
+    def __init__(self, sched, *, admin=True):
+        self._sched = sched
+        self._admin = admin
+
+    def _is_admin(self, interaction):
+        return self._admin
+
+
+def test_server_power_start_maps_ok_to_starting_message():
+    sched = _StubSched("ok")
+    it = _FakeInteraction()
+    asyncio.run(PalBot._server_power(_PowerBot(sched), it, "start"))
+    assert sched.started
+    assert "Starting" in it.followup.messages[-1]
+
+
+def test_server_power_start_maps_busy():
+    sched = _StubSched("busy")
+    it = _FakeInteraction()
+    asyncio.run(PalBot._server_power(_PowerBot(sched), it, "start"))
+    assert "mid-operation" in it.followup.messages[-1].lower()
+
+
+def test_server_power_denies_non_admin_without_calling_scheduler():
+    sched = _StubSched("ok")
+    it = _FakeInteraction()
+    asyncio.run(PalBot._server_power(_PowerBot(sched, admin=False), it, "start"))
+    assert not sched.started
+    assert any(m[0] == "send_message" for m in it.response.messages)
+
+
+# ---------------- _ConfirmView (only the author may press) ----------------
+
+
+def _it_with_user(uid):
+    it = _FakeInteraction()
+    it.user = types.SimpleNamespace(id=uid)
+    return it
+
+
+def test_confirm_view_only_the_author_can_press():
+    async def go():
+        view = _ConfirmView(author_id=100)
+        assert await view.interaction_check(_it_with_user(100)) is True
+        stranger = _it_with_user(999)
+        assert await view.interaction_check(stranger) is False
+        return stranger
+
+    stranger = asyncio.run(go())
+    assert any(
+        m[0] == "send_message" and "isn't yours" in (m[1] or "")
+        for m in stranger.response.messages
+    )
+
+
+# ---------------- autocomplete choice sources ----------------
+
+
+class _PlayersApi:
+    def __init__(self, names):
+        self._names = names
+
+    async def players(self):
+        return [types.SimpleNamespace(name=n) for n in self._names]
+
+
+def test_player_name_choices_filters_and_wraps():
+    bot = types.SimpleNamespace(_api=_PlayersApi(["Steve", "Bob", "Steven"]))
+    choices = asyncio.run(PalBot._player_name_choices(bot, None, "ste"))
+    assert [c.value for c in choices] == ["Steve", "Steven"]
+
+
+def test_player_name_choices_empty_when_api_down():
+    class _BadApi:
+        async def players(self):
+            raise PalApiError("unreachable")
+
+    bot = types.SimpleNamespace(_api=_BadApi())
+    assert asyncio.run(PalBot._player_name_choices(bot, None, "x")) == []
+
+
+# ---------------- /playtime & /whois offline fallback ----------------
+
+
+class _PlaytimeApi:
+    def __init__(self, players):
+        self._players = players
+
+    async def players(self):
+        return list(self._players)
+
+
+class _DownApi:
+    async def players(self):
+        raise PalApiError("unreachable")
+
+
+class _HistStore:
+    def __init__(self, uid=None, mins=0.0, seen=None, recent=()):
+        self._uid = uid
+        self._mins = mins
+        self._seen = seen
+        self._recent = list(recent)
+
+    def resolve_user_id(self, name):
+        return self._uid
+
+    def last_seen(self, uid):
+        return self._seen
+
+    def total_playtime_minutes(self, uid):
+        return self._mins
+
+    def recent_player_names(self, limit=50):
+        return self._recent[:limit]
+
+
+class _PtBot:
+    def __init__(self, api, store):
+        self._api = api
+        self._store = store
+
+
+def test_playtime_online_uses_the_live_player():
+    api = _PlaytimeApi([types.SimpleNamespace(name="Steve", user_id="u1", level=42)])
+    it = _FakeInteraction()
+    asyncio.run(PalBot._playtime(_PtBot(api, _HistStore(mins=120.0)), it, "steve"))
+    msg = it.followup.messages[-1]
+    assert "Steve" in msg and "2.0h" in msg and "level 42" in msg
+
+
+def test_playtime_offline_falls_back_to_history():
+    store = _HistStore(uid="u7", mins=300.0, seen=("Ghost", "2026-01-01T00:00:00+00:00"))
+    it = _FakeInteraction()
+    asyncio.run(PalBot._playtime(_PtBot(_PlaytimeApi([]), store), it, "ghost"))
+    msg = it.followup.messages[-1]
+    assert "Ghost" in msg and "5.0h" in msg and "offline" in msg
+
+
+def test_playtime_reports_an_unknown_player():
+    it = _FakeInteraction()
+    asyncio.run(PalBot._playtime(_PtBot(_PlaytimeApi([]), _HistStore(uid=None)), it, "nobody"))
+    assert "never seen" in it.followup.messages[-1]
+
+
+def test_playtime_uses_history_when_the_api_is_down():
+    store = _HistStore(uid="u7", mins=60.0, seen=("Ghost", "2026-01-01T00:00:00+00:00"))
+    it = _FakeInteraction()
+    asyncio.run(PalBot._playtime(_PtBot(_DownApi(), store), it, "ghost"))
+    assert "1.0h" in it.followup.messages[-1]  # API failure isn't fatal
+
+
+def test_known_name_choices_merges_online_and_history_deduped():
+    api = _PlaytimeApi([types.SimpleNamespace(name="Online1")])
+    store = _HistStore(recent=["Online1", "HistOnly"])
+    choices = asyncio.run(PalBot._known_name_choices(_PtBot(api, store), None, ""))
+    vals = [c.value for c in choices]
+    assert vals[0] == "Online1"  # online first
+    assert "HistOnly" in vals  # history contributes offline names
+    assert vals.count("Online1") == 1  # deduped across the two sources
+
+
+def test_match_choices_dedups_identical_names():
+    # Two players named "Bob" must not produce two identical autocomplete choices.
+    assert _match_choices(["Bob", "Bob", "Bobby"], "bob") == ["Bob", "Bobby"]
+
+
+def test_format_schedule_shows_backups_off_for_the_disable_sentinel():
+    cfg = Config()
+    cfg.schedule.backup_hours = 0  # documented "off" escape hatch
+    out = _format_schedule(cfg.schedule, datetime(2026, 7, 17, 12, 0))
+    assert "Backups: off" in out  # not a misleading "every 0h"
+
+
+# ---------------- /events disclosure filter ----------------
+
+
+def test_visible_events_hides_sensitive_kinds_from_non_admins():
+    from palctl.bot import _visible_events
+
+    evs = [
+        Event("join", "j"),
+        Event("error", "secret /srv/path failed: gdrive:Backups"),
+        Event("watchdog", "w"),
+        Event("restart", "r"),
+    ]
+    assert [e.kind for e in _visible_events(evs, False)] == ["join", "restart"]
+    assert [e.kind for e in _visible_events(evs, True)] == ["join", "error", "watchdog", "restart"]
+
+
+# ---------------- /whois disclosure gating (online + offline) ----------------
+
+
+class _RecFollowup:
+    def __init__(self):
+        self.calls = []
+
+    async def send(self, content=None, *, embed=None, ephemeral=False, **kw):
+        self.calls.append({"content": content, "embed": embed, "ephemeral": ephemeral})
+
+
+class _RecResponse:
+    def __init__(self):
+        self.deferred = False
+
+    async def defer(self):
+        self.deferred = True
+
+
+class _RecInteraction:
+    def __init__(self, uid=1):
+        self.response = _RecResponse()
+        self.followup = _RecFollowup()
+        self.user = types.SimpleNamespace(id=uid)
+
+
+class _WhoisBot:
+    def __init__(self, api, store, admin):
+        self._api = api
+        self._store = store
+        self._admin = admin
+
+    def _is_admin(self, interaction):
+        return self._admin
+
+
+def _online_player(name="Steve", uid="u1"):
+    return types.SimpleNamespace(
+        name=name, user_id=uid, level=42, ping=25.0,
+        building_count=7, location_x=100.0, location_y=200.0,
+    )
+
+
+def _fields(embed):
+    return {f.name: f.value for f in embed.fields}
+
+
+def test_whois_online_admin_gets_sensitive_fields_ephemerally():
+    bot = _WhoisBot(_PlaytimeApi([_online_player()]), _HistStore(mins=120.0), admin=True)
+    it = _RecInteraction()
+    asyncio.run(PalBot._whois(bot, it, "steve"))
+    pub, priv = it.followup.calls
+    assert pub["ephemeral"] is False  # public card, no sensitive fields
+    assert "Location" not in _fields(pub["embed"]) and "User ID" not in _fields(pub["embed"])
+    assert priv["ephemeral"] is True  # sensitive fields only to the admin
+    assert "Location" in _fields(priv["embed"]) and "User ID" in _fields(priv["embed"])
+
+
+def test_whois_online_non_admin_never_sees_sensitive_fields():
+    bot = _WhoisBot(_PlaytimeApi([_online_player()]), _HistStore(mins=120.0), admin=False)
+    it = _RecInteraction()
+    asyncio.run(PalBot._whois(bot, it, "steve"))
+    assert len(it.followup.calls) == 1  # public card only — no ephemeral admin follow-up
+    f = _fields(it.followup.calls[0]["embed"])
+    assert "Location" not in f and "User ID" not in f
+
+
+def test_whois_offline_admin_gets_user_id_ephemerally():
+    store = _HistStore(uid="u7", mins=60.0, seen=("Ghost", "2026-01-01T00:00:00+00:00"))
+    it = _RecInteraction()
+    asyncio.run(PalBot._whois(_WhoisBot(_PlaytimeApi([]), store, admin=True), it, "ghost"))
+    pub, priv = it.followup.calls
+    assert pub["ephemeral"] is False
+    assert priv["ephemeral"] is True and "u7" in priv["content"]
+
+
+def test_whois_offline_non_admin_gets_no_user_id():
+    store = _HistStore(uid="u7", mins=60.0, seen=("Ghost", "2026-01-01T00:00:00+00:00"))
+    it = _RecInteraction()
+    asyncio.run(PalBot._whois(_WhoisBot(_PlaytimeApi([]), store, admin=False), it, "ghost"))
+    assert len(it.followup.calls) == 1 and it.followup.calls[0]["ephemeral"] is False
+
+
+def test_whois_unknown_player():
+    bot = _WhoisBot(_PlaytimeApi([]), _HistStore(uid=None), admin=True)
+    it = _RecInteraction()
+    asyncio.run(PalBot._whois(bot, it, "nobody"))
+    assert len(it.followup.calls) == 1 and "never seen" in it.followup.calls[0]["content"]
+
+
+# ---------------- _server_power stop branch ----------------
+
+
+class _StopBot:
+    def __init__(self, sched, *, admin=True, confirm=True):
+        self._sched = sched
+        self._admin = admin
+        self._confirm_val = confirm
+
+    def _is_admin(self, interaction):
+        return self._admin
+
+    async def _confirm(self, interaction, prompt):
+        return self._confirm_val
+
+
+def test_server_power_stop_confirmed_ok():
+    sched = _StubSched("ok")
+    it = _FakeInteraction()
+    asyncio.run(PalBot._server_power(_StopBot(sched), it, "stop"))
+    assert sched.stopped and "stopped" in it.followup.messages[-1].lower()
+
+
+def test_server_power_stop_reports_failed():
+    sched = _StubSched("failed")
+    it = _FakeInteraction()
+    asyncio.run(PalBot._server_power(_StopBot(sched), it, "stop"))
+    assert "hung" in it.followup.messages[-1].lower()
+
+
+def test_server_power_stop_busy():
+    sched = _StubSched("busy")
+    it = _FakeInteraction()
+    asyncio.run(PalBot._server_power(_StopBot(sched), it, "stop"))
+    assert "mid-operation" in it.followup.messages[-1].lower()
+
+
+def test_server_power_stop_cancelled_does_not_stop():
+    sched = _StubSched("ok")
+    it = _FakeInteraction()
+    asyncio.run(PalBot._server_power(_StopBot(sched, confirm=False), it, "stop"))
+    assert not sched.stopped and it.followup.messages == []

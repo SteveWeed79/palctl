@@ -191,3 +191,111 @@ def test_unrecoverable_sessions_db_falls_back_to_memory(tmp_path: Path, monkeypa
     store = SessionStore(db)  # must not raise
     store.log_metrics({"at": 2.0, "memory_mb": 1.0})
     assert [s["at"] for s in store.recent_metrics(10)] == [2.0]
+
+
+# ---------------- top_playtime (leaderboard source) ----------------
+
+from datetime import UTC, datetime, timedelta  # noqa: E402
+
+
+def _insert_closed_session(store: SessionStore, uid: str, name: str, minutes: float,
+                           base: datetime = datetime(2026, 1, 1, tzinfo=UTC)) -> None:
+    joined = base
+    left = base + timedelta(minutes=minutes)
+    store._db.execute(
+        "INSERT INTO sessions (user_id, name, joined_at, left_at) VALUES (?,?,?,?)",
+        (uid, name, joined.isoformat(), left.isoformat()),
+    )
+    store._db.commit()
+
+
+def test_top_playtime_ranks_by_total_and_uses_latest_name(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    _insert_closed_session(store, "u1", "Alice", 30)
+    _insert_closed_session(store, "u1", "AliceRenamed", 90)  # same account, later name
+    _insert_closed_session(store, "u2", "Bob", 200)
+    top = store.top_playtime(10)
+    assert top[0] == ("Bob", 200.0)
+    assert top[1] == ("AliceRenamed", 120.0)  # 30 + 90, most-recent name wins
+
+
+def test_top_playtime_empty_and_limit(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    assert store.top_playtime() == []
+    _insert_closed_session(store, "a", "A", 10)
+    _insert_closed_session(store, "b", "B", 20)
+    assert [name for name, _ in store.top_playtime(1)] == ["B"]
+
+
+def test_top_playtime_skips_malformed_timestamps(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    store._db.execute(
+        "INSERT INTO sessions (user_id, name, joined_at, left_at) VALUES (?,?,?,?)",
+        ("x", "X", "not-a-date", "also-bad"),
+    )
+    store._db.commit()
+    _insert_closed_session(store, "y", "Y", 15)
+    assert store.top_playtime() == [("Y", 15.0)]  # the bad row is skipped, not fatal
+
+
+# ---------------- offline lookup helpers (resolve / last_seen / recent) ----------------
+
+
+def test_resolve_user_id_is_case_insensitive_and_takes_latest(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    _insert_closed_session(store, "u1", "Ghost", 10)
+    _insert_closed_session(store, "u2", "Ghost", 10)  # a later account reused the name
+    assert store.resolve_user_id("ghost") == "u2"  # most recent wins, case-insensitive
+    assert store.resolve_user_id("nobody") is None
+
+
+def test_last_seen_returns_most_recent_closed_session(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    _insert_closed_session(store, "u1", "Alice", 30, base=datetime(2026, 1, 1, tzinfo=UTC))
+    _insert_closed_session(store, "u1", "Alice", 30, base=datetime(2026, 2, 2, tzinfo=UTC))
+    name, left = store.last_seen("u1")
+    assert name == "Alice"
+    assert left.startswith("2026-02-02")
+    assert store.last_seen("ghost") is None
+
+
+def test_recent_player_names_dedups_keeping_most_recent_order(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    _insert_closed_session(store, "u1", "Alice", 5)
+    _insert_closed_session(store, "u2", "Bob", 5)
+    _insert_closed_session(store, "u1", "Alice", 5)  # Alice again, later
+    # newest-first, each name once: Alice (its latest row) before Bob
+    assert store.recent_player_names() == ["Alice", "Bob"]
+
+
+# ---------------- current (open) session counts toward playtime ----------------
+
+
+def test_total_playtime_includes_the_open_session(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    # one finished 60m session...
+    _insert_closed_session(store, "u1", "Alice", 60, base=base)
+    # ...plus a still-open session (left_at NULL) that started 30m before `now`
+    store._db.execute(
+        "INSERT INTO sessions (user_id, name, joined_at) VALUES (?,?,?)",
+        ("u1", "Alice", (base + timedelta(hours=2)).isoformat()),
+    )
+    store._db.commit()
+    now = base + timedelta(hours=2, minutes=30)
+    assert store.total_playtime_minutes("u1", now=now) == 90.0  # 60 closed + 30 open
+
+
+def test_top_playtime_counts_the_open_session(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    _insert_closed_session(store, "u1", "Alice", 10, base=base)
+    store._db.execute(
+        "INSERT INTO sessions (user_id, name, joined_at) VALUES (?,?,?)",
+        ("u2", "Bob", base.isoformat()),  # open session, no left_at
+    )
+    store._db.commit()
+    now = base + timedelta(minutes=120)  # Bob has been on 120m
+    top = store.top_playtime(now=now)
+    assert top[0] == ("Bob", 120.0)  # the online player leads on their live session
+    assert ("Alice", 10.0) in top

@@ -8,9 +8,16 @@ there can't be. Palworld exposes no chat-read endpoint and dedicated servers
 ship no log file. Chat is UE4SS-only territory.
 
 What you DO get, all reconstructed from polling /players and /metrics:
-  /status /players /playtime /announce /save /backup /backups /restore
-  /restart /update /kick /ban /unban
-  join + leave alerts, level-up alerts, watchdog alerts, up/down alerts
+  reads:   /status /health /players /whois /playtime /leaderboard /backups
+           /events /next /help
+  admin:   /start /stop /restart /cancel /update /save /backup /restore
+           /announce /kick /ban /unban
+  alerts:  join + leave, level-up, watchdog, up/down, update-available
+
+/playtime and /whois answer for offline players too (resolved from the session
+history palctl keeps). Player-name and backup-name arguments autocomplete, and
+the destructive commands (/stop /update /restore) ask for a button confirmation
+first — all so the bot is safe to drive one-handed from a phone.
 """
 
 from __future__ import annotations
@@ -18,12 +25,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
 
-from . import backups, procs
+from . import backups, leak, procs
 from .api import PalApi, PalApiError
 from .config import Config, get_discord_token
 from .events import Event, EventBus, SessionStore
@@ -60,6 +67,153 @@ def _fmt_uptime(seconds: float) -> str:
     h, rem = divmod(d.seconds, 3600)
     m = rem // 60
     return f"{d.days}d {h}h {m}m" if d.days else f"{h}h {m}m"
+
+
+def _fmt_last_seen(iso: str) -> str:
+    """A session's ISO `left_at` as a readable UTC stamp for /whois."""
+    try:
+        return datetime.fromisoformat(iso).strftime("%Y-%m-%d %H:%M UTC")
+    except (ValueError, TypeError):
+        return "unknown"
+
+
+# Event kinds safe to show any member via /events. Everything else — notably
+# "error" (raw exceptions, cloud-remote paths) and "watchdog" internals — is
+# admins-only, so a public /events can't leak operator diagnostics.
+_PUBLIC_EVENT_KINDS = frozenset({
+    "join", "leave", "levelup", "server_up", "server_down",
+    "restart", "backup", "restore", "update", "update_available",
+})
+
+
+def _visible_events(events: list, is_admin: bool) -> list:
+    """Filter the event feed for /events: admins see everything, everyone else
+    sees only non-sensitive kinds (no raw error/watchdog internals)."""
+    if is_admin:
+        return list(events)
+    return [e for e in events if e.kind in _PUBLIC_EVENT_KINDS]
+
+
+def _match_choices(options: list[str], current: str, limit: int = 25) -> list[str]:
+    """Filter `options` for a slash-command autocomplete box: prefix matches
+    first, then substring matches, capped at `limit` (Discord shows at most 25).
+    Pure, so the ranking is unit-tested without a Discord connection."""
+    cur = current.strip().lower()
+    if not cur:
+        picked = options
+    else:
+        prefix = [o for o in options if o.lower().startswith(cur)]
+        contains = [o for o in options if cur in o.lower() and not o.lower().startswith(cur)]
+        picked = prefix + contains
+    # Dedup identical strings (Palworld names aren't unique — two "Bob"s online
+    # would otherwise yield two identical Choices, which Discord rejects), while
+    # preserving the prefix-before-contains order.
+    return list(dict.fromkeys(picked))[:limit]
+
+
+def _health_fields(
+    *,
+    memory_mb: float,
+    limit_mb: int,
+    cpu: float,
+    fps: int,
+    frame_time: float,
+    ttl_minutes: float | None,
+) -> tuple[list[tuple[str, str]], bool]:
+    """(embed fields, is_warning) for /health. `ttl_minutes` is the leak
+    forecaster's minutes-to-limit (None = not trending up). Pure — the
+    percent-of-limit and warning threshold are unit-tested here, not in Discord."""
+    pct = (memory_mb / limit_mb * 100) if limit_mb else 0.0
+    fields = [
+        ("Memory", f"{memory_mb:,.0f} MB · {pct:.0f}% of the {limit_mb:,} MB watchdog limit"),
+        ("CPU", f"{cpu:.0f}%"),
+        ("Server FPS", str(fps)),
+        ("Frame time", f"{frame_time:.1f} ms"),
+    ]
+    if ttl_minutes is None:
+        fields.append(("Leak forecast", "memory isn't trending up — no restart forecast"))
+    else:
+        fields.append(
+            ("Leak forecast",
+             f"on the current pace, memory hits the limit in {leak.fmt_minutes(ttl_minutes)}")
+        )
+    warning = (ttl_minutes is not None and ttl_minutes <= 90) or pct >= 90
+    return fields, warning
+
+
+def _format_leaderboard(rows: list[tuple[str, float]]) -> str:
+    """Medal-ranked playtime list for /leaderboard, from (name, minutes) rows."""
+    medals = ("🥇", "🥈", "🥉")
+    lines = []
+    for i, (name, minutes) in enumerate(rows):
+        rank = medals[i] if i < len(medals) else f"**{i + 1}.**"
+        lines.append(f"{rank} {name} — {minutes / 60:.1f}h")
+    return "\n".join(lines)
+
+
+def _format_schedule(schedule, now: datetime) -> str:
+    """Human overview of upcoming automated actions for /next. `now` is passed
+    in so the next-occurrence maths is deterministic under test."""
+    from .scheduler import backup_interval_hours, next_daily
+
+    if not schedule.enabled:
+        return "⏸️ Scheduling is off — no automatic restarts, backups, or updates."
+    lines = []
+    if schedule.daily_restart:
+        nxt = next_daily(now, schedule.daily_restart_at, 6)
+        lines.append(f"🔁 Daily restart at **{schedule.daily_restart_at}** — next {nxt:%a %H:%M}")
+    else:
+        lines.append("🔁 Daily restart: off")
+    hours = backup_interval_hours(schedule.backup_hours)
+    if hours <= 0:
+        # backup_hours <= 0 is the documented "off" escape hatch, and
+        # _backup_loop honours it — don't imply the safety-net backups run.
+        lines.append("📦 Backups: off")
+    else:
+        lines.append(f"📦 Backups every **{hours}h** (keeping {schedule.backup_retain})")
+    lines.append(f"💾 Autosave every **{schedule.autosave_minutes}m**")
+    if schedule.auto_update:
+        nxt = next_daily(now, schedule.auto_update_at, 5)
+        lines.append(f"⏬ Auto-update at **{schedule.auto_update_at}** — next {nxt:%a %H:%M}")
+    else:
+        lines.append("⏬ Auto-update: off")
+    return "\n".join(lines)
+
+
+class _ConfirmView(discord.ui.View):
+    """A Confirm/Cancel button pair for destructive commands, so a fat-fingered
+    /restore, /stop, or /update from a phone asks first. Only the admin who
+    invoked the command may press the buttons, and it auto-expires so a stale
+    prompt can't be actioned later."""
+
+    def __init__(self, author_id: int, *, timeout: float = 30.0) -> None:
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.value: bool | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "This confirmation isn't yours.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+    async def _confirm(
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        self.value = True
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def _cancel(
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        self.value = False
+        await interaction.response.defer()
+        self.stop()
 
 
 class PalBot(discord.Client):
@@ -241,6 +395,21 @@ class PalBot(discord.Client):
                 value=f"{stats.memory_mb:,.0f} MB ({pct:.0f}% of watchdog limit)",
             )
             e.add_field(name="CPU", value=f"{stats.cpu_percent:.0f}%")
+
+        # The leak forecast, when there is one — so the live status embed (and
+        # /status) answers "is a restart coming?" at a glance, not just /health.
+        samples = [
+            (s["at"], s["memory_mb"])
+            for s in await asyncio.to_thread(self._store.recent_metrics, 720)
+            if s.get("memory_mb")
+        ]
+        ttl = leak.time_to_limit_minutes(samples, self._cfg.watchdog.memory_limit_mb)
+        if ttl is not None:
+            e.add_field(
+                name="Leak forecast",
+                value=f"memory hits the limit in {leak.fmt_minutes(ttl)}",
+                inline=False,
+            )
         return e
 
     async def _status_loop(self) -> None:
@@ -293,27 +462,16 @@ class PalBot(discord.Client):
             )
             await interaction.followup.send(embed=e)
 
-        @tree.command(name="playtime", description="Total playtime for a player")
-        @app_commands.describe(name="Player name (as shown in /players)")
+        @tree.command(
+            name="playtime", description="Total playtime for a player (online or offline)"
+        )
+        @app_commands.describe(name="Player name")
         async def playtime(interaction: discord.Interaction, name: str) -> None:
-            await interaction.response.defer()
-            try:
-                ps = await self._api.players()
-            except PalApiError:
-                ps = []
+            await self._playtime(interaction, name)
 
-            match = next((p for p in ps if p.name.lower() == name.lower()), None)
-            if match is None:
-                await interaction.followup.send(
-                    f"Can't find **{name}** online. (Playtime lookup needs them "
-                    "on the server so I can resolve their user ID.)"
-                )
-                return
-
-            mins = self._store.total_playtime_minutes(match.user_id)
-            await interaction.followup.send(
-                f"**{match.name}** — {mins / 60:.1f}h total, currently level {match.level}."
-            )
+        @playtime.autocomplete("name")
+        async def _playtime_ac(interaction: discord.Interaction, current: str):
+            return await self._known_name_choices(interaction, current)
 
         @tree.command(name="announce", description="Send an in-game announcement")
         async def announce(interaction: discord.Interaction, message: str) -> None:
@@ -368,9 +526,15 @@ class PalBot(discord.Client):
             if not self._is_admin(interaction):
                 await interaction.response.send_message("Not allowed.", ephemeral=True)
                 return
-            await interaction.response.send_message(
-                "⏬ Updating the server via SteamCMD — it'll go down and I'll report "
-                "back here when it's finished."
+            if not await self._confirm(
+                interaction,
+                "⏬ **Update the server via SteamCMD?** It goes down for the update; "
+                "a pre-update world backup is taken first.",
+            ):
+                return
+            await interaction.followup.send(
+                "⏬ Updating the server via SteamCMD — I'll report back here when "
+                "it's finished."
             )
             self._spawn(self._sched.update_server())
 
@@ -400,11 +564,20 @@ class PalBot(discord.Client):
             if not self._is_admin(interaction):
                 await interaction.response.send_message("Not allowed.", ephemeral=True)
                 return
-            await interaction.response.send_message(
-                f"♻️ Restoring `{name}` — the server will restart. A safety copy of "
-                "the current world is taken first. I'll report back here."
+            if not await self._confirm(
+                interaction,
+                f"♻️ **Restore `{name}`?** The server stops and restarts. A safety "
+                "copy of the current world is taken first, so this is undoable.",
+            ):
+                return
+            await interaction.followup.send(
+                f"♻️ Restoring `{name}` — I'll report back here."
             )
             self._spawn(self._sched.restore_backup(name))
+
+        @restore.autocomplete("name")
+        async def _restore_ac(interaction: discord.Interaction, current: str):
+            return await self._backup_name_choices(interaction, current)
 
         @tree.command(name="kick", description="Kick a player")
         async def kick(
@@ -412,11 +585,19 @@ class PalBot(discord.Client):
         ) -> None:
             await self._moderate(interaction, name, reason, "kick")
 
+        @kick.autocomplete("name")
+        async def _kick_ac(interaction: discord.Interaction, current: str):
+            return await self._player_name_choices(interaction, current)
+
         @tree.command(name="ban", description="Ban a player")
         async def ban(
             interaction: discord.Interaction, name: str, reason: str = "Banned by admin"
         ) -> None:
             await self._moderate(interaction, name, reason, "ban")
+
+        @ban.autocomplete("name")
+        async def _ban_ac(interaction: discord.Interaction, current: str):
+            return await self._player_name_choices(interaction, current)
 
         @tree.command(name="unban", description="Unban a player by user ID")
         async def unban(interaction: discord.Interaction, user_id: str) -> None:
@@ -431,6 +612,117 @@ class PalBot(discord.Client):
                 await interaction.followup.send(f"✅ Unbanned `{user_id}`.")
             except PalApiError as err:
                 await interaction.followup.send(f"❌ {err}")
+
+        @tree.command(name="start", description="Start the server")
+        async def start(interaction: discord.Interaction) -> None:
+            await self._server_power(interaction, "start")
+
+        @tree.command(name="stop", description="Save and stop the server (asks first)")
+        async def stop(interaction: discord.Interaction) -> None:
+            await self._server_power(interaction, "stop")
+
+        @tree.command(name="health", description="Memory, CPU, FPS, and leak forecast")
+        async def health(interaction: discord.Interaction) -> None:
+            await interaction.response.defer()
+            await interaction.followup.send(embed=await self._health_embed())
+
+        @tree.command(name="leaderboard", description="Top players by total playtime")
+        @app_commands.describe(top="How many to show (1–25, default 10)")
+        async def leaderboard(interaction: discord.Interaction, top: int = 10) -> None:
+            await interaction.response.defer()
+            rows = await asyncio.to_thread(self._store.top_playtime, max(1, min(25, top)))
+            if not rows:
+                await interaction.followup.send(
+                    "No playtime recorded yet — it accrues as people play (only "
+                    "sessions that have ended count)."
+                )
+                return
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="🏆 Playtime leaderboard",
+                    description=_format_leaderboard(rows),
+                    colour=BLUE,
+                )
+            )
+
+        @tree.command(name="whois", description="Details for a player (online or offline)")
+        @app_commands.describe(name="Player name")
+        async def whois(interaction: discord.Interaction, name: str) -> None:
+            await self._whois(interaction, name)
+
+        @whois.autocomplete("name")
+        async def _whois_ac(interaction: discord.Interaction, current: str):
+            return await self._known_name_choices(interaction, current)
+
+        @tree.command(name="events", description="Recent server events")
+        @app_commands.describe(count="How many to show (1–25, default 12)")
+        async def events(interaction: discord.Interaction, count: int = 12) -> None:
+            await interaction.response.defer()
+            # Filter first (non-admins don't see error/watchdog internals), then
+            # take the most recent `count` of what's left.
+            evs = _visible_events(self._bus.recent(60), self._is_admin(interaction))
+            evs = evs[-max(1, min(25, count)):]
+            if not evs:
+                await interaction.followup.send("No events recorded yet.")
+                return
+            lines = [f"`{e.at:%m-%d %H:%M}` {e.message}" for e in reversed(evs)]
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="Recent events", description="\n".join(lines), colour=BLUE
+                )
+            )
+
+        @tree.command(name="cancel", description="Cancel an in-progress restart countdown")
+        async def cancel(interaction: discord.Interaction) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message("Not allowed.", ephemeral=True)
+                return
+            await interaction.response.defer()
+            if self._sched.cancel_countdown():
+                await interaction.followup.send(
+                    "🚫 Cancelling the restart countdown — the server stays up."
+                )
+            else:
+                await interaction.followup.send("Nothing to cancel — no countdown is running.")
+
+        @tree.command(
+            name="next", description="Upcoming automatic restarts, backups, and updates"
+        )
+        async def next_(interaction: discord.Interaction) -> None:
+            await interaction.response.defer()
+            text = _format_schedule(self._cfg.schedule, datetime.now())
+            await interaction.followup.send(
+                embed=discord.Embed(title="Scheduled tasks", description=text, colour=BLUE)
+            )
+
+        @tree.command(name="help", description="What palctl's bot can do")
+        async def help_(interaction: discord.Interaction) -> None:
+            await interaction.response.send_message(embed=self._help_embed(), ephemeral=True)
+
+    def _help_embed(self) -> discord.Embed:
+        e = discord.Embed(
+            title="palctl bot",
+            description="Self-hosted Palworld server control — reconstructed from "
+            "the REST API, no cloud bridge.",
+            colour=BLUE,
+        )
+        e.add_field(
+            name="Anyone",
+            value="/status · /health · /players · /whois · /playtime · /leaderboard "
+            "· /backups · /events · /next · /help",
+            inline=False,
+        )
+        e.add_field(
+            name="Admins",
+            value="/start · /stop · /restart · /cancel · /update · /save · /backup "
+            "· /restore · /announce · /kick · /ban · /unban",
+            inline=False,
+        )
+        e.set_footer(
+            text="Admin commands need the configured role/user (or Manage Server if "
+            "none is set)."
+        )
+        return e
 
     async def _moderate(
         self, interaction: discord.Interaction, name: str, reason: str, action: str
@@ -468,6 +760,213 @@ class PalBot(discord.Client):
             await interaction.followup.send(f"✅ {action.title()}ed **{match.name}** — {reason}")
         except PalApiError as err:
             await interaction.followup.send(f"❌ {err}")
+
+    # ---------- confirmation ----------
+
+    async def _confirm(self, interaction: discord.Interaction, prompt: str) -> bool:
+        """Post a Confirm/Cancel prompt to the invoking admin and wait. Returns
+        True only if they pressed Confirm before it timed out. Consumes the
+        interaction's initial response, so callers use followup afterwards."""
+        view = _ConfirmView(interaction.user.id)
+        await interaction.response.send_message(prompt, view=view)
+        await view.wait()
+        outcome = "✅ Confirmed." if view.value else "✖️ Cancelled."
+        with contextlib.suppress(discord.DiscordException):
+            await interaction.edit_original_response(content=f"{prompt}\n{outcome}", view=None)
+        return view.value is True
+
+    # ---------- start / stop ----------
+
+    async def _server_power(self, interaction: discord.Interaction, action: str) -> None:
+        if not self._is_admin(interaction):
+            await interaction.response.send_message("Not allowed.", ephemeral=True)
+            return
+        if action == "stop":
+            if not await self._confirm(
+                interaction,
+                "⏹️ **Stop the server?** Everyone online is disconnected, and it "
+                "stays down until someone starts it again.",
+            ):
+                return
+            result = await self._sched.stop_server()
+            await interaction.followup.send(
+                {
+                    "ok": "⏹️ World saved and server stopped.",
+                    "busy": "⏳ The server is mid-operation — try again in a moment.",
+                    "failed": "⚠️ The stop didn't confirm — the server may be hung. "
+                    "Check the box, or try /restart.",
+                }[result]
+            )
+            return
+        # start
+        await interaction.response.defer()
+        result = await self._sched.start_server()
+        await interaction.followup.send(
+            {
+                "ok": "▶️ Starting the server — I'll post here when it's up "
+                "(the REST API takes about a minute to answer).",
+                "busy": "⏳ The server is mid-operation — try again in a moment.",
+            }[result]
+        )
+
+    # ---------- richer reads ----------
+
+    async def _whois(self, interaction: discord.Interaction, name: str) -> None:
+        await interaction.response.defer()
+        try:
+            ps = await self._api.players()
+        except PalApiError:
+            ps = []  # server down / unreachable — still answer from history below
+        match = next(
+            (p for p in ps if p.name.lower() == name.lower() or p.user_id == name), None
+        )
+        admin = self._is_admin(interaction)
+
+        if match is not None:
+            mins = await asyncio.to_thread(
+                self._store.total_playtime_minutes, match.user_id
+            )
+            e = discord.Embed(title=f"{match.name} — online", colour=GREEN)
+            e.add_field(name="Level", value=str(match.level))
+            e.add_field(name="Ping", value=f"{match.ping:.0f} ms")
+            e.add_field(name="Buildings", value=str(match.building_count))
+            e.add_field(name="Playtime", value=f"{mins / 60:.1f}h")
+            await interaction.followup.send(embed=e)
+            # A player's live map position (a grief vector) and platform ID (the
+            # dox / ban handle) go ONLY to the admin who asked — a public embed
+            # would broadcast them to everyone in the channel.
+            if admin:
+                priv = discord.Embed(title=f"{match.name} — admin details", colour=BLUE)
+                priv.add_field(
+                    name="Location",
+                    value=f"{match.location_x:.0f}, {match.location_y:.0f}",
+                )
+                priv.add_field(name="User ID", value=f"`{match.user_id}`")
+                await interaction.followup.send(embed=priv, ephemeral=True)
+            return
+
+        # Offline: fall back to what the session history remembers.
+        uid = await asyncio.to_thread(self._store.resolve_user_id, name)
+        if uid is None:
+            await interaction.followup.send(
+                f"I've never seen a player called **{name}** — names come from who's "
+                "played while palctl was running."
+            )
+            return
+        seen = await asyncio.to_thread(self._store.last_seen, uid)
+        mins = await asyncio.to_thread(self._store.total_playtime_minutes, uid)
+        display = seen[0] if seen else name
+        e = discord.Embed(title=f"{display} — offline", colour=BLUE)
+        e.add_field(name="Playtime", value=f"{mins / 60:.1f}h")
+        if seen:
+            e.add_field(name="Last seen", value=_fmt_last_seen(seen[1]))
+        await interaction.followup.send(embed=e)
+        if admin:  # platform ID only to the admin who asked
+            await interaction.followup.send(
+                f"🔑 `{display}` user ID: `{uid}`", ephemeral=True
+            )
+
+    async def _playtime(self, interaction: discord.Interaction, name: str) -> None:
+        await interaction.response.defer()
+        try:
+            online = await self._api.players()
+        except PalApiError:
+            online = []
+        match = next(
+            (p for p in online if p.name.lower() == name.lower() or p.user_id == name),
+            None,
+        )
+        if match is not None:
+            uid, display, suffix = match.user_id, match.name, f", currently level {match.level}"
+        else:
+            uid = await asyncio.to_thread(self._store.resolve_user_id, name)
+            if uid is None:
+                await interaction.followup.send(
+                    f"I've never seen a player called **{name}** — names come from "
+                    "who's played while palctl was running."
+                )
+                return
+            seen = await asyncio.to_thread(self._store.last_seen, uid)
+            display = seen[0] if seen else name
+            suffix = " (offline)"
+        mins = await asyncio.to_thread(self._store.total_playtime_minutes, uid)
+        await interaction.followup.send(f"**{display}** — {mins / 60:.1f}h total{suffix}.")
+
+    async def _health_embed(self) -> discord.Embed:
+        stats = await asyncio.to_thread(procs.proc_stats)
+        wd = self._cfg.watchdog
+        fps = frame_time = 0
+        try:
+            m = await self._api.metrics()
+            fps, frame_time = m.server_fps, m.server_frame_time
+        except PalApiError:
+            pass
+        # Forecast off the persisted history (survives daemon restarts), same
+        # data the daemon's own predictor fits.
+        samples = [
+            (s["at"], s["memory_mb"])
+            for s in await asyncio.to_thread(self._store.recent_metrics, 720)
+            if s.get("memory_mb")
+        ]
+        ttl = leak.time_to_limit_minutes(samples, wd.memory_limit_mb)
+        fields, warning = _health_fields(
+            memory_mb=stats.memory_mb if stats else 0.0,
+            limit_mb=wd.memory_limit_mb,
+            cpu=stats.cpu_percent if stats else 0.0,
+            fps=fps,
+            frame_time=frame_time,
+            ttl_minutes=ttl,
+        )
+        e = discord.Embed(title="Server health", colour=RED if warning else GREEN)
+        for name, value in fields:
+            e.add_field(name=name, value=value, inline=False)
+        if not stats:
+            e.description = "The Palworld server process isn't running right now."
+        return e
+
+    # ---------- autocomplete sources ----------
+
+    async def _player_name_choices(
+        self, _interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        try:
+            ps = await self._api.players()
+        except PalApiError:
+            return []
+        names = _match_choices([p.name for p in ps], current)
+        return [app_commands.Choice(name=n, value=n) for n in names]
+
+    async def _known_name_choices(
+        self, _interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Online players first, then names from session history — the pool for
+        /playtime and /whois, which answer for offline players too."""
+        try:
+            online = [p.name for p in await self._api.players()]
+        except PalApiError:
+            online = []
+        recent = await asyncio.to_thread(self._store.recent_player_names, 50)
+        seen: set[str] = set()
+        merged: list[str] = []
+        for n in (*online, *recent):
+            if n.lower() in seen:
+                continue
+            seen.add(n.lower())
+            merged.append(n)
+        names = _match_choices(merged, current)
+        return [app_commands.Choice(name=n, value=n) for n in names]
+
+    async def _backup_name_choices(
+        self, _interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        from pathlib import Path
+
+        try:
+            bs = await asyncio.to_thread(backups.listing, Path(self._cfg.backup_root))
+        except Exception:
+            return []
+        names = _match_choices([b.name for b in bs], current)
+        return [app_commands.Choice(name=n, value=n) for n in names]
 
     # ---------- lifecycle ----------
 

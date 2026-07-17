@@ -10,6 +10,68 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+### Added
+- **A much more capable Discord bot — the real from-anywhere remote control.**
+  Since the web dashboard is deliberately not internet-facing, the bot is how
+  you run the server when you're away, so it grew the commands that were
+  missing:
+  - **`/start` and `/stop`** — the bot could restart but never start or stop the
+    server. Both now go through the same desired-running intent the GUI/CLI use,
+    so a Discord `/stop` is remembered and auto-recovery won't fight it.
+  - **`/health`** — memory against the watchdog limit *with the leak forecast*
+    (minutes until a restart is due on the current trend), plus CPU, FPS, and
+    frame time; the embed turns red when memory is near the limit or a restart
+    is close.
+  - **`/leaderboard`** (top players by total playtime), **`/whois`** (a player
+    card), **`/events`** (recent server events, like the CLI and dashboard have),
+    **`/next`** (upcoming automatic restart/backup/update), and **`/help`** (a
+    grouped command list).
+  - **`/playtime` and `/whois` answer for offline players too**, resolved from the
+    session history palctl already keeps — the common case is checking on someone
+    who isn't on right now. Playtime now also counts the session in progress, not
+    just finished ones. A player's live map position and platform ID stay
+    admin-only, and are delivered to the requesting admin privately (an ephemeral
+    reply) so an admin's lookup doesn't broadcast them to the whole channel.
+  - **`/cancel`** aborts an in-progress restart countdown before the server
+    actually goes down — change your mind after `/restart` and call it off.
+  - **Autocomplete** for player-name and backup-name arguments (`/kick` `/ban`
+    `/playtime` `/whois` `/restore`), drawing on the live player list, the session
+    history, and the backups on disk — so you're not typing exact names on a phone.
+  - The optional **live status embed** now carries the leak forecast, so a pinned
+    message answers "is a restart coming?" at a glance. `/events` shows only
+    non-sensitive event kinds to non-admins (no raw error/watchdog internals).
+  - **Confirm/Cancel buttons** on the destructive commands (`/stop` `/update`
+    `/restore`), gated to the admin who invoked them, so a mis-tap can't take the
+    server down.
+
+- **Reach the web dashboard from other devices on your LAN.** The daemon's
+  dashboard/control API used to bind `127.0.0.1` unconditionally, so the
+  dashboard answered only a browser on the server PC itself — opening it from
+  another PC or a phone on the same network silently got nothing. A new
+  **Config → Web dashboard → "Allow access from other devices on this network"**
+  toggle (config key `ui_bind_host`, default `127.0.0.1`; `0.0.0.0` for LAN)
+  opts into a LAN-reachable bind. `palctl ui` then also prints an
+  `On this network:` URL to open on the other device, and the daemon logs a
+  one-line warning at startup that the per-user token is the only credential
+  once it's exposed. The safe default is unchanged — you opt in, and it takes
+  effect on the next daemon restart. On Windows the daemon also opens the
+  firewall for the dashboard port (private networks only) when LAN access is on
+  and it's running elevated — otherwise binding to the LAN was a silent no-op,
+  since the firewall drops the inbound connections — and closes it again when
+  LAN access is turned off. Don't port-forward the port to the internet; for
+  anything past a trusted LAN, an SSH tunnel or Tailscale still authenticates
+  and encrypts the connection.
+
+### Fixed
+- **A Stop that doesn't actually stop is no longer reported as success.** The
+  daemon's HTTP `/action/stop` (used by the web dashboard and the `palctl stop`
+  CLI) discarded the result of the service stop and always answered `ok`, so a
+  hung server that never confirmed STOPPED still showed "saved and stopped."
+  Start/stop now go through the one shared implementation the Discord bot uses,
+  and a stop that doesn't confirm surfaces as a failure (HTTP 502 with a message)
+  everywhere — dashboard, CLI, and bot alike. The Stop intent is still recorded,
+  so auto-recovery won't resurrect the server.
+
 ## [1.1.0] — 2026-07-17
 
 ### Added

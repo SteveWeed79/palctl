@@ -212,18 +212,93 @@ class SessionStore:
             self._db.commit()
             return (now - datetime.fromisoformat(joined_at)).total_seconds() / 60
 
-    def total_playtime_minutes(self, user_id: str) -> float:
+    def total_playtime_minutes(self, user_id: str, *, now: datetime | None = None) -> float:
+        """Total minutes played, INCLUDING the current session if the player is
+        online — an open row (left_at NULL) is counted up to `now`, so /playtime
+        reflects the session in progress instead of freezing at the last logout."""
+        now = now or datetime.now(UTC)
         with self._lock:
             rows = self._db.execute(
-                "SELECT joined_at, left_at FROM sessions WHERE user_id=? AND left_at IS NOT NULL",
+                "SELECT joined_at, left_at FROM sessions WHERE user_id=?",
                 (user_id,),
             ).fetchall()
         total = 0.0
         for joined, left in rows:
-            total += (
-                datetime.fromisoformat(left) - datetime.fromisoformat(joined)
-            ).total_seconds() / 60
+            try:
+                start = datetime.fromisoformat(joined)
+                end = datetime.fromisoformat(left) if left else now
+            except (ValueError, TypeError):
+                continue  # a half-written row shouldn't zero out a real total
+            total += (end - start).total_seconds() / 60
         return total
+
+    def resolve_user_id(self, name: str) -> str | None:
+        """The most-recent user_id seen for a display name, from session history.
+        Lets /playtime and /whois answer for a player who's offline right now —
+        the live /players list only knows who's on. Case-insensitive (ASCII)."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT user_id FROM sessions WHERE name = ? COLLATE NOCASE "
+                "ORDER BY rowid DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+        return row[0] if row else None
+
+    def last_seen(self, user_id: str) -> tuple[str, str] | None:
+        """(name, left_at-ISO) of the player's most recent finished session, or
+        None if they have no closed session on record."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT name, left_at FROM sessions "
+                "WHERE user_id = ? AND left_at IS NOT NULL ORDER BY rowid DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def recent_player_names(self, limit: int = 50) -> list[str]:
+        """Distinct display names from recent sessions, most-recent first. The
+        autocomplete pool for /playtime and /whois, which now answer offline."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT name FROM sessions ORDER BY rowid DESC"
+            ).fetchall()
+        seen: set[str] = set()
+        out: list[str] = []
+        for (name,) in rows:
+            low = name.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            out.append(name)
+            if len(out) >= limit:
+                break
+        return out
+
+    def top_playtime(
+        self, limit: int = 10, *, now: datetime | None = None
+    ) -> list[tuple[str, float]]:
+        """The `limit` players with the most total playtime, as (name, minutes)
+        highest first. Includes the current session for anyone online (an open
+        row counted up to `now`). The name is the most recent one seen for that
+        account, so a rename shows the current handle. Powers /leaderboard."""
+        now = now or datetime.now(UTC)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT user_id, name, joined_at, left_at FROM sessions ORDER BY rowid"
+            ).fetchall()
+        totals: dict[str, float] = {}
+        latest_name: dict[str, str] = {}
+        for user_id, name, joined, left in rows:
+            try:
+                start = datetime.fromisoformat(joined)
+                end = datetime.fromisoformat(left) if left else now
+                mins = (end - start).total_seconds() / 60
+            except (ValueError, TypeError):
+                continue  # a malformed timestamp shouldn't sink the leaderboard
+            totals[user_id] = totals.get(user_id, 0.0) + mins
+            latest_name[user_id] = name  # rows are rowid-ordered, so last wins
+        ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
+        return [(latest_name[uid], mins) for uid, mins in ranked[: max(0, limit)]]
 
     METRICS_RETAIN_SECONDS = 7 * 24 * 3600
 

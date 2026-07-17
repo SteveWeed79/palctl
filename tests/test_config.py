@@ -18,17 +18,21 @@ def test_defaults_when_missing(cfg_path: Path):
     cfg = Config.load()
     assert cfg.api_port == 8212
     assert cfg.watchdog.enabled
+    # The dashboard stays loopback-only until the admin opts into LAN access.
+    assert cfg.ui_bind_host == "127.0.0.1"
 
 
 def test_save_load_round_trip(cfg_path: Path):
     cfg = Config()
     cfg.api_port = 9000
+    cfg.ui_bind_host = "0.0.0.0"
     cfg.watchdog.memory_limit_mb = 10_000
     cfg.discord.channel_id = 42
     cfg.save()
 
     loaded = Config.load()
     assert loaded.api_port == 9000
+    assert loaded.ui_bind_host == "0.0.0.0"
     assert loaded.watchdog.memory_limit_mb == 10_000
     assert loaded.discord.channel_id == 42
 

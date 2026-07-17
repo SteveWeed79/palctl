@@ -25,7 +25,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from . import backups, inifile, leak, localauth, procs
+from . import backups, inifile, leak, localauth, netinfo, procs
 from .api import PalApi, PalApiError
 from .bot import run_bot
 from .client import DAEMON_PORT
@@ -153,6 +153,24 @@ _FAVICON_SVG = (
 )
 
 
+def lan_exposure_warning(host: str) -> str | None:
+    """The line to log when the dashboard/control API is bound beyond loopback.
+
+    Binding to 0.0.0.0 is a deliberate opt-in (so the dashboard works from other
+    devices on the LAN), but it moves the whole security boundary onto the token:
+    it is now the only thing between the network and start/stop/restore/kick/ban,
+    and it rides over plain HTTP. Fine on a home LAN, never on the internet — say
+    so, once, at startup. Pure, so it's testable without a live socket."""
+    if netinfo.is_loopback(host):
+        return None
+    return (
+        f"dashboard/control API bound to {host} — it is now reachable from other "
+        "devices on this network. The per-user token in the dashboard URL is the "
+        "only credential and it travels over plain HTTP, so keep this to a LAN "
+        f"you trust and NEVER port-forward port {DAEMON_PORT} to the internet."
+    )
+
+
 def make_auth_middleware(token: str, exempt: frozenset[str] = frozenset()):
     """aiohttp middleware that rejects any request without the shared token.
     `exempt` paths skip the check — only the dashboard page itself, which
@@ -193,6 +211,10 @@ class Daemon:
         self.scheduler = Scheduler(
             self.cfg, self.api, self.bus, self.control,
             intent_running=lambda: self._desired_running,
+            # Lets a Discord /start or /stop persist the admin's intent through
+            # the same property setter the GUI/CLI use, so auto-recovery never
+            # fights a stop issued from Discord.
+            set_intent=lambda running: setattr(self, "_desired_running", running),
         )
         self.watchdog = Watchdog(self.cfg, self.api, self.bus, self.control)
         self.bot = None  # set by run_bot if the Discord bot is enabled
@@ -240,6 +262,36 @@ class Daemon:
             warning = None
         if warning:
             self.log.warning("%s", warning)
+
+    def _sync_dashboard_firewall(self, host: str) -> None:
+        """On Windows, a non-loopback bind still needs a firewall rule or other
+        devices on the LAN can't reach the dashboard — so binding 0.0.0.0 alone
+        is a silent no-op. Open the port (private networks) when LAN access is
+        on, and close it again when off. Best-effort: a non-elevated daemon can't
+        touch the firewall, so log the one-line manual command instead."""
+        if not sys.platform.startswith("win"):
+            return
+        from . import firewall
+
+        try:
+            if netinfo.is_loopback(host):
+                if firewall.remove_rule() == "removed":
+                    self.log.info("closed the dashboard firewall rule (LAN access off)")
+                return
+            outcome = firewall.ensure_rule(DAEMON_PORT)
+            if outcome == "added":
+                self.log.info(
+                    "opened the Windows Firewall for the dashboard on port %d "
+                    "(private networks only)", DAEMON_PORT,
+                )
+            elif outcome == "failed":
+                self.log.warning(
+                    "couldn't open the Windows Firewall for the dashboard — other "
+                    "devices on your LAN stay blocked until you run this once as "
+                    "administrator:\n    %s", firewall.manual_add_command(DAEMON_PORT),
+                )
+        except Exception as e:  # firewall trouble must never break startup
+            self.log.warning("dashboard firewall setup failed: %s", e)
 
     def _warn_if_cloud_mirror_broken(self) -> None:
         """If the backup mirror is an rclone remote that's misconfigured — no
@@ -619,22 +671,26 @@ class Daemon:
 
             try:
                 if what == "start":
-                    op = self.control.try_operation("start")
-                    if op is None:
+                    # One implementation for start/stop (also the bot's /start,
+                    # /stop): sets the desired-running intent and drives control.
+                    if await self.scheduler.start_server() == "busy":
                         return _busy_response(self.control.current_op)
-                    self._desired_running = True
-                    async with op:
-                        await self.control.start()
                 elif what == "stop":
-                    op = self.control.try_operation("stop")
-                    if op is None:
+                    result = await self.scheduler.stop_server()
+                    if result == "busy":
                         return _busy_response(self.control.current_op)
-                    # Intentional: don't let auto-recovery start it back up.
-                    self._desired_running = False
-                    async with op:
-                        with contextlib.suppress(PalApiError):
-                            await self.api.save()
-                        await self.control.stop()
+                    if result == "failed":
+                        # The world was saved and the Stop intent recorded, but
+                        # the service never confirmed STOPPED — surface that
+                        # instead of a misleading "ok" (matches the bot's /stop).
+                        return web.json_response(
+                            {
+                                "error": "The world was saved and the server was "
+                                "told to stop, but it didn't confirm STOPPED — it "
+                                "may be hung. Check the server, or try a restart."
+                            },
+                            status=502,
+                        )
                 elif what == "restart":
                     if self.control.busy:
                         return _busy_response(self.control.current_op)
@@ -708,10 +764,17 @@ class Daemon:
     async def run(self) -> None:
         runner = web.AppRunner(self._routes())
         await runner.setup()
-        # 127.0.0.1 only, and every request must carry the per-user token
-        # (see localauth) — but this API still must never leave the box.
-        await web.TCPSite(runner, "127.0.0.1", DAEMON_PORT).start()
-        self.log.info("daemon up; localhost API on 127.0.0.1:%d", DAEMON_PORT)
+        # Bind loopback by default (localhost only); every request must still
+        # carry the per-user token (see localauth). The admin can opt into
+        # `ui_bind_host = "0.0.0.0"` to reach the dashboard from other devices on
+        # the LAN — the warning below spells out that the token then stands alone.
+        host = self.cfg.ui_bind_host or "127.0.0.1"
+        await web.TCPSite(runner, host, DAEMON_PORT).start()
+        self.log.info("daemon up; control API on %s:%d", host, DAEMON_PORT)
+        warning = lan_exposure_warning(host)
+        if warning:
+            self.log.warning("%s", warning)
+        self._sync_dashboard_firewall(host)
         self._warn_if_cloud_mirror_broken()
 
         if self.cfg.check_for_updates:
@@ -882,6 +945,10 @@ def uninstall_service() -> None:
             return
         nssm = winservice.ensure_nssm(config_dir() / "bin")
         winservice.remove_service(nssm, SERVICE_NAME)
+        # Don't leave the dashboard firewall port open after uninstall.
+        from . import firewall
+
+        firewall.remove_rule()
     else:
         from . import systemd
 
