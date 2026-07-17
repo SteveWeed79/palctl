@@ -668,7 +668,35 @@ class ConfigTab(QWidget):
         token_help.setWordWrap(True)
         df.addRow(token_help)
         df.addRow("Channel ID", self.dc_channel)
+        # These two IDs are the usual snags. Both are numeric, so the
+        # save-time "must be a number" check can't catch a wrong-*kind* of ID
+        # (a user ID pasted for a role ID passes validation but never
+        # matches). Spell out where each comes from, right at the field.
+        channel_help = QLabel(
+            "Where the bot posts notifications. Turn on Discord "
+            "<b>Developer Mode</b> (Settings → Advanced), then right-click the "
+            "channel → <b>Copy Channel ID</b>. The bot also needs "
+            "<b>View Channel</b>, <b>Send Messages</b> and <b>Embed Links</b> "
+            "there, or notifications silently won't appear."
+        )
+        channel_help.setWordWrap(True)
+        df.addRow(channel_help)
         df.addRow("Admin role ID", self.dc_role)
+        role_help = QLabel(
+            "Who may run /announce, /restart, /kick, etc. This is a "
+            "<b>role</b> ID, <b>not your user ID</b> — right-click a role in "
+            "Server Settings → Roles → <b>Copy Role ID</b>. Leave blank to "
+            "allow anyone with the <b>Manage Server</b> permission."
+        )
+        role_help.setWordWrap(True)
+        df.addRow(role_help)
+        guide = QLabel(
+            'Full walkthrough: <a href="https://github.com/SteveWeed79/palctl/'
+            'blob/main/docs/discord.md">Discord bot setup guide</a>.'
+        )
+        guide.setOpenExternalLinks(True)
+        guide.setWordWrap(True)
+        df.addRow(guide)
         df.addRow(
             QLabel(
                 "Token is stored encrypted in Windows Credential Manager.\n"
