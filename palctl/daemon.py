@@ -25,7 +25,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from . import backups, inifile, leak, localauth, procs
+from . import backups, inifile, leak, localauth, netinfo, procs
 from .api import PalApi, PalApiError
 from .bot import run_bot
 from .client import DAEMON_PORT
@@ -151,6 +151,24 @@ _FAVICON_SVG = (
     "C7.8 20.1 4.5 16.3 4.5 11.5 V5.5 Z'/>"
     "<path d='M6.5 12 H9 L10.5 8.5 L13 15.5 L14.5 12 H17.5'/></svg>"
 )
+
+
+def lan_exposure_warning(host: str) -> str | None:
+    """The line to log when the dashboard/control API is bound beyond loopback.
+
+    Binding to 0.0.0.0 is a deliberate opt-in (so the dashboard works from other
+    devices on the LAN), but it moves the whole security boundary onto the token:
+    it is now the only thing between the network and start/stop/restore/kick/ban,
+    and it rides over plain HTTP. Fine on a home LAN, never on the internet — say
+    so, once, at startup. Pure, so it's testable without a live socket."""
+    if netinfo.is_loopback(host):
+        return None
+    return (
+        f"dashboard/control API bound to {host} — it is now reachable from other "
+        "devices on this network. The per-user token in the dashboard URL is the "
+        "only credential and it travels over plain HTTP, so keep this to a LAN "
+        f"you trust and NEVER port-forward port {DAEMON_PORT} to the internet."
+    )
 
 
 def make_auth_middleware(token: str, exempt: frozenset[str] = frozenset()):
@@ -708,10 +726,16 @@ class Daemon:
     async def run(self) -> None:
         runner = web.AppRunner(self._routes())
         await runner.setup()
-        # 127.0.0.1 only, and every request must carry the per-user token
-        # (see localauth) — but this API still must never leave the box.
-        await web.TCPSite(runner, "127.0.0.1", DAEMON_PORT).start()
-        self.log.info("daemon up; localhost API on 127.0.0.1:%d", DAEMON_PORT)
+        # Bind loopback by default (localhost only); every request must still
+        # carry the per-user token (see localauth). The admin can opt into
+        # `ui_bind_host = "0.0.0.0"` to reach the dashboard from other devices on
+        # the LAN — the warning below spells out that the token then stands alone.
+        host = self.cfg.ui_bind_host or "127.0.0.1"
+        await web.TCPSite(runner, host, DAEMON_PORT).start()
+        self.log.info("daemon up; control API on %s:%d", host, DAEMON_PORT)
+        warning = lan_exposure_warning(host)
+        if warning:
+            self.log.warning("%s", warning)
         self._warn_if_cloud_mirror_broken()
 
         if self.cfg.check_for_updates:

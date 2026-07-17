@@ -10,6 +10,21 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+### Added
+- **Reach the web dashboard from other devices on your LAN.** The daemon's
+  dashboard/control API used to bind `127.0.0.1` unconditionally, so the
+  dashboard answered only a browser on the server PC itself — opening it from
+  another PC or a phone on the same network silently got nothing. A new
+  **Config → Web dashboard → "Allow access from other devices on this network"**
+  toggle (config key `ui_bind_host`, default `127.0.0.1`; `0.0.0.0` for LAN)
+  opts into a LAN-reachable bind. `palctl ui` then also prints an
+  `On this network:` URL to open on the other device, and the daemon logs a
+  one-line warning at startup that the per-user token is the only credential
+  once it's exposed. The safe default is unchanged — you opt in, and it takes
+  effect on the next daemon restart. Don't port-forward the port to the
+  internet; for anything past a trusted LAN, an SSH tunnel or Tailscale still
+  authenticates and encrypts the connection.
+
 ## [1.1.0] — 2026-07-17
 
 ### Added

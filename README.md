@@ -134,20 +134,30 @@ actions confirm first, and a restore still snapshots the current world). The
 page is static; the data and action calls need your per-user token, which
 `palctl ui` puts in the URL fragment — fragments never leave the browser.
 
-**Manage it from your phone, safely.** The dashboard never leaves
-`127.0.0.1`, so remote access rides on a tunnel you already trust instead of
-palctl exposing a login to the network:
+**Open it from another PC or your phone on the same network.** By default the
+dashboard binds `127.0.0.1`, which means it only answers a browser on the
+server PC itself — a browser on another machine gets nothing. To reach it from
+other devices on your LAN, turn on **Config → Web dashboard → "Allow access
+from other devices on this network"** (or set `ui_bind_host` to `0.0.0.0` in
+`config.json`), then **restart the daemon** — the port is bound once at startup.
+`palctl ui` then prints an `On this network:` URL to open on the other device.
+The per-user token in that URL is the only credential and it rides plain HTTP,
+so keep this to a network you trust. Don't port-forward `8830` to the internet —
+same rule as `8212`.
+
+**Prefer a tunnel when the network isn't fully trusted.** A tunnel authenticates
+the connection and encrypts it, instead of leaning on the token alone:
 
 - **ssh** — `ssh -L 8830:127.0.0.1:8830 your-server-box`, then run `palctl ui`
   on the box and open the printed URL on your local machine. SSH is the
-  authentication.
+  authentication. Works with the default `127.0.0.1` bind — nothing to expose.
 - **Tailscale** (or any WireGuard-style private network) — on the server box:
   `tailscale serve 8830`. The dashboard is now reachable from your own devices
   only, with HTTPS, at the URL `tailscale serve` prints. Get the tokened path
   from `palctl ui` on the box.
 
 Both give you the full dashboard from anywhere with zero ports opened to the
-internet. Don't port-forward 8830 on your router — same rule as 8212.
+internet.
 
 **Discord bot**
 `/status` `/players` `/playtime` `/announce` `/save` `/backup` `/backups` `/restore` `/restart` `/update` `/kick` `/ban`

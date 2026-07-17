@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import netinfo
 from ..config import (
     CONFIG_PATH,
     Config,
@@ -656,6 +657,23 @@ class ConfigTab(QWidget):
         )
         v.addWidget(api)
 
+        web = QGroupBox("Web dashboard")
+        webf = QFormLayout(web)
+        self.ui_lan = QCheckBox(checked=not netinfo.is_loopback(cfg.ui_bind_host))
+        webf.addRow("Allow access from other devices on this network", self.ui_lan)
+        web_help = QLabel(
+            "Off (default): the dashboard (<code>palctl ui</code>) opens only in a "
+            "browser on this PC.<br>On: any device on your LAN — a phone, another "
+            "PC — can open it with the tokened URL that <code>palctl ui</code> "
+            "prints.<br>The token in that URL is the only credential and it's "
+            "plain HTTP, so keep this to a network you trust and never "
+            "port-forward the dashboard port to the internet.<br>"
+            "<b>Takes effect after the daemon restarts.</b>"
+        )
+        web_help.setWordWrap(True)
+        webf.addRow("", web_help)
+        v.addWidget(web)
+
         wd = QGroupBox("Memory-leak watchdog")
         wf = QFormLayout(wd)
         self.wd_enabled = QCheckBox(checked=cfg.watchdog.enabled)
@@ -859,6 +877,12 @@ class ConfigTab(QWidget):
         c.service_name = self.service.text()
         c.api_port = self.api_port.value()
 
+        # 0.0.0.0 = reachable from the LAN; 127.0.0.1 = this box only. The socket
+        # is bound once at daemon start, so a change here only lands on restart.
+        new_ui_host = "0.0.0.0" if self.ui_lan.isChecked() else "127.0.0.1"
+        ui_host_changed = new_ui_host != c.ui_bind_host
+        c.ui_bind_host = new_ui_host
+
         if self.wd_hard.value() < self.wd_limit.value():
             QMessageBox.warning(
                 self, "Check the memory limits",
@@ -901,13 +925,19 @@ class ConfigTab(QWidget):
 
         try:
             call("/action/reload-config", {})
-            QMessageBox.information(
-                self, "Saved",
+            msg = (
                 "Config saved and daemon reloaded.\n\n"
                 "If the Discord bot was off, it is starting now — allow a few "
                 "seconds to connect. Changing the token of a bot that is "
-                "already connected still needs a daemon restart.",
+                "already connected still needs a daemon restart."
             )
+            if ui_host_changed:
+                msg += (
+                    "\n\nThe network-access change takes effect after you restart "
+                    "the palctl daemon — the dashboard port is bound once when the "
+                    "daemon starts."
+                )
+            QMessageBox.information(self, "Saved", msg)
         except Exception:
             QMessageBox.information(
                 self, "Saved",

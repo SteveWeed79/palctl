@@ -133,9 +133,21 @@ class Config:
     service_name: str = "PalServer"
     app_id: str = "2394010"
 
-    # REST API
+    # REST API (the Palworld server's own admin API — palctl only ever talks to
+    # it on this box, so this stays loopback).
     api_host: str = "127.0.0.1"
     api_port: int = 8212
+
+    # Web dashboard + control API — the daemon's OWN HTTP server (port 8830),
+    # the thing `palctl ui` opens and the GUI talks to.
+    #   "127.0.0.1" — reachable only from a browser on THIS PC (the safe
+    #     default; remote access then rides an SSH tunnel or Tailscale).
+    #   "0.0.0.0"   — reachable from other devices on your LAN. The per-user
+    #     token in the dashboard URL is then the ONLY credential, and it travels
+    #     over plain HTTP, so keep this to a network you trust and never
+    #     port-forward the port to the internet.
+    # Takes effect when the daemon (re)starts — the socket is bound once at boot.
+    ui_bind_host: str = "127.0.0.1"
 
     poll_seconds: int = 10
 

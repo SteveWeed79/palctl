@@ -200,12 +200,34 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "ui":
             # The token rides in the URL fragment: fragments never leave the
             # browser, and the page needs it to call the daemon's API.
-            url = f"http://127.0.0.1:{args.port}/#{localauth.get_or_create_token()}"
-            print(f"Dashboard: {url}")
+            from . import netinfo
+            from .config import Config
+
+            token = localauth.get_or_create_token()
+            host = Config.load().ui_bind_host
+            open_url, lan_url = netinfo.dashboard_targets(
+                host, args.port, token, netinfo.lan_ip()
+            )
+            print(f"Dashboard: {open_url}")
+            if lan_url:
+                # LAN access is on — this is the URL to open on another PC/phone.
+                print(f"On this network: {lan_url}")
+                print(
+                    "  Open that on another device. The token in the link is the "
+                    "only credential, so treat it like a password — and never "
+                    f"port-forward port {args.port} to the internet."
+                )
+            elif not netinfo.is_loopback(host):
+                # LAN bind requested, but we couldn't work out this box's address.
+                print(
+                    "  (LAN access is enabled, but palctl couldn't determine this "
+                    "machine's network address — browse to http://<this-box-ip>:"
+                    f"{args.port}/ and append #{token} from another device.)"
+                )
             try:
                 import webbrowser
 
-                webbrowser.open(url)
+                webbrowser.open(open_url)
             except Exception:
                 pass  # headless box: the printed URL is the point
     except DaemonError as e:

@@ -18,11 +18,27 @@ import palctl.daemon as daemon_mod  # noqa: E402
 from palctl.daemon import (  # noqa: E402  (after importorskip guard)
     _within_window,
     autorecover_phase,
+    lan_exposure_warning,
     make_auth_middleware,
     service_target,
     should_recover_now,
 )
 from palctl.localauth import TOKEN_HEADER  # noqa: E402
+
+# ---------------- LAN-exposure warning ----------------
+
+
+def test_lan_exposure_warning_silent_on_loopback():
+    for host in ("127.0.0.1", "localhost", "::1", ""):
+        assert lan_exposure_warning(host) is None, host
+
+
+def test_lan_exposure_warning_fires_off_loopback():
+    for host in ("0.0.0.0", "192.168.1.10"):
+        msg = lan_exposure_warning(host)
+        assert msg is not None
+        assert host in msg
+        assert "port-forward" in msg.lower()  # the one thing they must not do
 
 
 def test_within_window_keeps_recent_drops_old():
