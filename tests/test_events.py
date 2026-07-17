@@ -191,3 +191,48 @@ def test_unrecoverable_sessions_db_falls_back_to_memory(tmp_path: Path, monkeypa
     store = SessionStore(db)  # must not raise
     store.log_metrics({"at": 2.0, "memory_mb": 1.0})
     assert [s["at"] for s in store.recent_metrics(10)] == [2.0]
+
+
+# ---------------- top_playtime (leaderboard source) ----------------
+
+from datetime import UTC, datetime, timedelta  # noqa: E402
+
+
+def _insert_closed_session(store: SessionStore, uid: str, name: str, minutes: float,
+                           base: datetime = datetime(2026, 1, 1, tzinfo=UTC)) -> None:
+    joined = base
+    left = base + timedelta(minutes=minutes)
+    store._db.execute(
+        "INSERT INTO sessions (user_id, name, joined_at, left_at) VALUES (?,?,?,?)",
+        (uid, name, joined.isoformat(), left.isoformat()),
+    )
+    store._db.commit()
+
+
+def test_top_playtime_ranks_by_total_and_uses_latest_name(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    _insert_closed_session(store, "u1", "Alice", 30)
+    _insert_closed_session(store, "u1", "AliceRenamed", 90)  # same account, later name
+    _insert_closed_session(store, "u2", "Bob", 200)
+    top = store.top_playtime(10)
+    assert top[0] == ("Bob", 200.0)
+    assert top[1] == ("AliceRenamed", 120.0)  # 30 + 90, most-recent name wins
+
+
+def test_top_playtime_empty_and_limit(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    assert store.top_playtime() == []
+    _insert_closed_session(store, "a", "A", 10)
+    _insert_closed_session(store, "b", "B", 20)
+    assert [name for name, _ in store.top_playtime(1)] == ["B"]
+
+
+def test_top_playtime_skips_malformed_timestamps(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    store._db.execute(
+        "INSERT INTO sessions (user_id, name, joined_at, left_at) VALUES (?,?,?,?)",
+        ("x", "X", "not-a-date", "also-bad"),
+    )
+    store._db.commit()
+    _insert_closed_session(store, "y", "Y", 15)
+    assert store.top_playtime() == [("Y", 15.0)]  # the bad row is skipped, not fatal

@@ -695,3 +695,61 @@ def test_update_available_quiet_when_current(tmp_path, monkeypatch):
     events = _collect(bus)
     assert _run(sched_mod.Scheduler(cfg, FakeApi(), bus).check_update_available()) is False
     assert not any(e.kind == "update_available" for e in events)
+
+
+# ---------------- manual start / stop (bot & GUI parity) ----------------
+
+
+def test_start_server_records_intent_and_starts(monkeypatch):
+    cfg = Config()
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+    intent: list = []
+    sched = sched_mod.Scheduler(cfg, FakeApi(), EventBus(), set_intent=intent.append)
+    assert _run(sched.start_server()) == "ok"
+    assert intent == [True]  # 'server should be up' persisted
+    assert ("start", cfg.service_name) in calls
+
+
+def test_stop_server_saves_records_intent_and_stops(monkeypatch):
+    cfg = Config()
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+    intent: list = []
+    sched = sched_mod.Scheduler(cfg, FakeApi(), EventBus(), set_intent=intent.append)
+    assert _run(sched.stop_server()) == "ok"
+    assert intent == [False]  # a Stop must not be undone by auto-recovery
+    assert ("stop", cfg.service_name) in calls
+
+
+def test_stop_server_reports_failure_when_stop_does_not_confirm(monkeypatch):
+    cfg = Config()
+
+    async def stop(name):
+        return False  # service never reached STOPPED
+
+    async def start(name):
+        return True
+
+    monkeypatch.setattr(sched_mod.procs, "stop_service", stop)
+    monkeypatch.setattr(sched_mod.procs, "start_service", start)
+    intent: list = []
+    sched = sched_mod.Scheduler(cfg, FakeApi(), EventBus(), set_intent=intent.append)
+    assert _run(sched.stop_server()) == "failed"
+    assert intent == [False]  # the admin still asked to stop
+
+
+def test_start_server_when_busy_returns_busy_without_claiming_intent(monkeypatch):
+    cfg = Config()
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+    intent: list = []
+    sched = sched_mod.Scheduler(cfg, FakeApi(), EventBus(), set_intent=intent.append)
+
+    async def go():
+        async with sched._control.operation("restart"):  # something else holds the lock
+            return await sched.start_server()
+
+    assert _run(go()) == "busy"
+    assert intent == []  # never touched intent
+    assert not any(c[0] == "start" for c in calls)

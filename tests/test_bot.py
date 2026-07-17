@@ -309,3 +309,173 @@ def test_run_bot_gives_up_after_a_connected_session_ends(monkeypatch):
     assert len(created) == 1  # a real session that dropped is discord.py's job
     assert sleeps == []
     assert any("stopped" in e.message for e in bus.events)
+
+
+# ---------------- pure helpers (autocomplete / health / leaderboard / schedule) ----
+
+from datetime import datetime  # noqa: E402
+
+from palctl.api import PalApiError  # noqa: E402
+from palctl.bot import (  # noqa: E402
+    _ConfirmView,
+    _format_leaderboard,
+    _format_schedule,
+    _health_fields,
+    _match_choices,
+)
+
+
+def test_match_choices_prefix_before_contains():
+    opts = ["Steve", "SteveW", "Steven", "bob", "misteve"]
+    # prefix matches first (in input order), then substring matches
+    assert _match_choices(opts, "ste") == ["Steve", "SteveW", "Steven", "misteve"]
+
+
+def test_match_choices_empty_current_returns_all_capped():
+    assert _match_choices(["a", "b", "c"], "", limit=2) == ["a", "b"]
+
+
+def test_match_choices_case_insensitive_and_capped():
+    opts = [f"p{i}" for i in range(30)]
+    assert _match_choices(opts, "P", limit=25) == opts[:25]
+
+
+def test_health_fields_warns_near_the_memory_limit():
+    fields, warn = _health_fields(
+        memory_mb=11500, limit_mb=12000, cpu=10, fps=60, frame_time=16.0, ttl_minutes=None
+    )
+    assert warn is True
+    assert any("96%" in v for _, v in fields)
+
+
+def test_health_fields_warns_on_a_short_leak_forecast():
+    _, warn = _health_fields(
+        memory_mb=5000, limit_mb=12000, cpu=10, fps=60, frame_time=16.0, ttl_minutes=45
+    )
+    assert warn is True
+
+
+def test_health_fields_calm_when_low_and_stable():
+    fields, warn = _health_fields(
+        memory_mb=5000, limit_mb=12000, cpu=10, fps=60, frame_time=16.0, ttl_minutes=None
+    )
+    assert warn is False
+    assert any("no restart forecast" in v for _, v in fields)
+
+
+def test_format_leaderboard_medals_then_numbers():
+    out = _format_leaderboard([("A", 120.0), ("B", 60.0), ("C", 30.0), ("D", 6.0)])
+    lines = out.splitlines()
+    assert lines[0].startswith("🥇") and "2.0h" in lines[0]
+    assert "4." in lines[3] and "0.1h" in lines[3]
+
+
+def test_format_schedule_off_when_disabled():
+    cfg = Config()
+    cfg.schedule.enabled = False
+    assert "off" in _format_schedule(cfg.schedule, datetime(2026, 7, 17, 12, 0)).lower()
+
+
+def test_format_schedule_lists_restart_and_backups():
+    out = _format_schedule(Config().schedule, datetime(2026, 7, 17, 12, 0))
+    assert "Daily restart" in out and "Backups every" in out
+
+
+# ---------------- _server_power (start / stop delegation + gating) ----------------
+
+
+class _StubSched:
+    def __init__(self, result):
+        self.result = result
+        self.started = False
+        self.stopped = False
+
+    async def start_server(self):
+        self.started = True
+        return self.result
+
+    async def stop_server(self):
+        self.stopped = True
+        return self.result
+
+
+class _PowerBot:
+    def __init__(self, sched, *, admin=True):
+        self._sched = sched
+        self._admin = admin
+
+    def _is_admin(self, interaction):
+        return self._admin
+
+
+def test_server_power_start_maps_ok_to_starting_message():
+    sched = _StubSched("ok")
+    it = _FakeInteraction()
+    asyncio.run(PalBot._server_power(_PowerBot(sched), it, "start"))
+    assert sched.started
+    assert "Starting" in it.followup.messages[-1]
+
+
+def test_server_power_start_maps_busy():
+    sched = _StubSched("busy")
+    it = _FakeInteraction()
+    asyncio.run(PalBot._server_power(_PowerBot(sched), it, "start"))
+    assert "mid-operation" in it.followup.messages[-1].lower()
+
+
+def test_server_power_denies_non_admin_without_calling_scheduler():
+    sched = _StubSched("ok")
+    it = _FakeInteraction()
+    asyncio.run(PalBot._server_power(_PowerBot(sched, admin=False), it, "start"))
+    assert not sched.started
+    assert any(m[0] == "send_message" for m in it.response.messages)
+
+
+# ---------------- _ConfirmView (only the author may press) ----------------
+
+
+def _it_with_user(uid):
+    it = _FakeInteraction()
+    it.user = types.SimpleNamespace(id=uid)
+    return it
+
+
+def test_confirm_view_only_the_author_can_press():
+    async def go():
+        view = _ConfirmView(author_id=100)
+        assert await view.interaction_check(_it_with_user(100)) is True
+        stranger = _it_with_user(999)
+        assert await view.interaction_check(stranger) is False
+        return stranger
+
+    stranger = asyncio.run(go())
+    assert any(
+        m[0] == "send_message" and "isn't yours" in (m[1] or "")
+        for m in stranger.response.messages
+    )
+
+
+# ---------------- autocomplete choice sources ----------------
+
+
+class _PlayersApi:
+    def __init__(self, names):
+        self._names = names
+
+    async def players(self):
+        return [types.SimpleNamespace(name=n) for n in self._names]
+
+
+def test_player_name_choices_filters_and_wraps():
+    bot = types.SimpleNamespace(_api=_PlayersApi(["Steve", "Bob", "Steven"]))
+    choices = asyncio.run(PalBot._player_name_choices(bot, None, "ste"))
+    assert [c.value for c in choices] == ["Steve", "Steven"]
+
+
+def test_player_name_choices_empty_when_api_down():
+    class _BadApi:
+        async def players(self):
+            raise PalApiError("unreachable")
+
+    bot = types.SimpleNamespace(_api=_BadApi())
+    assert asyncio.run(PalBot._player_name_choices(bot, None, "x")) == []

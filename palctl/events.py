@@ -225,6 +225,29 @@ class SessionStore:
             ).total_seconds() / 60
         return total
 
+    def top_playtime(self, limit: int = 10) -> list[tuple[str, float]]:
+        """The `limit` players with the most total playtime, as (name, minutes)
+        highest first. The name is the most recent one seen for that account, so
+        a rename shows the current handle. Powers the Discord /leaderboard."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT user_id, name, joined_at, left_at FROM sessions "
+                "WHERE left_at IS NOT NULL ORDER BY rowid"
+            ).fetchall()
+        totals: dict[str, float] = {}
+        latest_name: dict[str, str] = {}
+        for user_id, name, joined, left in rows:
+            try:
+                mins = (
+                    datetime.fromisoformat(left) - datetime.fromisoformat(joined)
+                ).total_seconds() / 60
+            except (ValueError, TypeError):
+                continue  # a malformed timestamp shouldn't sink the leaderboard
+            totals[user_id] = totals.get(user_id, 0.0) + mins
+            latest_name[user_id] = name  # rows are rowid-ordered, so last wins
+        ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
+        return [(latest_name[uid], mins) for uid, mins in ranked[: max(0, limit)]]
+
     METRICS_RETAIN_SECONDS = 7 * 24 * 3600
 
     def log_metrics(self, s: dict) -> None:

@@ -19,18 +19,31 @@ This page is the long form.
 | Command | What it does | Admin only? |
 |---|---|---|
 | `/status` | Server status, FPS, memory, uptime | no |
+| `/health` | Memory vs the watchdog limit, the leak forecast, CPU, FPS | no |
 | `/players` | Who's online | no |
+| `/whois <name>` | Live details for one online player | no |
 | `/playtime <name>` | Total playtime for a player | no |
+| `/leaderboard [top]` | Top players by total playtime | no |
 | `/backups` | List recent backups | no |
+| `/next` | Upcoming automatic restarts, backups, and updates | no |
+| `/help` | Grouped list of every command | no |
+| `/start` | Start the server | **yes** |
+| `/stop` | Save and stop the server (asks first) | **yes** |
 | `/announce <message>` | In-game announcement | **yes** |
 | `/save` | Save the world now | **yes** |
 | `/backup` | Take a backup now | **yes** |
-| `/restore <name>` | Restore a backup (restarts the server) | **yes** |
+| `/restore <name>` | Restore a backup (asks first; restarts the server) | **yes** |
 | `/restart [reason]` | Restart with an in-game countdown | **yes** |
-| `/update` | Update via SteamCMD (stops the server) | **yes** |
+| `/update` | Update via SteamCMD (asks first; stops the server) | **yes** |
 | `/kick <name> [reason]` | Kick a player | **yes** |
 | `/ban <name> [reason]` | Ban a player | **yes** |
 | `/unban <user_id>` | Unban by user ID | **yes** |
+
+`/kick`, `/ban`, `/playtime`, `/whois`, and `/restore` **autocomplete** their
+name argument from the live player list / the backups on disk, so you rarely
+type a full name. The destructive commands (`/stop`, `/update`, `/restore`) show
+a **Confirm / Cancel** button that only the admin who ran the command can press —
+a mis-tap from a phone just cancels.
 
 **Automatic notifications** (the bot posts to your channel on its own):
 
@@ -175,8 +188,8 @@ looks like "commands work but alerts don't".
 
 ## Step 5 — Set who can run admin commands
 
-Admin-only commands (`/announce`, `/restart`, `/kick`, `/ban`, `/save`, `/backup`,
-`/restore`, `/update`, `/unban`) are gated by **`admin_role_id`**.
+Admin-only commands (`/start`, `/stop`, `/announce`, `/restart`, `/kick`, `/ban`,
+`/save`, `/backup`, `/restore`, `/update`, `/unban`) are gated by **`admin_role_id`**.
 
 Despite the name, this field accepts **either a role ID or a user ID** — palctl
 allows the caller if they *hold a role* with that ID **or** if they *are* the user

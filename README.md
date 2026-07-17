@@ -159,9 +159,22 @@ the connection and encrypts it, instead of leaning on the token alone:
 Both give you the full dashboard from anywhere with zero ports opened to the
 internet.
 
-**Discord bot**
-`/status` `/players` `/playtime` `/announce` `/save` `/backup` `/backups` `/restore` `/restart` `/update` `/kick` `/ban`
-plus join/leave, level-up, watchdog, server up/down, and update-available
+**Discord bot** — your real remote control, from anywhere, no ports opened.
+
+*Reads (anyone):*
+`/status` `/health` `/players` `/whois` `/playtime` `/leaderboard` `/backups` `/next` `/help`
+*Admin:*
+`/start` `/stop` `/restart` `/update` `/save` `/backup` `/restore` `/announce` `/kick` `/ban` `/unban`
+
+`/health` shows memory against the watchdog limit *and the leak forecast* — how
+long until a restart is due on the current trend. `/leaderboard` ranks players
+by total playtime, `/next` lists the upcoming automatic restart/backup/update,
+and `/whois` gives a live card for anyone online. Player-name and backup-name
+arguments **autocomplete**, and the destructive commands (`/stop` `/update`
+`/restore`) pop a **Confirm/Cancel** button first — both so the bot is safe to
+drive one-handed from a phone.
+
+Plus join/leave, level-up, watchdog, server up/down, and update-available
 notifications — with an optional auto-refreshing status message and a
 `{name}` join welcome. Full setup: [docs/discord.md](docs/discord.md).
 

@@ -11,6 +11,26 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Added
+- **A much more capable Discord bot — the real from-anywhere remote control.**
+  Since the web dashboard is deliberately not internet-facing, the bot is how
+  you run the server when you're away, so it grew the commands that were
+  missing:
+  - **`/start` and `/stop`** — the bot could restart but never start or stop the
+    server. Both now go through the same desired-running intent the GUI/CLI use,
+    so a Discord `/stop` is remembered and auto-recovery won't fight it.
+  - **`/health`** — memory against the watchdog limit *with the leak forecast*
+    (minutes until a restart is due on the current trend), plus CPU, FPS, and
+    frame time; the embed turns red when memory is near the limit or a restart
+    is close.
+  - **`/leaderboard`** (top players by total playtime), **`/whois`** (a live card
+    for an online player), **`/next`** (upcoming automatic restart/backup/update),
+    and **`/help`** (a grouped command list).
+  - **Autocomplete** for player-name and backup-name arguments (`/kick` `/ban`
+    `/playtime` `/whois` `/restore`), so you're not typing exact names on a phone.
+  - **Confirm/Cancel buttons** on the destructive commands (`/stop` `/update`
+    `/restore`), gated to the admin who invoked them, so a mis-tap can't take the
+    server down.
+
 - **Reach the web dashboard from other devices on your LAN.** The daemon's
   dashboard/control API used to bind `127.0.0.1` unconditionally, so the
   dashboard answered only a browser on the server PC itself — opening it from

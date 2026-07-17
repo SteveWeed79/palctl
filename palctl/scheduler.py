@@ -48,6 +48,7 @@ class Scheduler:
         bus: EventBus,
         control: ServerController | None = None,
         intent_running: Callable[[], bool] | None = None,
+        set_intent: Callable[[bool], None] | None = None,
     ) -> None:
         self._cfg = cfg
         self._api = api
@@ -62,6 +63,11 @@ class Scheduler:
         # silently brought back to life at 06:00. None = always-running (tests
         # and standalone use), matching the previous behaviour.
         self._intent_running = intent_running
+        # Records the admin's start/stop intent (the daemon's `_desired_running`
+        # setter, which persists it). Used by start_server/stop_server so a
+        # Discord /start or /stop is remembered exactly like the GUI's buttons —
+        # a /stop must not be undone by auto-recovery. None = no-op (standalone).
+        self._set_intent = set_intent or (lambda _running: None)
 
     def reconfigure(self, cfg: Config, api: PalApi) -> None:
         self._cfg = cfg
@@ -347,6 +353,35 @@ class Scheduler:
                     {"recovered": ok},
                 )
             )
+
+    # ---------- manual start / stop (bot & GUI parity) ----------
+
+    async def start_server(self) -> str:
+        """Start the server on an admin's request and record the intent so
+        scheduling/auto-recovery treat it as 'should be up'. Mirrors the daemon's
+        /action/start. Returns 'busy' if another operation holds the server,
+        else 'ok'."""
+        op = self._control.try_operation("start")
+        if op is None:
+            return "busy"
+        self._set_intent(True)
+        async with op:
+            await self._control.start()
+        return "ok"
+
+    async def stop_server(self) -> str:
+        """Save and stop the server on an admin's request, recording the Stop
+        intent so auto-recovery won't resurrect it. Mirrors /action/stop.
+        Returns 'busy' (another op holds it), 'ok' (confirmed STOPPED), or
+        'failed' (the stop didn't confirm — likely a hung server)."""
+        op = self._control.try_operation("stop")
+        if op is None:
+            return "busy"
+        self._set_intent(False)
+        async with op:
+            await self._control.save_best_effort()
+            ok = await self._control.stop()
+        return "ok" if ok else "failed"
 
     # ---------- restore ----------
 

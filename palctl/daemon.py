@@ -211,6 +211,10 @@ class Daemon:
         self.scheduler = Scheduler(
             self.cfg, self.api, self.bus, self.control,
             intent_running=lambda: self._desired_running,
+            # Lets a Discord /start or /stop persist the admin's intent through
+            # the same property setter the GUI/CLI use, so auto-recovery never
+            # fights a stop issued from Discord.
+            set_intent=lambda running: setattr(self, "_desired_running", running),
         )
         self.watchdog = Watchdog(self.cfg, self.api, self.bus, self.control)
         self.bot = None  # set by run_bot if the Discord bot is enabled
