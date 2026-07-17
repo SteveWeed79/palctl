@@ -15,21 +15,30 @@ It writes two committed assets from one source:
 * ``packaging/app-icon.ico`` — a multi-resolution icon for the frozen exes and
   the Inno Setup installer, so a Windows build needs no rasteriser.
 
+Frame format matters: Windows only supports PNG-compressed frames at 256×256;
+every smaller frame must be a classic 32-bit BMP (DIB). The 1.0.0 installer
+shipped an all-PNG .ico and Explorer showed the generic-exe icon whenever a
+view asked for a sub-256 frame (e.g. the Downloads folder) while 256px
+contexts looked fine — so this writes DIB frames below 256 and PNG at 256.
+
 Re-run this only when ``app-icon.svg`` or the tile design changes:
 
     python packaging/make_icon.py
 
-Needs ``cairosvg`` and its libcairo system library (Linux/macOS build hosts have
-it; it is not required at palctl runtime or in CI).
+Needs ``cairosvg`` (which pulls in Pillow, used to re-encode the small frames)
+and its libcairo system library (Linux/macOS build hosts have it; it is not
+required at palctl runtime or in CI).
 """
 
 from __future__ import annotations
 
+import io
 import re
 import struct
 from pathlib import Path
 
 import cairosvg
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 ICON_DIR = ROOT / "palctl" / "gui" / "icons"
@@ -83,17 +92,57 @@ def _png_frames_from_file(path: Path) -> dict[int, bytes]:
     }
 
 
-def _write_ico(frames: dict[int, bytes], out: Path) -> None:
-    """Assemble a PNG-framed .ico (Vista+; read by Windows, PyInstaller, Inno).
+def _dib_frame(png: bytes) -> bytes:
+    """Re-encode a PNG frame as the classic 32-bit BMP (DIB) icon image.
 
-    ICONDIR header, one ICONDIRENTRY per size, then the PNG blobs. A width/height
-    byte of 0 means 256 per the ICO spec.
+    BITMAPINFOHEADER with doubled height, then the bottom-up BGRA colour (XOR)
+    plane, then the 1-bit AND mask (rows padded to 32 bits; bit set where the
+    pixel is fully transparent — modern Windows keys on the alpha channel, but
+    the mask keeps legacy renderers from drawing a black box).
+    """
+    img = Image.open(io.BytesIO(png)).convert("RGBA")
+    w, h = img.size
+    rgba = img.tobytes()
+
+    xor = bytearray()
+    for y in range(h - 1, -1, -1):  # DIB rows run bottom-up
+        row = bytearray(rgba[y * w * 4 : (y + 1) * w * 4])
+        row[0::4], row[2::4] = row[2::4], row[0::4]  # RGBA -> BGRA
+        xor += row
+
+    stride = ((w + 31) // 32) * 4
+    mask = bytearray()
+    for y in range(h - 1, -1, -1):
+        bits = bytearray(stride)
+        for x in range(w):
+            if rgba[(y * w + x) * 4 + 3] == 0:
+                bits[x // 8] |= 0x80 >> (x % 8)
+        mask += bits
+
+    header = struct.pack(
+        "<IiiHHIIiiII",
+        40, w, h * 2,           # biSize, biWidth, biHeight (XOR + AND planes)
+        1, 32, 0,               # biPlanes, biBitCount, biCompression (BI_RGB)
+        len(xor) + len(mask),   # biSizeImage
+        0, 0, 0, 0,
+    )
+    return header + xor + mask
+
+
+def _write_ico(frames: dict[int, bytes], out: Path) -> None:
+    """Assemble the .ico (read by Windows, PyInstaller, Inno Setup).
+
+    ICONDIR header, one ICONDIRENTRY per size, then the image blobs. Windows
+    only reads PNG-compressed frames at 256×256 (where a width/height byte of
+    0 means 256, per the ICO spec); every smaller frame must be a classic DIB
+    or Explorer falls back to the generic icon in sub-256 views.
     """
     entries = sorted(frames.items())
     offset = 6 + 16 * len(entries)
     directory = struct.pack("<HHH", 0, 1, len(entries))  # reserved, type=icon, count
     blobs = b""
     for size, png in entries:
+        image = png if size >= 256 else _dib_frame(png)
         directory += struct.pack(
             "<BBBBHHII",
             size & 0xFF,  # width  (0 => 256)
@@ -102,11 +151,11 @@ def _write_ico(frames: dict[int, bytes], out: Path) -> None:
             0,            # reserved
             1,            # colour planes
             32,           # bits per pixel
-            len(png),
+            len(image),
             offset,
         )
-        blobs += png
-        offset += len(png)
+        blobs += image
+        offset += len(image)
     out.write_bytes(directory + blobs)
 
 

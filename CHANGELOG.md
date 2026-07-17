@@ -10,6 +10,14 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+### Fixed
+- **The installer (and frozen exes) show their icon everywhere in Explorer.**
+  `app-icon.ico` was written with every frame PNG-compressed, but Windows only
+  reads PNG icon frames at 256×256 — so any Explorer view that wanted a
+  smaller frame (the Downloads folder, details view, small/medium icons) fell
+  back to the generic-exe icon while 256px contexts looked fine. Frames below
+  256 are now classic 32-bit BMPs, per the ICO spec.
+
 ## [1.0.0] — 2026-07-15
 
 The first stable release. The 0.1.x line closed with a full
