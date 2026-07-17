@@ -47,6 +47,16 @@ Installers for every release are on the
     cheap cold storage). New `Copies to keep (mirror)` setting; `0` = match the
     local `Backups to keep` count. Local retention is now editable in the GUI
     too.
+- **The watchdog can now force-kill a server that ignores the stop.** A truly
+  wedged `PalServer` — the classic memory-leak hang — can sit in `STOP_PENDING`
+  forever, and every automatic recovery (memory watchdog, crash auto-recovery,
+  scheduled/pre-emptive restart) was reduced to the same ineffective service
+  stop, retried each cooldown. Those unattended restarts now escalate when the
+  stop times out: `terminate()` the server process, then a hard `kill()` if it
+  survives, then confirm the service reached STOPPED — with an event at each
+  step so it's clear a hard kill happened (a world save is attempted first). The
+  user's own **Stop** button is unchanged: it still reports an honest failure so
+  a human can decide, rather than force-killing behind your back.
 
 ### Changed
 - **Local backups always run, at least once a day.** Local backups are the
@@ -77,6 +87,21 @@ Installers for every release are on the
   smaller frame (the Downloads folder, details view, small/medium icons) fell
   back to the generic-exe icon while 256px contexts looked fine. Frames below
   256 are now classic 32-bit BMPs, per the ICO spec.
+- **A broken system keyring no longer crash-loops the daemon.** On a box with a
+  broken `cryptography` backend, reading the admin password made keyring's pyo3
+  layer raise a `PanicException` — which derives from `BaseException`, so it
+  slipped past the "reads must never crash the daemon" guard and killed the
+  process before it even started, which under NSSM/systemd is a restart loop.
+  Secret reads now survive it, fall back to the ini admin password, and log the
+  `PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring` workaround. Saving a
+  secret still surfaces the error, as before.
+- **The daemon API answers malformed requests with a useful 4xx.** A control
+  action missing its body field (`kick`/`ban`/`unban`/`announce`/`restore`) used
+  to return `500 {"error": "'user_id'"}` — a bare `KeyError`; it now returns
+  `400 {"error": "missing required field: user_id"}`, and a non-JSON or
+  non-object body gets a clear 400 too. `/favicon.ico`, which browsers fetch on
+  their own, is served instead of returning 401 and littering the console with a
+  spurious auth error on every dashboard visit.
 
 ## [1.0.0] — 2026-07-15
 
