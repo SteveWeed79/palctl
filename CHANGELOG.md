@@ -103,6 +103,17 @@ Installers for every release are on the
   their own, is served instead of returning 401 and littering the console with a
   spurious auth error on every dashboard visit.
 
+### Security
+- **The NSSM download is now pinned to a checksum.** `ensure_nssm` fetched
+  `nssm-2.24.zip` from nssm.cc with no verification and then registered the
+  unpacked binary as a LocalSystem service — so a compromised nssm.cc or a
+  man-in-the-middle on that download was a path to SYSTEM-level code execution.
+  The download is now verified against a hard-coded SHA-256 (NSSM 2.24 is
+  immutable) and refused if it doesn't match. The Visual C++ redistributable,
+  whose Microsoft `aka.ms` URL is evergreen and so can't be hash-pinned, now has
+  its Authenticode signature checked before it runs: a positively tampered
+  installer is refused, while a machine that simply can't verify still installs.
+
 ## [1.0.0] — 2026-07-15
 
 The first stable release. The 0.1.x line closed with a full

@@ -1,7 +1,12 @@
 """NSSM registration is Windows-only, but the command sequence and the archive
 layout logic are the parts that go wrong silently, so those are pinned here."""
 
+import hashlib
+import io
+import zipfile
 from pathlib import Path
+
+import pytest
 
 from palctl import winservice
 
@@ -82,3 +87,45 @@ def test_install_commands_user_wins_over_appdata_redirect():
     joined = [" ".join(c) for c in cmds]
     assert any("ObjectName" in j for j in joined)
     assert not any("AppEnvironmentExtra" in j for j in joined)
+
+
+# ---------- NSSM download checksum pin ----------
+
+
+def _nssm_zip_bytes() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("nssm-2.24/win32/nssm.exe", b"MZ-fake-32")
+        z.writestr("nssm-2.24/win64/nssm.exe", b"MZ-fake-64")
+    return buf.getvalue()
+
+
+def _fake_download(monkeypatch, data: bytes):
+    monkeypatch.setattr(
+        winservice.urllib.request, "urlopen",
+        lambda url, timeout=None: io.BytesIO(data),
+    )
+
+
+def test_pinned_nssm_sha256_is_well_formed():
+    # A typo in the pin would refuse every real download — guard the literal.
+    assert len(winservice.NSSM_SHA256) == 64
+    int(winservice.NSSM_SHA256, 16)  # all hex
+
+
+def test_ensure_nssm_unpacks_a_matching_download(tmp_path: Path, monkeypatch):
+    data = _nssm_zip_bytes()
+    _fake_download(monkeypatch, data)
+    good = hashlib.sha256(data).hexdigest()
+    out = winservice.ensure_nssm(tmp_path / "cache", sha256=good)
+    assert out.exists() and out.name == "nssm.exe"
+    assert out.read_bytes() == b"MZ-fake-64"  # win64 preferred
+
+
+def test_ensure_nssm_refuses_a_tampered_download(tmp_path: Path, monkeypatch):
+    _fake_download(monkeypatch, _nssm_zip_bytes())
+    cache = tmp_path / "cache"
+    with pytest.raises(winservice.NssmChecksumError):
+        winservice.ensure_nssm(cache, sha256="0" * 64)
+    # Nothing unverified was left on disk as the usable binary.
+    assert not (cache / "nssm.exe").exists()
