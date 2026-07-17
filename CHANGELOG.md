@@ -22,11 +22,17 @@ Installers for every release are on the
     (minutes until a restart is due on the current trend), plus CPU, FPS, and
     frame time; the embed turns red when memory is near the limit or a restart
     is close.
-  - **`/leaderboard`** (top players by total playtime), **`/whois`** (a live card
-    for an online player), **`/next`** (upcoming automatic restart/backup/update),
-    and **`/help`** (a grouped command list).
+  - **`/leaderboard`** (top players by total playtime), **`/whois`** (a player
+    card), **`/events`** (recent server events, like the CLI and dashboard have),
+    **`/next`** (upcoming automatic restart/backup/update), and **`/help`** (a
+    grouped command list).
+  - **`/playtime` and `/whois` answer for offline players too**, resolved from the
+    session history palctl already keeps — the common case is checking on someone
+    who isn't on right now. A player's live map position and platform ID stay
+    admin-only.
   - **Autocomplete** for player-name and backup-name arguments (`/kick` `/ban`
-    `/playtime` `/whois` `/restore`), so you're not typing exact names on a phone.
+    `/playtime` `/whois` `/restore`), drawing on the live player list, the session
+    history, and the backups on disk — so you're not typing exact names on a phone.
   - **Confirm/Cancel buttons** on the destructive commands (`/stop` `/update`
     `/restore`), gated to the admin who invoked them, so a mis-tap can't take the
     server down.

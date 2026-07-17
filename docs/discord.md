@@ -21,10 +21,11 @@ This page is the long form.
 | `/status` | Server status, FPS, memory, uptime | no |
 | `/health` | Memory vs the watchdog limit, the leak forecast, CPU, FPS | no |
 | `/players` | Who's online | no |
-| `/whois <name>` | Live details for one online player | no |
-| `/playtime <name>` | Total playtime for a player | no |
+| `/whois <name>` | Player details — live if online, else from history | no |
+| `/playtime <name>` | Total playtime for a player (online **or** offline) | no |
 | `/leaderboard [top]` | Top players by total playtime | no |
 | `/backups` | List recent backups | no |
+| `/events [count]` | Recent server events (joins, restarts, watchdog…) | no |
 | `/next` | Upcoming automatic restarts, backups, and updates | no |
 | `/help` | Grouped list of every command | no |
 | `/start` | Start the server | **yes** |
@@ -39,11 +40,15 @@ This page is the long form.
 | `/ban <name> [reason]` | Ban a player | **yes** |
 | `/unban <user_id>` | Unban by user ID | **yes** |
 
-`/kick`, `/ban`, `/playtime`, `/whois`, and `/restore` **autocomplete** their
-name argument from the live player list / the backups on disk, so you rarely
-type a full name. The destructive commands (`/stop`, `/update`, `/restore`) show
-a **Confirm / Cancel** button that only the admin who ran the command can press —
-a mis-tap from a phone just cancels.
+`/playtime` and `/whois` work for players who are **offline** too — palctl
+resolves the name from the session history it keeps, so you can check on someone
+who logged off hours ago (a player's live map position and platform ID stay
+admin-only). `/kick`, `/ban`, `/playtime`, `/whois`, and `/restore`
+**autocomplete** their name argument from the live player list, the session
+history, and the backups on disk, so you rarely type a full name. The
+destructive commands (`/stop`, `/update`, `/restore`) show a **Confirm / Cancel**
+button that only the admin who ran the command can press — a mis-tap from a phone
+just cancels.
 
 **Automatic notifications** (the bot posts to your channel on its own):
 

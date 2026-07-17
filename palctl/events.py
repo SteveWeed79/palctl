@@ -225,6 +225,48 @@ class SessionStore:
             ).total_seconds() / 60
         return total
 
+    def resolve_user_id(self, name: str) -> str | None:
+        """The most-recent user_id seen for a display name, from session history.
+        Lets /playtime and /whois answer for a player who's offline right now —
+        the live /players list only knows who's on. Case-insensitive (ASCII)."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT user_id FROM sessions WHERE name = ? COLLATE NOCASE "
+                "ORDER BY rowid DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+        return row[0] if row else None
+
+    def last_seen(self, user_id: str) -> tuple[str, str] | None:
+        """(name, left_at-ISO) of the player's most recent finished session, or
+        None if they have no closed session on record."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT name, left_at FROM sessions "
+                "WHERE user_id = ? AND left_at IS NOT NULL ORDER BY rowid DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def recent_player_names(self, limit: int = 50) -> list[str]:
+        """Distinct display names from recent sessions, most-recent first. The
+        autocomplete pool for /playtime and /whois, which now answer offline."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT name FROM sessions ORDER BY rowid DESC"
+            ).fetchall()
+        seen: set[str] = set()
+        out: list[str] = []
+        for (name,) in rows:
+            low = name.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            out.append(name)
+            if len(out) >= limit:
+                break
+        return out
+
     def top_playtime(self, limit: int = 10) -> list[tuple[str, float]]:
         """The `limit` players with the most total playtime, as (name, minutes)
         highest first. The name is the most recent one seen for that account, so

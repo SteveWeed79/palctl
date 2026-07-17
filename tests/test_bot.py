@@ -479,3 +479,96 @@ def test_player_name_choices_empty_when_api_down():
 
     bot = types.SimpleNamespace(_api=_BadApi())
     assert asyncio.run(PalBot._player_name_choices(bot, None, "x")) == []
+
+
+# ---------------- /playtime & /whois offline fallback ----------------
+
+
+class _PlaytimeApi:
+    def __init__(self, players):
+        self._players = players
+
+    async def players(self):
+        return list(self._players)
+
+
+class _DownApi:
+    async def players(self):
+        raise PalApiError("unreachable")
+
+
+class _HistStore:
+    def __init__(self, uid=None, mins=0.0, seen=None, recent=()):
+        self._uid = uid
+        self._mins = mins
+        self._seen = seen
+        self._recent = list(recent)
+
+    def resolve_user_id(self, name):
+        return self._uid
+
+    def last_seen(self, uid):
+        return self._seen
+
+    def total_playtime_minutes(self, uid):
+        return self._mins
+
+    def recent_player_names(self, limit=50):
+        return self._recent[:limit]
+
+
+class _PtBot:
+    def __init__(self, api, store):
+        self._api = api
+        self._store = store
+
+
+def test_playtime_online_uses_the_live_player():
+    api = _PlaytimeApi([types.SimpleNamespace(name="Steve", user_id="u1", level=42)])
+    it = _FakeInteraction()
+    asyncio.run(PalBot._playtime(_PtBot(api, _HistStore(mins=120.0)), it, "steve"))
+    msg = it.followup.messages[-1]
+    assert "Steve" in msg and "2.0h" in msg and "level 42" in msg
+
+
+def test_playtime_offline_falls_back_to_history():
+    store = _HistStore(uid="u7", mins=300.0, seen=("Ghost", "2026-01-01T00:00:00+00:00"))
+    it = _FakeInteraction()
+    asyncio.run(PalBot._playtime(_PtBot(_PlaytimeApi([]), store), it, "ghost"))
+    msg = it.followup.messages[-1]
+    assert "Ghost" in msg and "5.0h" in msg and "offline" in msg
+
+
+def test_playtime_reports_an_unknown_player():
+    it = _FakeInteraction()
+    asyncio.run(PalBot._playtime(_PtBot(_PlaytimeApi([]), _HistStore(uid=None)), it, "nobody"))
+    assert "never seen" in it.followup.messages[-1]
+
+
+def test_playtime_uses_history_when_the_api_is_down():
+    store = _HistStore(uid="u7", mins=60.0, seen=("Ghost", "2026-01-01T00:00:00+00:00"))
+    it = _FakeInteraction()
+    asyncio.run(PalBot._playtime(_PtBot(_DownApi(), store), it, "ghost"))
+    assert "1.0h" in it.followup.messages[-1]  # API failure isn't fatal
+
+
+def test_known_name_choices_merges_online_and_history_deduped():
+    api = _PlaytimeApi([types.SimpleNamespace(name="Online1")])
+    store = _HistStore(recent=["Online1", "HistOnly"])
+    choices = asyncio.run(PalBot._known_name_choices(_PtBot(api, store), None, ""))
+    vals = [c.value for c in choices]
+    assert vals[0] == "Online1"  # online first
+    assert "HistOnly" in vals  # history contributes offline names
+    assert vals.count("Online1") == 1  # deduped across the two sources
+
+
+def test_match_choices_dedups_identical_names():
+    # Two players named "Bob" must not produce two identical autocomplete choices.
+    assert _match_choices(["Bob", "Bob", "Bobby"], "bob") == ["Bob", "Bobby"]
+
+
+def test_format_schedule_shows_backups_off_for_the_disable_sentinel():
+    cfg = Config()
+    cfg.schedule.backup_hours = 0  # documented "off" escape hatch
+    out = _format_schedule(cfg.schedule, datetime(2026, 7, 17, 12, 0))
+    assert "Backups: off" in out  # not a misleading "every 0h"

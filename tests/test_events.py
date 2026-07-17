@@ -236,3 +236,33 @@ def test_top_playtime_skips_malformed_timestamps(tmp_path: Path):
     store._db.commit()
     _insert_closed_session(store, "y", "Y", 15)
     assert store.top_playtime() == [("Y", 15.0)]  # the bad row is skipped, not fatal
+
+
+# ---------------- offline lookup helpers (resolve / last_seen / recent) ----------------
+
+
+def test_resolve_user_id_is_case_insensitive_and_takes_latest(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    _insert_closed_session(store, "u1", "Ghost", 10)
+    _insert_closed_session(store, "u2", "Ghost", 10)  # a later account reused the name
+    assert store.resolve_user_id("ghost") == "u2"  # most recent wins, case-insensitive
+    assert store.resolve_user_id("nobody") is None
+
+
+def test_last_seen_returns_most_recent_closed_session(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    _insert_closed_session(store, "u1", "Alice", 30, base=datetime(2026, 1, 1, tzinfo=UTC))
+    _insert_closed_session(store, "u1", "Alice", 30, base=datetime(2026, 2, 2, tzinfo=UTC))
+    name, left = store.last_seen("u1")
+    assert name == "Alice"
+    assert left.startswith("2026-02-02")
+    assert store.last_seen("ghost") is None
+
+
+def test_recent_player_names_dedups_keeping_most_recent_order(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    _insert_closed_session(store, "u1", "Alice", 5)
+    _insert_closed_session(store, "u2", "Bob", 5)
+    _insert_closed_session(store, "u1", "Alice", 5)  # Alice again, later
+    # newest-first, each name once: Alice (its latest row) before Bob
+    assert store.recent_player_names() == ["Alice", "Bob"]

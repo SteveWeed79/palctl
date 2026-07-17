@@ -162,17 +162,19 @@ internet.
 **Discord bot** — your real remote control, from anywhere, no ports opened.
 
 *Reads (anyone):*
-`/status` `/health` `/players` `/whois` `/playtime` `/leaderboard` `/backups` `/next` `/help`
+`/status` `/health` `/players` `/whois` `/playtime` `/leaderboard` `/backups` `/events` `/next` `/help`
 *Admin:*
 `/start` `/stop` `/restart` `/update` `/save` `/backup` `/restore` `/announce` `/kick` `/ban` `/unban`
 
 `/health` shows memory against the watchdog limit *and the leak forecast* — how
 long until a restart is due on the current trend. `/leaderboard` ranks players
-by total playtime, `/next` lists the upcoming automatic restart/backup/update,
-and `/whois` gives a live card for anyone online. Player-name and backup-name
-arguments **autocomplete**, and the destructive commands (`/stop` `/update`
-`/restore`) pop a **Confirm/Cancel** button first — both so the bot is safe to
-drive one-handed from a phone.
+by total playtime, `/events` shows the recent event feed, `/next` lists the
+upcoming automatic restart/backup/update, and `/whois` gives a player card —
+live if they're online, from history if they're not. `/playtime` and `/whois`
+work for **offline** players too. Player-name and backup-name arguments
+**autocomplete**, and the destructive commands (`/stop` `/update` `/restore`)
+pop a **Confirm/Cancel** button first — all so the bot is safe to drive
+one-handed from a phone.
 
 Plus join/leave, level-up, watchdog, server up/down, and update-available
 notifications — with an optional auto-refreshing status message and a

@@ -8,14 +8,16 @@ there can't be. Palworld exposes no chat-read endpoint and dedicated servers
 ship no log file. Chat is UE4SS-only territory.
 
 What you DO get, all reconstructed from polling /players and /metrics:
-  reads:   /status /health /players /whois /playtime /leaderboard /backups /next /help
+  reads:   /status /health /players /whois /playtime /leaderboard /backups
+           /events /next /help
   admin:   /start /stop /restart /update /save /backup /restore /announce
            /kick /ban /unban
   alerts:  join + leave, level-up, watchdog, up/down, update-available
 
-Player-name and backup-name arguments autocomplete, and the destructive
-commands (/stop /update /restore) ask for a button confirmation first — both so
-the bot is safe to drive one-handed from a phone.
+/playtime and /whois answer for offline players too (resolved from the session
+history palctl keeps). Player-name and backup-name arguments autocomplete, and
+the destructive commands (/stop /update /restore) ask for a button confirmation
+first — all so the bot is safe to drive one-handed from a phone.
 """
 
 from __future__ import annotations
@@ -67,16 +69,29 @@ def _fmt_uptime(seconds: float) -> str:
     return f"{d.days}d {h}h {m}m" if d.days else f"{h}h {m}m"
 
 
+def _fmt_last_seen(iso: str) -> str:
+    """A session's ISO `left_at` as a readable UTC stamp for /whois."""
+    try:
+        return datetime.fromisoformat(iso).strftime("%Y-%m-%d %H:%M UTC")
+    except (ValueError, TypeError):
+        return "unknown"
+
+
 def _match_choices(options: list[str], current: str, limit: int = 25) -> list[str]:
     """Filter `options` for a slash-command autocomplete box: prefix matches
     first, then substring matches, capped at `limit` (Discord shows at most 25).
     Pure, so the ranking is unit-tested without a Discord connection."""
     cur = current.strip().lower()
     if not cur:
-        return options[:limit]
-    prefix = [o for o in options if o.lower().startswith(cur)]
-    contains = [o for o in options if cur in o.lower() and not o.lower().startswith(cur)]
-    return (prefix + contains)[:limit]
+        picked = options
+    else:
+        prefix = [o for o in options if o.lower().startswith(cur)]
+        contains = [o for o in options if cur in o.lower() and not o.lower().startswith(cur)]
+        picked = prefix + contains
+    # Dedup identical strings (Palworld names aren't unique — two "Bob"s online
+    # would otherwise yield two identical Choices, which Discord rejects), while
+    # preserving the prefix-before-contains order.
+    return list(dict.fromkeys(picked))[:limit]
 
 
 def _health_fields(
@@ -133,7 +148,12 @@ def _format_schedule(schedule, now: datetime) -> str:
     else:
         lines.append("🔁 Daily restart: off")
     hours = backup_interval_hours(schedule.backup_hours)
-    lines.append(f"📦 Backups every **{hours}h** (keeping {schedule.backup_retain})")
+    if hours <= 0:
+        # backup_hours <= 0 is the documented "off" escape hatch, and
+        # _backup_loop honours it — don't imply the safety-net backups run.
+        lines.append("📦 Backups: off")
+    else:
+        lines.append(f"📦 Backups every **{hours}h** (keeping {schedule.backup_retain})")
     lines.append(f"💾 Autosave every **{schedule.autosave_minutes}m**")
     if schedule.auto_update:
         nxt = next_daily(now, schedule.auto_update_at, 5)
@@ -410,31 +430,16 @@ class PalBot(discord.Client):
             )
             await interaction.followup.send(embed=e)
 
-        @tree.command(name="playtime", description="Total playtime for a player")
-        @app_commands.describe(name="Player name (as shown in /players)")
+        @tree.command(
+            name="playtime", description="Total playtime for a player (online or offline)"
+        )
+        @app_commands.describe(name="Player name")
         async def playtime(interaction: discord.Interaction, name: str) -> None:
-            await interaction.response.defer()
-            try:
-                ps = await self._api.players()
-            except PalApiError:
-                ps = []
-
-            match = next((p for p in ps if p.name.lower() == name.lower()), None)
-            if match is None:
-                await interaction.followup.send(
-                    f"Can't find **{name}** online. (Playtime lookup needs them "
-                    "on the server so I can resolve their user ID.)"
-                )
-                return
-
-            mins = self._store.total_playtime_minutes(match.user_id)
-            await interaction.followup.send(
-                f"**{match.name}** — {mins / 60:.1f}h total, currently level {match.level}."
-            )
+            await self._playtime(interaction, name)
 
         @playtime.autocomplete("name")
         async def _playtime_ac(interaction: discord.Interaction, current: str):
-            return await self._player_name_choices(interaction, current)
+            return await self._known_name_choices(interaction, current)
 
         @tree.command(name="announce", description="Send an in-game announcement")
         async def announce(interaction: discord.Interaction, message: str) -> None:
@@ -608,14 +613,29 @@ class PalBot(discord.Client):
                 )
             )
 
-        @tree.command(name="whois", description="Details for an online player")
-        @app_commands.describe(name="Player name (as shown in /players)")
+        @tree.command(name="whois", description="Details for a player (online or offline)")
+        @app_commands.describe(name="Player name")
         async def whois(interaction: discord.Interaction, name: str) -> None:
             await self._whois(interaction, name)
 
         @whois.autocomplete("name")
         async def _whois_ac(interaction: discord.Interaction, current: str):
-            return await self._player_name_choices(interaction, current)
+            return await self._known_name_choices(interaction, current)
+
+        @tree.command(name="events", description="Recent server events")
+        @app_commands.describe(count="How many to show (1–25, default 12)")
+        async def events(interaction: discord.Interaction, count: int = 12) -> None:
+            await interaction.response.defer()
+            evs = self._bus.recent(max(1, min(25, count)))
+            if not evs:
+                await interaction.followup.send("No events recorded yet.")
+                return
+            lines = [f"`{e.at:%m-%d %H:%M}` {e.message}" for e in reversed(evs)]
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="Recent events", description="\n".join(lines), colour=BLUE
+                )
+            )
 
         @tree.command(
             name="next", description="Upcoming automatic restarts, backups, and updates"
@@ -641,7 +661,7 @@ class PalBot(discord.Client):
         e.add_field(
             name="Anyone",
             value="/status · /health · /players · /whois · /playtime · /leaderboard "
-            "· /backups · /next · /help",
+            "· /backups · /events · /next · /help",
             inline=False,
         )
         e.add_field(
@@ -747,32 +767,77 @@ class PalBot(discord.Client):
         await interaction.response.defer()
         try:
             ps = await self._api.players()
-        except PalApiError as err:
-            await interaction.followup.send(f"❌ {err}")
-            return
+        except PalApiError:
+            ps = []  # server down / unreachable — still answer from history below
         match = next(
             (p for p in ps if p.name.lower() == name.lower() or p.user_id == name), None
         )
-        if match is None:
+        admin = self._is_admin(interaction)
+
+        if match is not None:
+            mins = await asyncio.to_thread(
+                self._store.total_playtime_minutes, match.user_id
+            )
+            e = discord.Embed(title=f"{match.name} — online", colour=GREEN)
+            e.add_field(name="Level", value=str(match.level))
+            e.add_field(name="Ping", value=f"{match.ping:.0f} ms")
+            e.add_field(name="Buildings", value=str(match.building_count))
+            e.add_field(name="Playtime (closed sessions)", value=f"{mins / 60:.1f}h")
+            # A player's live map position and platform ID (the ban handle) are
+            # admin-only — public they'd help grief someone or dox an account.
+            if admin:
+                e.add_field(
+                    name="Location",
+                    value=f"{match.location_x:.0f}, {match.location_y:.0f}",
+                )
+                e.add_field(name="User ID", value=f"`{match.user_id}`")
+            await interaction.followup.send(embed=e)
+            return
+
+        # Offline: fall back to what the session history remembers.
+        uid = await asyncio.to_thread(self._store.resolve_user_id, name)
+        if uid is None:
             await interaction.followup.send(
-                f"**{name}** isn't online. (Details come from the live player list, "
-                "so I can only look up someone currently on the server.)"
+                f"I've never seen a player called **{name}** — names come from who's "
+                "played while palctl was running."
             )
             return
-        mins = await asyncio.to_thread(self._store.total_playtime_minutes, match.user_id)
-        e = discord.Embed(title=match.name, colour=BLUE)
-        e.add_field(name="Level", value=str(match.level))
-        e.add_field(name="Ping", value=f"{match.ping:.0f} ms")
-        e.add_field(name="Buildings", value=str(match.building_count))
+        seen = await asyncio.to_thread(self._store.last_seen, uid)
+        mins = await asyncio.to_thread(self._store.total_playtime_minutes, uid)
+        display = seen[0] if seen else name
+        e = discord.Embed(title=f"{display} — offline", colour=BLUE)
         e.add_field(name="Playtime (closed sessions)", value=f"{mins / 60:.1f}h")
-        # A player's live map position and platform ID (the ban handle) are only
-        # shown to admins — public they'd help grief someone or dox an account.
-        if self._is_admin(interaction):
-            e.add_field(
-                name="Location", value=f"{match.location_x:.0f}, {match.location_y:.0f}"
-            )
-            e.add_field(name="User ID", value=f"`{match.user_id}`")
+        if seen:
+            e.add_field(name="Last seen", value=_fmt_last_seen(seen[1]))
+        if admin:
+            e.add_field(name="User ID", value=f"`{uid}`")
         await interaction.followup.send(embed=e)
+
+    async def _playtime(self, interaction: discord.Interaction, name: str) -> None:
+        await interaction.response.defer()
+        try:
+            online = await self._api.players()
+        except PalApiError:
+            online = []
+        match = next(
+            (p for p in online if p.name.lower() == name.lower() or p.user_id == name),
+            None,
+        )
+        if match is not None:
+            uid, display, suffix = match.user_id, match.name, f", currently level {match.level}"
+        else:
+            uid = await asyncio.to_thread(self._store.resolve_user_id, name)
+            if uid is None:
+                await interaction.followup.send(
+                    f"I've never seen a player called **{name}** — names come from "
+                    "who's played while palctl was running."
+                )
+                return
+            seen = await asyncio.to_thread(self._store.last_seen, uid)
+            display = seen[0] if seen else name
+            suffix = " (offline)"
+        mins = await asyncio.to_thread(self._store.total_playtime_minutes, uid)
+        await interaction.followup.send(f"**{display}** — {mins / 60:.1f}h total{suffix}.")
 
     async def _health_embed(self) -> discord.Embed:
         stats = await asyncio.to_thread(procs.proc_stats)
@@ -816,6 +881,26 @@ class PalBot(discord.Client):
         except PalApiError:
             return []
         names = _match_choices([p.name for p in ps], current)
+        return [app_commands.Choice(name=n, value=n) for n in names]
+
+    async def _known_name_choices(
+        self, _interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Online players first, then names from session history — the pool for
+        /playtime and /whois, which answer for offline players too."""
+        try:
+            online = [p.name for p in await self._api.players()]
+        except PalApiError:
+            online = []
+        recent = await asyncio.to_thread(self._store.recent_player_names, 50)
+        seen: set[str] = set()
+        merged: list[str] = []
+        for n in (*online, *recent):
+            if n.lower() in seen:
+                continue
+            seen.add(n.lower())
+            merged.append(n)
+        names = _match_choices(merged, current)
         return [app_commands.Choice(name=n, value=n) for n in names]
 
     async def _backup_name_choices(
