@@ -57,6 +57,11 @@ Installers for every release are on the
   step so it's clear a hard kill happened (a world save is attempted first). The
   user's own **Stop** button is unchanged: it still reports an honest failure so
   a human can decide, rather than force-killing behind your back.
+- **Releases now include version-stamped downloads.** Alongside the canonical
+  `palctl-setup.exe` / `palctl-portable.zip` (unchanged, so winget and the docs
+  still resolve them), each release also carries `palctl-setup-<version>.exe` and
+  `palctl-portable-<version>.zip`, so a saved file's version is obvious from its
+  name.
 
 ### Changed
 - **Local backups always run, at least once a day.** Local backups are the
@@ -102,6 +107,10 @@ Installers for every release are on the
   non-object body gets a clear 400 too. `/favicon.ico`, which browsers fetch on
   their own, is served instead of returning 401 and littering the console with a
   spurious auth error on every dashboard visit.
+- **`SHA256SUMS.txt` on the Releases page now verifies on Linux/macOS.** It was
+  written with CRLF line endings, which `sha256sum -c` / `shasum -c` reject with
+  "no properly formatted checksum lines"; it's now LF, with lower-cased hashes
+  in the exact `sha256sum` on-disk format.
 
 ### Security
 - **The NSSM download is now pinned to a checksum.** `ensure_nssm` fetched
@@ -113,6 +122,10 @@ Installers for every release are on the
   whose Microsoft `aka.ms` URL is evergreen and so can't be hash-pinned, now has
   its Authenticode signature checked before it runs: a positively tampered
   installer is refused, while a machine that simply can't verify still installs.
+- **The release workflow pins its GitHub Actions by commit SHA.** The workflow
+  that builds and attaches the shipped binaries runs with `contents: write` and
+  used mutable tags (`@v4`, `@v2`); each is now pinned to a full commit SHA, so a
+  retargeted tag can't slip new code into a release build.
 
 ## [1.0.0] — 2026-07-15
 

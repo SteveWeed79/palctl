@@ -26,7 +26,11 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      # Third-party actions are pinned by full commit SHA, not a mutable tag:
+      # this workflow runs with `contents: write` and produces the shipped
+      # binaries, so a retargeted tag on any of these would be a supply-chain
+      # foothold on the release. The trailing comment tracks the human version.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
         with:
           fetch-depth: 0   # setuptools-scm reads the tag/history for the version
           # On a manual run, build the tag that was asked for — not the branch
@@ -34,7 +38,7 @@ jobs:
           # the release tag. On a tag push, github.ref IS the tag.
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.12"
 
@@ -76,23 +80,46 @@ jobs:
       # is the paid alternative — same spot.)
       # --------------------------------------------------------------------
 
+      - name: Version-stamp the release assets
+        # Publish version-stamped COPIES alongside the canonical unstamped names
+        # (winget and the docs reference `palctl-setup.exe` / `palctl-portable.zip`,
+        # so those stay), so a downloaded file's version is knowable from its
+        # name alone rather than only from where it came from.
+        shell: pwsh
+        run: |
+          Copy-Item "packaging\Output\palctl-setup.exe" "packaging\Output\palctl-setup-$env:PALCTL_VERSION.exe"
+          Copy-Item "palctl-portable.zip" "palctl-portable-$env:PALCTL_VERSION.zip"
+
       - name: Generate SHA256 checksums
         # Free integrity check: users can confirm the download matches what CI
         # built, whether or not it's signed.
+        shell: pwsh
         run: |
-          $items = "packaging\Output\palctl-setup.exe", "palctl-portable.zip"
-          $items | ForEach-Object {
-            (Get-FileHash $_ -Algorithm SHA256).Hash + "  " + (Split-Path $_ -Leaf)
-          } | Set-Content SHA256SUMS.txt
+          $items = @(
+            "packaging\Output\palctl-setup.exe",
+            "packaging\Output\palctl-setup-$env:PALCTL_VERSION.exe",
+            "palctl-portable.zip",
+            "palctl-portable-$env:PALCTL_VERSION.zip"
+          )
+          $lines = $items | ForEach-Object {
+            (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower() + "  " + (Split-Path $_ -Leaf)
+          }
+          # Write LF, not CRLF. Set-Content emits CRLF, which makes
+          # `sha256sum -c SHA256SUMS.txt` on Linux/macOS report "no properly
+          # formatted checksum lines"; and Get-FileHash returns uppercase, so
+          # lower-case it to match the sha256sum on-disk format exactly.
+          [IO.File]::WriteAllText("$PWD\SHA256SUMS.txt", ($lines -join "`n") + "`n")
           Get-Content SHA256SUMS.txt
 
       - name: Attach artifacts to a draft release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
         with:
           draft: true
           # Use the pushed tag, or the tag typed into the manual "Run workflow".
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             packaging/Output/palctl-setup.exe
+            packaging/Output/palctl-setup-${{ env.PALCTL_VERSION }}.exe
             palctl-portable.zip
+            palctl-portable-${{ env.PALCTL_VERSION }}.zip
             SHA256SUMS.txt
