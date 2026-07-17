@@ -681,12 +681,14 @@ class ConfigTab(QWidget):
         )
         channel_help.setWordWrap(True)
         df.addRow(channel_help)
-        df.addRow("Admin role ID", self.dc_role)
+        df.addRow("Admin role/user ID", self.dc_role)
         role_help = QLabel(
-            "Who may run /announce, /restart, /kick, etc. This is a "
-            "<b>role</b> ID, <b>not your user ID</b> — right-click a role in "
-            "Server Settings → Roles → <b>Copy Role ID</b>. Leave blank to "
-            "allow anyone with the <b>Manage Server</b> permission."
+            "Who may run /announce, /restart, /kick, etc. Accepts either a "
+            "<b>role</b> ID (right-click a role in Server Settings → Roles → "
+            "<b>Copy Role ID</b> — everyone with that role) <b>or</b> a single "
+            "<b>user</b> ID (right-click a member → <b>Copy User ID</b> — just "
+            "that person). Leave blank to allow anyone with the "
+            "<b>Manage Server</b> permission."
         )
         role_help.setWordWrap(True)
         df.addRow(role_help)
@@ -781,9 +783,9 @@ class ConfigTab(QWidget):
         except ValueError:
             QMessageBox.warning(
                 self, "Invalid ID",
-                "Channel ID and Admin role ID must be numbers.\n"
+                "Channel ID and Admin role/user ID must be numbers.\n"
                 "In Discord: Settings → Advanced → Developer Mode, then "
-                "right-click the channel/role → Copy ID.",
+                "right-click the channel / role / member → Copy ID.",
             )
             return
 

@@ -173,33 +173,38 @@ looks like "commands work but alerts don't".
 
 ---
 
-## Step 5 — Get the admin role ID (and the classic mistake)
+## Step 5 — Set who can run admin commands
 
 Admin-only commands (`/announce`, `/restart`, `/kick`, `/ban`, `/save`, `/backup`,
 `/restore`, `/update`, `/unban`) are gated by **`admin_role_id`**.
 
-**This field takes a *role* ID, not your *user* ID.** A role ID identifies a role
-(a group anyone can hold), not a person. palctl checks *"does the caller have that
-role?"* — so pasting your own user ID here means the check can never match and you
-get `Not allowed.` even as the server owner. This is the #1 support question.
+Despite the name, this field accepts **either a role ID or a user ID** — palctl
+allows the caller if they *hold a role* with that ID **or** if they *are* the user
+with that ID. Discord IDs carry no type tag (a role ID and a user ID are the same
+kind of number), so palctl just checks both rather than making you get the "right
+kind." Pick whichever fits:
 
-You have two options:
+**Option A — leave it empty (simplest).** With the field set to `0`/blank, palctl
+falls back to allowing anyone with the Discord **Manage Server** permission. As the
+owner, that's already you. Nothing else to do.
 
-**Option A — leave it empty (simplest).** With `admin_role_id` set to `0`/blank,
-palctl falls back to allowing anyone with the Discord **Manage Server**
-permission. As the owner, that's already you. Nothing else to do.
-
-**Option B — use a dedicated role.**
+**Option B — a dedicated role** (best when more than one person should have access).
 1. Discord → **Server Settings** → **Roles** → create a role (e.g. "Palworld Admin").
-2. Assign it to yourself (and anyone else who should have admin commands):
+2. Assign it to yourself and anyone else who should have admin commands:
    right-click a member → **Roles** → tick it.
 3. With Developer Mode on, **Server Settings → Roles → right-click the role →
-   Copy Role ID**. (Make sure it says *Copy Role ID*, not *Copy User ID* — role
-   and user IDs look identical.)
-4. Paste it into **Admin role ID** / `admin_role_id`, save, reload.
+   Copy Role ID**.
+4. Paste it into **Admin role/user ID** / `admin_role_id`, save, reload. Grant or
+   revoke access later by just adding/removing the role — no palctl change needed.
 
-Grant or revoke admin access later by just adding/removing the role in Discord —
-no palctl change needed.
+**Option C — just your own account.** Right-click your name → **Copy User ID**,
+paste that in. Only that one account gets admin commands. (This is why "I added my
+ID" now works — a user ID is a valid value here.)
+
+> A typo'd ID that matches *neither* any role you hold nor your user ID simply
+> denies — the safe default. If admin commands unexpectedly say `Not allowed.`,
+> re-copy the ID and confirm you actually hold that role (Option B) or that it's
+> your account's ID (Option C).
 
 ---
 
@@ -248,7 +253,7 @@ and all default to sensible values, so you only touch them to customize.
 |---|---|---|
 | `enabled` | bool | Master on/off for the bot. |
 | `channel_id` | int | Channel the bot posts notifications to. `0` = nowhere. |
-| `admin_role_id` | int | Role required for admin commands. `0` = fall back to Manage Server. |
+| `admin_role_id` | int | Role **or** user ID allowed to run admin commands. `0` = fall back to Manage Server. |
 | `notify_join_leave` | bool | Post player join and leave alerts. |
 | `notify_level_up` | bool | Post level-up alerts. |
 | `notify_watchdog` | bool | Post memory-watchdog alerts (hold-off, restart, recovery). |
@@ -271,10 +276,10 @@ on a live connection.
 
 **`/announce` (or any admin command) replies `Not allowed.`**
 That's palctl's admin check, not a Discord error — the command *is* reaching the
-bot. You're not matching `admin_role_id`. Either you put a **user** ID where a
-**role** ID belongs (see [Step 5](#step-5--get-the-admin-role-id-and-the-classic-mistake)),
-or you don't hold the configured role. Fix: use a real role ID you actually have,
-or blank the field to fall back to Manage Server.
+bot. The configured `admin_role_id` matches neither a role you hold nor your user
+ID (see [Step 5](#step-5--set-who-can-run-admin-commands)). Fix: paste a role ID
+you actually hold, or your own user ID, or blank the field to fall back to Manage
+Server.
 
 **Slash commands work, but automatic notifications never appear.**
 Almost always one of these, all of which fail silently:
