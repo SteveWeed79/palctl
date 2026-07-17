@@ -93,7 +93,7 @@ class ScheduleConfig:
 class DiscordConfig:
     enabled: bool = False
     channel_id: int = 0
-    admin_role_id: int = 0  # who may run /restart, /kick, /ban
+    admin_role_id: int = 0  # role OR user ID allowed to run /restart, /kick, /ban
     notify_join_leave: bool = True
     notify_level_up: bool = True
     notify_watchdog: bool = True

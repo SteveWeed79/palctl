@@ -33,6 +33,28 @@ RED = 0xF85149
 GREEN = 0x3FB950
 
 
+def _admin_allowed(
+    admin_id: int,
+    caller_id: int,
+    caller_role_ids: set[int],
+    has_manage_guild: bool,
+) -> bool:
+    """Decide whether a caller may run admin commands.
+
+    `admin_id` is a Discord snowflake from config. Snowflakes carry no type
+    tag, so a role ID and a user ID are indistinguishable as bare numbers —
+    and people routinely paste the wrong one. We therefore accept *either*:
+    the caller holds a role with that ID, or the caller *is* that user. A
+    typo'd ID simply matches neither and denies, which is the safe default.
+
+    `admin_id == 0` means nothing is configured -> fall back to the guild's
+    Manage Server permission.
+    """
+    if not admin_id:
+        return has_manage_guild
+    return caller_id == admin_id or admin_id in caller_role_ids
+
+
 def _fmt_uptime(seconds: float) -> str:
     d = timedelta(seconds=int(seconds))
     h, rem = divmod(d.seconds, 3600)
@@ -180,13 +202,14 @@ class PalBot(discord.Client):
     # ---------- permissions ----------
 
     def _is_admin(self, interaction: discord.Interaction) -> bool:
-        role_id = self._cfg.discord.admin_role_id
-        if not role_id:
-            # No role configured -> only people who can manage the guild.
-            perms = getattr(interaction.user, "guild_permissions", None)
-            return bool(perms and perms.manage_guild)
-        roles = getattr(interaction.user, "roles", [])
-        return any(r.id == role_id for r in roles)
+        perms = getattr(interaction.user, "guild_permissions", None)
+        role_ids = {r.id for r in getattr(interaction.user, "roles", [])}
+        return _admin_allowed(
+            self._cfg.discord.admin_role_id,
+            getattr(interaction.user, "id", 0),
+            role_ids,
+            bool(perms and perms.manage_guild),
+        )
 
     # ---------- status embed (shared by /status and the live message) ----------
 

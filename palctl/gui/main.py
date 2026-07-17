@@ -668,7 +668,37 @@ class ConfigTab(QWidget):
         token_help.setWordWrap(True)
         df.addRow(token_help)
         df.addRow("Channel ID", self.dc_channel)
-        df.addRow("Admin role ID", self.dc_role)
+        # These two IDs are the usual snags. Both are numeric, so the
+        # save-time "must be a number" check can't catch a wrong-*kind* of ID
+        # (a user ID pasted for a role ID passes validation but never
+        # matches). Spell out where each comes from, right at the field.
+        channel_help = QLabel(
+            "Where the bot posts notifications. Turn on Discord "
+            "<b>Developer Mode</b> (Settings → Advanced), then right-click the "
+            "channel → <b>Copy Channel ID</b>. The bot also needs "
+            "<b>View Channel</b>, <b>Send Messages</b> and <b>Embed Links</b> "
+            "there, or notifications silently won't appear."
+        )
+        channel_help.setWordWrap(True)
+        df.addRow(channel_help)
+        df.addRow("Admin role/user ID", self.dc_role)
+        role_help = QLabel(
+            "Who may run /announce, /restart, /kick, etc. Accepts either a "
+            "<b>role</b> ID (right-click a role in Server Settings → Roles → "
+            "<b>Copy Role ID</b> — everyone with that role) <b>or</b> a single "
+            "<b>user</b> ID (right-click a member → <b>Copy User ID</b> — just "
+            "that person). Leave blank to allow anyone with the "
+            "<b>Manage Server</b> permission."
+        )
+        role_help.setWordWrap(True)
+        df.addRow(role_help)
+        guide = QLabel(
+            'Full walkthrough: <a href="https://github.com/SteveWeed79/palctl/'
+            'blob/main/docs/discord.md">Discord bot setup guide</a>.'
+        )
+        guide.setOpenExternalLinks(True)
+        guide.setWordWrap(True)
+        df.addRow(guide)
         df.addRow(
             QLabel(
                 "Token is stored encrypted in Windows Credential Manager.\n"
@@ -753,9 +783,9 @@ class ConfigTab(QWidget):
         except ValueError:
             QMessageBox.warning(
                 self, "Invalid ID",
-                "Channel ID and Admin role ID must be numbers.\n"
+                "Channel ID and Admin role/user ID must be numbers.\n"
                 "In Discord: Settings → Advanced → Developer Mode, then "
-                "right-click the channel/role → Copy ID.",
+                "right-click the channel / role / member → Copy ID.",
             )
             return
 
