@@ -3,6 +3,7 @@ systemd. The parsers and command builders are pure, so both platforms' logic is
 checked on whatever OS runs the tests."""
 
 import asyncio
+import types
 
 import psutil
 
@@ -38,6 +39,71 @@ def test_command_builders_match_platform():
 def test_pal_process_names_cover_both_platforms():
     assert "PalServer-Win64-Shipping.exe" in procs.PAL_PROCESS_NAMES
     assert "PalServer-Linux-Shipping" in procs.PAL_PROCESS_NAMES
+
+
+# ---------- process metrics (the always-0 CPU bug) ----------
+
+
+class _FakeMetricsProc:
+    """psutil.Process stand-in for proc_stats. cpu_percent(interval=None) mimics
+    the real thing: 0.0 on the first call for this object, a real value after."""
+
+    def __init__(self, pid=999, cpu_after_first=80.0):
+        self.pid = pid
+        self._cpu = cpu_after_first
+        self.cpu_calls = 0
+
+    def oneshot(self):
+        import contextlib
+        return contextlib.nullcontext()
+
+    def memory_info(self):
+        return types.SimpleNamespace(rss=1_048_576 * 100)  # 100 MB
+
+    def cpu_percent(self, interval=None):
+        self.cpu_calls += 1
+        return 0.0 if self.cpu_calls == 1 else self._cpu
+
+    def num_threads(self):
+        return 12
+
+    def create_time(self):
+        return 0.0
+
+
+def test_proc_stats_reuses_process_so_cpu_is_not_stuck_at_zero(monkeypatch):
+    # find_process() returns a fresh object each call, but proc_stats must reuse
+    # one so psutil's cpu_percent has a prior sample and stops reporting 0.0.
+    proc = _FakeMetricsProc(cpu_after_first=800.0)  # raw per-core sum
+    monkeypatch.setattr(procs, "find_process", lambda: proc)
+    monkeypatch.setattr(procs, "_tracked", None)
+    monkeypatch.setattr(procs.psutil, "cpu_count", lambda: 8)
+
+    first = procs.proc_stats()
+    assert first is not None and first.cpu_percent == 0.0  # unavoidable first sample
+
+    second = procs.proc_stats()
+    assert second is not None
+    assert second.cpu_percent == 100.0  # 800% across 8 cores, normalized
+
+
+def test_tracked_process_rebinds_on_pid_change(monkeypatch):
+    a = _FakeMetricsProc(pid=1)
+    monkeypatch.setattr(procs, "_tracked", None)
+    monkeypatch.setattr(procs, "find_process", lambda: a)
+    assert procs._tracked_process() is a
+    assert procs._tracked_process() is a  # same pid -> same object reused
+
+    b = _FakeMetricsProc(pid=2)  # server restarted, new pid
+    monkeypatch.setattr(procs, "find_process", lambda: b)
+    assert procs._tracked_process() is b
+
+
+def test_tracked_process_clears_cache_when_server_stops(monkeypatch):
+    monkeypatch.setattr(procs, "_tracked", _FakeMetricsProc(pid=1))
+    monkeypatch.setattr(procs, "find_process", lambda: None)
+    assert procs._tracked_process() is None
+    assert procs._tracked is None
 
 
 # ---------- force-kill escalation primitives ----------

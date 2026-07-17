@@ -77,14 +77,42 @@ def shipping_processes() -> list[psutil.Process]:
     return out
 
 
+# psutil.Process.cpu_percent(interval=None) is a delta against the *same object's*
+# previous call, so the first call on any given Process returns a meaningless 0.0.
+# proc_stats() is polled repeatedly (daemon loop, /state), and a fresh
+# find_process() each time hands cpu_percent a brand-new object every call — it
+# never gets a prior sample, so CPU reads 0.0 forever. We cache the Process by pid
+# and reuse it, letting cpu_percent measure across our own poll interval instead.
+_tracked: psutil.Process | None = None
+
+
+def _tracked_process() -> psutil.Process | None:
+    """find_process(), but return the *same* psutil.Process object across calls
+    for a given pid so cpu_percent(interval=None) has a baseline to diff against.
+    A restarted server (new pid) or a stopped one transparently rebinds/clears."""
+    global _tracked
+    found = find_process()
+    if found is None:
+        _tracked = None
+        return None
+    if _tracked is not None and _tracked.pid == found.pid:
+        return _tracked
+    _tracked = found
+    return found
+
+
 def proc_stats() -> ProcStats | None:
-    p = find_process()
+    p = _tracked_process()
     if p is None:
         return None
     try:
         with p.oneshot():
             mem = p.memory_info().rss / 1_048_576
-            cpu = p.cpu_percent(interval=None)
+            # Raw psutil cpu_percent sums across cores (can exceed 100% on an
+            # N-core box). Normalize to 0-100% of the whole machine — that's what
+            # a "CPU" status tile reads as.
+            cores = psutil.cpu_count() or 1
+            cpu = p.cpu_percent(interval=None) / cores
             return ProcStats(
                 pid=p.pid,
                 memory_mb=mem,
