@@ -96,6 +96,38 @@ def test_mirror_copies_backup_and_is_idempotent(tmp_path: Path):
     assert [x.name for x in backups.listing(mirror_root)] == [b.name]
 
 
+def test_test_mirror_local_path_ok_and_creates_it(tmp_path: Path):
+    target = tmp_path / "mirror" / "sub"  # doesn't exist yet
+    ok, msg = backups.test_mirror(str(target))
+    assert ok is True
+    assert target.is_dir()  # created for the test
+    assert not (target / ".palctl-write-test").exists()  # probe cleaned up
+
+
+def test_test_mirror_local_path_not_writable(tmp_path: Path):
+    # A file where a directory should be: mkdir under it fails (NotADirectoryError).
+    blocker = tmp_path / "afile"
+    blocker.write_text("not a dir")
+    ok, msg = backups.test_mirror(str(blocker / "mirror"))
+    assert ok is False
+    assert "Not writable" in msg
+
+
+def test_test_mirror_empty_target(tmp_path: Path):
+    ok, msg = backups.test_mirror("   ")
+    assert ok is False
+
+
+def test_test_mirror_delegates_remotes_to_rclone(monkeypatch):
+    from palctl import rclone
+
+    called: list = []
+    monkeypatch.setattr(rclone, "test_remote",
+                        lambda t: called.append(t) or (True, "ok"))
+    ok, msg = backups.test_mirror("gdrive:PalworldBackups")
+    assert ok is True and called == ["gdrive:PalworldBackups"]
+
+
 def test_listing_ignores_partial_copies(tmp_path: Path):
     # A mirror mid-copy leaves a "<name>.partial" dir; it must not be listed (or
     # restored/pruned) as if it were a finished backup.
@@ -247,3 +279,23 @@ def test_prune_keeps_newest_and_pre_restore(tmp_path: Path):
     remaining = {d.name for d in root.iterdir()}
     assert "2026-01-01_12-00-00-pre-restore" in remaining
     assert len(remaining) == 3
+
+
+def test_prune_never_deletes_non_backup_dirs(tmp_path: Path):
+    # Symmetric with the rclone mirror: a local mirror pointed at a populated
+    # location (another disk's root, a shared network folder) must only ever
+    # prune palctl's own backups — never the user's unrelated directories, even
+    # when those sort above or below the timestamped backups.
+    root = tmp_path / "shared_disk"
+    root.mkdir()
+    (root / "Photos").mkdir()          # sorts above the timestamps
+    (root / "0-user-folder").mkdir()   # sorts below the timestamps
+    for stamp in ("2026-01-01_00-00-00", "2026-01-02_00-00-00", "2026-01-03_00-00-00"):
+        (root / f"{stamp}-scheduled").mkdir()
+
+    doomed = backups.prune(root, retain=1)
+
+    assert doomed == ["2026-01-02_00-00-00-scheduled", "2026-01-01_00-00-00-scheduled"]
+    remaining = {d.name for d in root.iterdir()}
+    assert "Photos" in remaining and "0-user-folder" in remaining  # untouched
+    assert "2026-01-03_00-00-00-scheduled" in remaining  # newest backup kept

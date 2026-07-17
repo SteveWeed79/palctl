@@ -73,8 +73,10 @@ PC, which is the situation most people are trying to get out of.
   empty, instead of at the threshold later with players mid-session
 - Scheduled restarts with in-game countdown, autosave, rotating backups —
   **consistency-checked** (a copy the server wrote through is retried, and
-  flagged if it stays dirty) and optionally **mirrored** to a second disk or
-  network share (backups on the server's own disk don't survive the disk)
+  flagged if it stays dirty) and optionally **mirrored** to a second disk, a
+  network share, or an **rclone cloud remote** (Google Drive, Dropbox, S3,
+  OneDrive …) for off-site copies — backups on the server's own disk don't
+  survive the disk, and a house fire takes the network share with it
 - Opt-in scheduled auto-update (Palworld patches constantly) — the same
   save → backup → SteamCMD → restart flow as a manual update, world backup
   included (updates are exactly when saves get eaten), and **no backup means
@@ -281,6 +283,45 @@ For the full walkthrough — inviting with the right **channel permissions**, th
 **role-ID vs user-ID** gotcha behind `/announce` saying *"Not allowed"*, every
 notification toggle, headless-Linux config, and troubleshooting — see the
 **[Discord bot setup guide](docs/discord.md)**.
+
+### Cloud / off-site backups (optional)
+
+The **backup mirror** takes a second copy of every backup. Point it at a local
+path (another disk or a `\\server\share`) for the simple case, or at an
+[rclone](https://rclone.org) remote to push backups off the box entirely —
+Google Drive, Dropbox, S3, OneDrive, and [dozens more](https://rclone.org/overview/).
+palctl never touches OAuth tokens or a cloud API itself; rclone owns the auth
+and the uploads.
+
+1. Install rclone (`rclone.org/downloads`) and put it on `PATH`.
+2. Run `rclone config` once to authorize your account — say you name the remote
+   `gdrive`.
+3. In the **Config** tab, set **Backup mirror** to a **dedicated folder** on the
+   remote — `gdrive:PalworldBackups`, not the bare `gdrive:` root — and hit
+   **Test** to confirm palctl can reach it.
+
+palctl uploads to, and prunes within, **that one folder only**: it lists and
+deletes solely its own dated backup directories, so retention can never reach
+anything else on the drive even if the folder is shared. (Because of that,
+pointing the mirror at the bare remote root is refused — give it a folder of its
+own.) Each backup is uploaded under that folder as its own dated directory. A
+mirror failure never fails the primary backup — it's logged and the local copy
+is untouched. If the mirror is a remote but rclone isn't installed (or points at
+the bare root), the daemon warns at startup instead of failing silently.
+
+The mirror keeps its own retention: **Copies to keep (mirror)** in the Config
+tab can differ from the local **Backups to keep** — keep fewer off-site to save
+cloud cost, or more on cheap cold storage. Leave it at `0` to match the local
+count.
+
+> **rclone config is per-user.** `rclone config` stores the remote under the
+> account that ran it, so the palctl **daemon must run as that same user** to
+> find it — which it does in the default login-startup mode (and, on Linux, when
+> `install-service` registers the unit as your user). A daemon running as a
+> different account (e.g. a Windows *LocalSystem* service) won't see your remote;
+> run `rclone config` as that account, or keep the daemon on login startup. Note
+> the **Test** button runs as *you* (the logged-in user), so it's representative
+> only when the daemon also runs as you — the default.
 
 ---
 

@@ -78,6 +78,10 @@ class ScheduleConfig:
     autosave_minutes: int = 15
     backup_hours: int = 6
     backup_retain: int = 24
+    # How many backups to keep on the mirror (second copy). Cloud storage costs
+    # money, so you may want fewer copies off-site than on the local disk — or,
+    # with cheap cold storage, more. 0 = keep the same count as backup_retain.
+    mirror_retain: int = 0
     # Palworld patches constantly. Opt-in: run a SteamCMD update at a quiet hour,
     # reusing the same stop -> backup -> update -> restart flow as manual updates.
     auto_update: bool = False
@@ -111,8 +115,11 @@ class Config:
     server_root: str = r"C:\steamcmd\steamapps\common\PalServer"
     steamcmd_path: str = r"C:\steamcmd\steamcmd.exe"
     backup_root: str = r"D:\PalworldBackups"
-    # Optional second copy of every backup — another disk or a network share.
-    # Backups on the server's own disk don't survive the disk. Empty = off.
+    # Optional second copy of every backup. Backups on the server's own disk
+    # don't survive the disk. Either a local path (another disk or a network
+    # share) or an rclone remote for off-site/cloud storage, written as
+    # `remote:path` — e.g. `gdrive:PalworldBackups` after `rclone config`.
+    # Empty = off.
     backup_mirror: str = ""
     service_name: str = "PalServer"
     app_id: str = "2394010"

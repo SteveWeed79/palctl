@@ -220,6 +220,32 @@ class Daemon:
         if warning:
             self.log.warning("%s", warning)
 
+    def _warn_if_cloud_mirror_broken(self) -> None:
+        """If the backup mirror is an rclone remote that's misconfigured — no
+        dedicated folder, or rclone not installed — every scheduled mirror will
+        fail. Say so once at startup rather than only in a buried error event
+        after the first backup."""
+        from . import rclone
+
+        target = self.cfg.backup_mirror
+        if not target or not rclone.is_remote(target):
+            return
+        if not rclone.has_subpath(target):
+            self.log.warning(
+                "backup mirror '%s' points at the remote root — set a dedicated "
+                "folder like `gdrive:PalworldBackups`, so retention only ever "
+                "touches palctl's own backups and never the rest of your drive.",
+                target,
+            )
+            return
+        ok, detail = rclone.check()
+        if not ok:
+            self.log.warning(
+                "backup mirror '%s' is a cloud remote but %s — install rclone "
+                "and run `rclone config`, or backups won't reach the cloud.",
+                target, detail,
+            )
+
     def _admin_password(self) -> str:
         """Keyring first; fall back to AdminPassword in the server's own ini
         for daemons that can't see the per-user keyring (LocalSystem service,
@@ -632,6 +658,7 @@ class Daemon:
         # (see localauth) — but this API still must never leave the box.
         await web.TCPSite(runner, "127.0.0.1", DAEMON_PORT).start()
         self.log.info("daemon up; localhost API on 127.0.0.1:%d", DAEMON_PORT)
+        self._warn_if_cloud_mirror_broken()
 
         if self.cfg.check_for_updates:
             self._spawn(self._check_palctl_update())

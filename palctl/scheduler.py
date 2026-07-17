@@ -8,7 +8,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import backups, procs, steamcmd  # noqa: F401  (procs: tests patch service ctl here)
+from . import backups, procs, rclone, steamcmd  # noqa: F401  (procs: tests patch service ctl here)
 from .api import PalApi
 from .config import Config
 from .control import ServerController
@@ -151,16 +151,23 @@ class Scheduler:
             return None
 
     async def _mirror(self, b: backups.Backup) -> bool:
-        """Second copy onto another disk/share, if configured. A mirror failure
-        must not fail the backup — the primary copy already exists."""
+        """Second copy of the backup, if configured — onto another disk/share, or
+        up to an rclone cloud remote (Google Drive, Dropbox, S3, …) when the
+        mirror target is a `remote:path` string instead of a local path. A mirror
+        failure must not fail the backup — the primary copy already exists."""
         root = self._cfg.backup_mirror
         if not root:
             return False
+        # The mirror can keep a different number of copies than the local disk
+        # (cloud costs money, or cold storage is cheap). 0 = match local.
+        retain = self._cfg.schedule.mirror_retain or self._cfg.schedule.backup_retain
         try:
-            await asyncio.to_thread(backups.mirror, b.path, Path(root))
-            await asyncio.to_thread(
-                backups.prune, Path(root), self._cfg.schedule.backup_retain
-            )
+            if rclone.is_remote(root):
+                await asyncio.to_thread(rclone.mirror, b.path, root)
+                await asyncio.to_thread(rclone.prune, root, retain)
+            else:
+                await asyncio.to_thread(backups.mirror, b.path, Path(root))
+                await asyncio.to_thread(backups.prune, Path(root), retain)
             return True
         except Exception as e:
             await self._bus.emit(
