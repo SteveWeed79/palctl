@@ -11,6 +11,17 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Added
+- **The first-run wizard now sets up backups and the Discord bot** — both as
+  optional, opt-in sections. Left unchecked they're skipped and the wizard
+  ignores them entirely; ticked, it walks the user through the fields (a backup
+  folder plus an optional off-site mirror with a **Test** button; the bot token,
+  channel ID, and admin role/user ID with the same in-line help as the Config
+  tab) and writes the config, so a first-run user can discover and enable these
+  without hunting through the Config tab afterwards. The **Backups** section is
+  on by default and pre-filled with a folder that actually exists — the built-in
+  `D:\PalworldBackups` default silently failed scheduled backups (which run by
+  default) on the common single-`C:`-drive box, because the folder's `mkdir`
+  can't create a drive that isn't there.
 - **Cloud / off-site backup mirror via rclone.** The backup mirror now accepts
   an [rclone](https://rclone.org) remote (`remote:path`, e.g.
   `gdrive:PalworldBackups`) in addition to a local path, so backups can be

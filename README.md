@@ -193,6 +193,10 @@ Then it opens the GUI, and the **first-run wizard** does the rest:
 - **registers the game server** as a Windows service and sets **palctl itself
   to run in the background** — password-free login startup by default, or a
   Windows service — so your server keeps being managed after a reboot or sign-in
+- **optionally sets up backups and the Discord bot** — tick either section and
+  the wizard walks you through an off-site backup mirror, or the bot token,
+  channel, and admin role; leave them unchecked to skip and set them up later
+  from the Config tab
 
 You still need to point it at, or let it install, a Palworld **dedicated
 server** — that software comes from Steam (app `2394010`). The wizard is happy to
@@ -218,8 +222,9 @@ run-daemon.bat      creates a venv, installs deps, starts the daemon
 run-gui.bat         opens the GUI  (first launch pops the setup wizard)
 ```
 
-The wizard handles detection, the REST API, an optional server install, and how
-the daemon runs in the background. Prefer to do it by hand?
+The wizard handles detection, the REST API, an optional server install, how the
+daemon runs in the background, and — as optional sections — backups and the
+Discord bot. Prefer to do it by hand?
 
 ```
 palctl-daemon.exe install-startup      # start at login — password-free (recommended)
@@ -277,7 +282,9 @@ lands, grab the installer from the
 
 Quick version: create an app at discord.com/developers → Bot → copy the token →
 invite it to your server with the `bot` and `applications.commands` scopes → paste
-the token into the GUI's **Config → Discord bot** tab → Save & reload.
+the token into the GUI's **Config → Discord bot** tab → Save & reload. (The
+first-run wizard has the same fields under its optional **Set up the Discord
+bot** section, if you'd rather do it there.)
 
 For the full walkthrough — inviting with the right **channel permissions**, the
 **role-ID vs user-ID** gotcha behind `/announce` saying *"Not allowed"*, every
@@ -296,9 +303,10 @@ and the uploads.
 1. Install rclone (`rclone.org/downloads`) and put it on `PATH`.
 2. Run `rclone config` once to authorize your account — say you name the remote
    `gdrive`.
-3. In the **Config** tab, set **Backup mirror** to a **dedicated folder** on the
-   remote — `gdrive:PalworldBackups`, not the bare `gdrive:` root — and hit
-   **Test** to confirm palctl can reach it.
+3. In the **Config** tab (or the wizard's optional **Back up my world**
+   section), set the **backup mirror** to a **dedicated folder** on the remote —
+   `gdrive:PalworldBackups`, not the bare `gdrive:` root — and hit **Test** to
+   confirm palctl can reach it.
 
 palctl uploads to, and prunes within, **that one folder only**: it lists and
 deletes solely its own dated backup directories, so retention can never reach

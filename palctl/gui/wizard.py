@@ -8,6 +8,12 @@ it from one dialog — detect the paths, turn the REST API on, optionally instal
 the server with SteamCMD, and register both Windows services — while streaming a
 live log so nothing happens behind your back.
 
+Two later features — an off-site backup mirror and the Discord bot — hang off
+this same flow as *optional* sections: unchecked, the wizard ignores them
+entirely; checked, it walks the user through the fields and writes the config,
+so a first-run user can discover and set them up without hunting through the
+Config tab afterwards.
+
 The heavy lifting lives in the tested, GUI-free modules (discovery, serversetup,
 steamcmd, winservice); this file is just the form and a worker thread.
 """
@@ -30,6 +36,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -38,15 +45,35 @@ from PySide6.QtWidgets import (
 from ..config import (
     Config,
     config_dir,
+    get_discord_token,
     set_admin_password,
+    set_discord_token,
 )
 from ..discovery import detect_server_roots, detect_steamcmd, is_server_root, is_steamcmd
 from . import icons
-from .main import PathPicker
+from .main import PathPicker, _MirrorTestWorker
 from .widgets import NoScrollSpinBox
 
 # Widely-recommended launch flags for the Palworld dedicated server.
 PALSERVER_ARGS = "-useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS"
+
+
+def _default_backup_dir(cfg: Config) -> str:
+    """A backup folder that actually exists to pre-fill the wizard with.
+
+    The built-in default is ``D:\\PalworldBackups``, which doesn't exist on the
+    common single-``C:``-drive box — so scheduled backups (on by default) would
+    fail their `mkdir` every few hours. Keep the configured folder when its drive
+    is real; otherwise fall back to the user's home, which always exists and is
+    writable."""
+    current = cfg.backup_root
+    try:
+        anchor = Path(current).anchor if current else ""
+        if anchor and Path(anchor).exists():
+            return current
+    except OSError:
+        pass
+    return str(Path.home() / "PalworldBackups")
 
 
 @dataclass
@@ -62,6 +89,15 @@ class SetupPlan:
     # key, the default), "service" (Windows service, starts on boot), or "none".
     daemon_startup: str
     service_name: str
+    # Optional sections — only written when the user ticked their group. Left
+    # off, the wizard doesn't touch the corresponding config at all.
+    configure_backups: bool = False
+    backup_root: str = ""
+    backup_mirror: str = ""
+    setup_discord: bool = False
+    discord_token: str = ""
+    discord_channel_id: int = 0
+    discord_admin_id: int = 0
 
 
 class SetupWorker(QThread):
@@ -94,8 +130,27 @@ class SetupWorker(QThread):
             cfg.steamcmd_path = plan.steamcmd_path
             cfg.api_port = plan.api_port
             cfg.service_name = plan.service_name
+            if plan.configure_backups:
+                cfg.backup_root = plan.backup_root
+                cfg.backup_mirror = plan.backup_mirror
+            if plan.setup_discord:
+                cfg.discord.enabled = True
+                cfg.discord.channel_id = plan.discord_channel_id
+                cfg.discord.admin_role_id = plan.discord_admin_id
             cfg.save()
             set_admin_password(plan.password)
+            if plan.setup_discord:
+                set_discord_token(plan.discord_token)
+
+            if plan.configure_backups:
+                self._log(f"  Backups will be saved to {plan.backup_root}.")
+                if plan.backup_mirror:
+                    self._log(f"  Off-site mirror: {plan.backup_mirror}.")
+            if plan.setup_discord:
+                self._log(
+                    "  Discord bot configured — it will come online shortly "
+                    "after palctl starts."
+                )
 
             if plan.install_server:
                 self._install_server(cfg, plan)
@@ -356,12 +411,22 @@ class SetupWizard(QDialog):
             "can — fix anything with a red ✗, then run setup.\n\n"
             "The Palworld dedicated server itself comes from Steam. If it isn't "
             "installed yet, tick “Install / update the server” and this will fetch "
-            "it with SteamCMD for you."
+            "it with SteamCMD for you. The last two sections — off-site backups "
+            "and the Discord bot — are optional; leave them unchecked to skip."
             if first_run
             else "Re-run any part of setup. Detected paths are pre-filled."
         )
         intro.setWordWrap(True)
         root.addWidget(intro)
+
+        # The input groups live in a scroll area so the optional Backups and
+        # Discord sections can't push the dialog taller than a small screen; the
+        # progress bar, log, and buttons stay pinned below it.
+        scroll = QScrollArea(widgetResizable=True)
+        form_host = QWidget()
+        scroll.setWidget(form_host)
+        form = QVBoxLayout(form_host)
+        form.setContentsMargins(0, 0, 0, 0)
 
         paths = QGroupBox("Paths")
         pf = QFormLayout(paths)
@@ -376,7 +441,7 @@ class SetupWizard(QDialog):
         )
         pf.addRow("Server root", self.server_root)
         pf.addRow("steamcmd.exe", self.steamcmd)
-        root.addWidget(paths)
+        form.addWidget(paths)
 
         api = QGroupBox("REST API")
         af = QFormLayout(api)
@@ -395,7 +460,7 @@ class SetupWizard(QDialog):
         pw_widget.setLayout(pw_row)
         af.addRow("Port", self.port)
         af.addRow("Admin password", pw_widget)
-        root.addWidget(api)
+        form.addWidget(api)
 
         steps = QGroupBox("Do now")
         sf = QVBoxLayout(steps)
@@ -410,7 +475,7 @@ class SetupWizard(QDialog):
         self.reg_server.setChecked(True)
         for cb in (self.install_server, self.install_vc, self.reg_server):
             sf.addWidget(cb)
-        root.addWidget(steps)
+        form.addWidget(steps)
 
         # How the daemon runs in the background. Login startup is the default:
         # it needs no password (unlike a user service, which fails with Error
@@ -433,7 +498,12 @@ class SetupWizard(QDialog):
         bgf.addWidget(self.startup_login)
         bgf.addWidget(self.startup_service)
         self._bg_group = bg
-        root.addWidget(bg)
+        form.addWidget(bg)
+
+        form.addWidget(self._build_backups_group(cfg))
+        form.addWidget(self._build_discord_group(cfg))
+        form.addStretch(1)
+        root.addWidget(scroll, 1)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)  # indeterminate; hidden until running
@@ -442,6 +512,7 @@ class SetupWizard(QDialog):
 
         self.log = QTextEdit(readOnly=True)
         self.log.setPlaceholderText("Setup progress will appear here…")
+        self.log.setMinimumHeight(150)  # never let the scroll area squeeze it away
         root.addWidget(self.log, 1)
 
         buttons = QHBoxLayout()
@@ -458,6 +529,119 @@ class SetupWizard(QDialog):
         buttons.addWidget(self.check_btn)
         buttons.addWidget(self.run_btn)
         root.addLayout(buttons)
+
+    def _build_backups_group(self, cfg: Config) -> QGroupBox:
+        """Optional. Ticked (the default), the wizard writes the backup folder
+        and an off-site mirror; unticked, it leaves backup config untouched.
+        Default-on and pre-filled with a folder that exists, because scheduled
+        backups run by default and the built-in D:\\ default fails on a box
+        without that drive."""
+        bk = QGroupBox("Back up my world  —  optional, recommended")
+        bk.setCheckable(True)
+        bk.setChecked(True)
+        bkf = QFormLayout(bk)
+        self.backup_root = PathPicker(_default_backup_dir(cfg), pick_file=False)
+        bkf.addRow("Backup folder", self.backup_root)
+
+        # Not a PathPicker: an rclone remote like gdrive:Pal isn't a filesystem
+        # path. Test proves the target works before backups rely on it.
+        mirror_row = QHBoxLayout()
+        self.backup_mirror = QLineEdit(cfg.backup_mirror)
+        self.backup_mirror.setPlaceholderText(
+            r"Off — or D:\Backups, \\nas\pal, or gdrive:PalworldBackups"
+        )
+        self._mirror_test = QPushButton("Test")
+        self._mirror_test.clicked.connect(self._test_mirror)
+        mirror_row.addWidget(self.backup_mirror, 1)
+        mirror_row.addWidget(self._mirror_test)
+        mirror_widget = QWidget()
+        mirror_widget.setLayout(mirror_row)
+        bkf.addRow("Off-site mirror", mirror_widget)
+
+        bk_help = QLabel(
+            "A second copy survives a dead disk. For cloud (Google Drive, "
+            'Dropbox, S3…), install <a href="https://rclone.org">rclone</a>, run '
+            "<code>rclone config</code>, then enter a dedicated folder like "
+            "<code>gdrive:PalworldBackups</code> — palctl only ever touches that "
+            "one folder. Use <b>Test</b> to check it first. Leave the mirror "
+            "blank to keep backups on this disk only."
+        )
+        bk_help.setOpenExternalLinks(True)
+        bk_help.setWordWrap(True)
+        bkf.addRow("", bk_help)
+        self._backups_group = bk
+        return bk
+
+    def _build_discord_group(self, cfg: Config) -> QGroupBox:
+        """Optional. Ticked, the wizard stores the token and IDs and enables the
+        bot; unticked (the default on first run), it leaves Discord off. Mirrors
+        the Config tab's fields and help so the bot can be set up here directly."""
+        dc = QGroupBox("Set up the Discord bot  —  optional")
+        dc.setCheckable(True)
+        dc.setChecked(cfg.discord.enabled)
+        df = QFormLayout(dc)
+        self.dc_token = QLineEdit(get_discord_token())
+        self.dc_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.dc_channel = QLineEdit(str(cfg.discord.channel_id or ""))
+        self.dc_role = QLineEdit(str(cfg.discord.admin_role_id or ""))
+        df.addRow("Bot token", self.dc_token)
+        token_help = QLabel(
+            'No token yet? <a href="https://discord.com/developers/applications">'
+            "Open the Discord Developer Portal</a> → <b>New Application</b> → "
+            "<b>Bot</b> → <b>Reset Token</b> → copy it here, then invite the bot "
+            "with the <b>bot</b> and <b>applications.commands</b> scopes."
+        )
+        token_help.setOpenExternalLinks(True)
+        token_help.setWordWrap(True)
+        df.addRow(token_help)
+        df.addRow("Channel ID", self.dc_channel)
+        df.addRow("Admin role/user ID", self.dc_role)
+        # Both IDs are numeric, so a wrong-*kind* of ID (user pasted for a role)
+        # passes the save-time number check but never matches — spell out where
+        # each comes from, as the Config tab does.
+        id_help = QLabel(
+            "Turn on Discord <b>Developer Mode</b> (Settings → Advanced), then "
+            "right-click the channel → <b>Copy Channel ID</b>. For who may run "
+            "/announce, /restart, /kick, etc., copy a <b>role</b> ID (everyone "
+            "with it) <b>or</b> a single <b>user</b> ID — or leave it blank to "
+            "allow anyone with <b>Manage Server</b>."
+        )
+        id_help.setWordWrap(True)
+        df.addRow(id_help)
+        guide = QLabel(
+            'Full walkthrough: <a href="https://github.com/SteveWeed79/palctl/'
+            'blob/main/docs/discord.md">Discord bot setup guide</a>.'
+        )
+        guide.setOpenExternalLinks(True)
+        guide.setWordWrap(True)
+        df.addRow(guide)
+        self._discord_group = dc
+        return dc
+
+    def _test_mirror(self) -> None:
+        target = self.backup_mirror.text().strip()
+        if not target:
+            QMessageBox.information(
+                self, "Off-site mirror",
+                "No mirror set — that's fine. A mirror keeps a second copy on "
+                "another disk, a network share, or a cloud remote (remote:path) "
+                "so your backups survive this disk failing.",
+            )
+            return
+        self._mirror_test.setEnabled(False)
+        self._mirror_test.setText("Testing…")
+        # Held on self so the thread isn't garbage-collected mid-run.
+        self._mirror_worker = _MirrorTestWorker(target)
+        self._mirror_worker.done.connect(self._mirror_test_done)
+        self._mirror_worker.start()
+
+    def _mirror_test_done(self, ok: bool, msg: str) -> None:
+        self._mirror_test.setEnabled(True)
+        self._mirror_test.setText("Test")
+        if ok:
+            QMessageBox.information(self, "Off-site mirror — reachable", msg)
+        else:
+            QMessageBox.warning(self, "Off-site mirror — problem", msg)
 
     def _check_readiness(self) -> None:
         """A quick, side-effect-free preview of the preflight checks so the user
@@ -523,6 +707,32 @@ class SetupWizard(QDialog):
             )
             return
 
+        # Optional Discord section: only validate its fields when it's ticked,
+        # so junk left in an unused section can't block setup.
+        setup_discord = self._discord_group.isChecked()
+        discord_token = self.dc_token.text().strip()
+        channel_id = admin_id = 0
+        if setup_discord:
+            if not discord_token:
+                QMessageBox.warning(
+                    self, "Discord bot token needed",
+                    "You ticked “Set up the Discord bot”, but there's no bot "
+                    "token. Paste the token from the Discord Developer Portal, "
+                    "or untick that section to skip the bot for now.",
+                )
+                return
+            try:
+                channel_id = int(self.dc_channel.text().strip() or 0)
+                admin_id = int(self.dc_role.text().strip() or 0)
+            except ValueError:
+                QMessageBox.warning(
+                    self, "Invalid Discord ID",
+                    "Channel ID and Admin role/user ID must be numbers (or "
+                    "blank).\nIn Discord: Settings → Advanced → Developer Mode, "
+                    "then right-click the channel / role / member → Copy ID.",
+                )
+                return
+
         plan = SetupPlan(
             server_root=self.server_root.text().strip(),
             steamcmd_path=self.steamcmd.text().strip(),
@@ -533,6 +743,13 @@ class SetupWizard(QDialog):
             register_server_service=self.reg_server.isChecked(),
             daemon_startup=self._daemon_startup(),
             service_name=self._cfg.service_name or "PalServer",
+            configure_backups=self._backups_group.isChecked(),
+            backup_root=self.backup_root.text().strip(),
+            backup_mirror=self.backup_mirror.text().strip(),
+            setup_discord=setup_discord,
+            discord_token=discord_token,
+            discord_channel_id=channel_id,
+            discord_admin_id=admin_id,
         )
         # Kept so the completion dialog can describe what actually ran.
         self._plan = plan
@@ -581,7 +798,19 @@ class SetupWizard(QDialog):
                 "say the daemon is down until you start palctl (re-run setup and "
                 "pick a background option, or launch palctl-daemon)."
             )
-        return lead + tail
+
+        # Note the optional bits the user set up, so the finish line matches
+        # what actually happened rather than only the core install.
+        extras = []
+        if plan and plan.setup_discord:
+            extras.append(
+                "The Discord bot is configured — it comes online a few seconds "
+                "after palctl starts."
+            )
+        if plan and plan.configure_backups and plan.backup_mirror:
+            extras.append("Off-site backup mirror is set up.")
+        extra = ("\n\n" + " ".join(extras)) if extras else ""
+        return lead + extra + tail
 
     def _finished(self, ok: bool) -> None:
         self.progress.hide()
