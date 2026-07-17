@@ -671,22 +671,26 @@ class Daemon:
 
             try:
                 if what == "start":
-                    op = self.control.try_operation("start")
-                    if op is None:
+                    # One implementation for start/stop (also the bot's /start,
+                    # /stop): sets the desired-running intent and drives control.
+                    if await self.scheduler.start_server() == "busy":
                         return _busy_response(self.control.current_op)
-                    self._desired_running = True
-                    async with op:
-                        await self.control.start()
                 elif what == "stop":
-                    op = self.control.try_operation("stop")
-                    if op is None:
+                    result = await self.scheduler.stop_server()
+                    if result == "busy":
                         return _busy_response(self.control.current_op)
-                    # Intentional: don't let auto-recovery start it back up.
-                    self._desired_running = False
-                    async with op:
-                        with contextlib.suppress(PalApiError):
-                            await self.api.save()
-                        await self.control.stop()
+                    if result == "failed":
+                        # The world was saved and the Stop intent recorded, but
+                        # the service never confirmed STOPPED — surface that
+                        # instead of a misleading "ok" (matches the bot's /stop).
+                        return web.json_response(
+                            {
+                                "error": "The world was saved and the server was "
+                                "told to stop, but it didn't confirm STOPPED — it "
+                                "may be hung. Check the server, or try a restart."
+                            },
+                            status=502,
+                        )
                 elif what == "restart":
                     if self.control.busy:
                         return _busy_response(self.control.current_op)

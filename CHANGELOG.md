@@ -62,6 +62,16 @@ Installers for every release are on the
   anything past a trusted LAN, an SSH tunnel or Tailscale still authenticates
   and encrypts the connection.
 
+### Fixed
+- **A Stop that doesn't actually stop is no longer reported as success.** The
+  daemon's HTTP `/action/stop` (used by the web dashboard and the `palctl stop`
+  CLI) discarded the result of the service stop and always answered `ok`, so a
+  hung server that never confirmed STOPPED still showed "saved and stopped."
+  Start/stop now go through the one shared implementation the Discord bot uses,
+  and a stop that doesn't confirm surfaces as a failure (HTTP 502 with a message)
+  everywhere — dashboard, CLI, and bot alike. The Stop intent is still recorded,
+  so auto-recovery won't resurrect the server.
+
 ## [1.1.0] — 2026-07-17
 
 ### Added
