@@ -67,8 +67,12 @@ Installers for every release are on the
   the service over an already-running daemon wrote the new unit/exe/params but
   left the old process up: `systemctl start` no-ops on an active unit and
   `nssm start` no-ops on a running service, so the stale binary and settings kept
-  running. Install now restarts on Linux (`systemctl restart`) and stops before
-  starting on Windows, so a reinstall picks up the new registration. The
+  running. Worse, on Windows an in-place re-install could inherit stale
+  settings from the old registration — the `set` calls only overwrite what the
+  new install specifies, so an old service account or old launch arguments
+  survived. Install now rewrites the unit and restarts on Linux (`systemctl
+  restart`), and on Windows stops, removes, and re-registers the service from
+  scratch before starting it, so a reinstall is exactly what it says. The
   Windows login-startup path had the same gap — it skipped the launch whenever
   a daemon was already answering — and now replaces the running daemon instead,
   removing any leftover daemon *service* registration first so the service

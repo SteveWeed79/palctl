@@ -142,18 +142,22 @@ def install_service(
     appdata: str | None = None,
     start: bool = True,
 ) -> None:
-    """Create/configure the service, then optionally start it."""
+    """Create/configure the service, then optionally start it.
+
+    A re-install replaces the whole registration, not patches it: `nssm
+    install` no-ops on an existing service, and the per-setting `set` calls
+    only overwrite what THIS install specifies — empty args skip the
+    AppParameters set (so a dev install's `-m palctl.daemon` would survive
+    into a frozen re-install and break it), and ObjectName is never reset
+    back to LocalSystem after an `--as-user` install. Stop + remove + register
+    guarantees nothing stale survives from the old registration."""
+    if service_exists(name):
+        remove_service(nssm, name)
     for cmd in install_commands(
         nssm, name, exe, args, app_dir, user=user, password=password, appdata=appdata
     ):
         _run(cmd)
     if start:
-        # `nssm install` no-ops when the service already exists and `nssm start`
-        # no-ops when it's already running, so a re-install over a running daemon
-        # would keep the OLD process alive with the pre-`set` exe/params. Stop
-        # first (harmless if it isn't running) so the freshly-set Application and
-        # AppParameters actually take effect on start.
-        _run([str(nssm), "stop", name])
         _run([str(nssm), "start", name])
 
 

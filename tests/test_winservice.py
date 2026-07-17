@@ -89,28 +89,49 @@ def test_install_commands_user_wins_over_appdata_redirect():
     assert not any("AppEnvironmentExtra" in j for j in joined)
 
 
-def test_install_service_stops_before_start_to_reload_the_daemon(monkeypatch):
-    # A re-install over a RUNNING daemon must stop it before starting, or the
-    # live process keeps the pre-`set` exe/params (`nssm start` no-ops when the
-    # service is already running).
+def test_install_service_replaces_an_existing_registration(monkeypatch):
+    # A re-install must be stop → remove → register → start, not an in-place
+    # patch: `nssm install` no-ops on an existing service and the `set` calls
+    # only overwrite what THIS install specifies, so stale settings (old
+    # AppParameters, an old ObjectName account) would survive — and `nssm
+    # start` no-ops on a running service, leaving the OLD process up.
     calls: list[list[str]] = []
     monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))
+    monkeypatch.setattr(winservice, "service_exists", lambda name: True)
 
     winservice.install_service("nssm.exe", "palctl-daemon", "svc.exe")
 
     stop = ["nssm.exe", "stop", "palctl-daemon"]
+    remove = ["nssm.exe", "remove", "palctl-daemon", "confirm"]
+    install = ["nssm.exe", "install", "palctl-daemon", "svc.exe"]
     start = ["nssm.exe", "start", "palctl-daemon"]
-    assert stop in calls and start in calls
-    assert calls.index(stop) < calls.index(start)
+    assert (
+        calls.index(stop)
+        < calls.index(remove)
+        < calls.index(install)
+        < calls.index(start)
+    )
 
 
-def test_install_service_start_false_skips_stop_and_start(monkeypatch):
+def test_install_service_fresh_registration_skips_removal(monkeypatch):
     calls: list[list[str]] = []
     monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))
+    monkeypatch.setattr(winservice, "service_exists", lambda name: False)
+
+    winservice.install_service("nssm.exe", "svc", "svc.exe")
+
+    assert not any(c[1:2] == ["stop"] for c in calls)
+    assert not any(c[1:2] == ["remove"] for c in calls)
+    assert ["nssm.exe", "start", "svc"] in calls
+
+
+def test_install_service_start_false_skips_start(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))
+    monkeypatch.setattr(winservice, "service_exists", lambda name: False)
 
     winservice.install_service("nssm.exe", "svc", "svc.exe", start=False)
 
-    assert not any(c[1:2] == ["stop"] for c in calls)
     assert not any(c[1:2] == ["start"] for c in calls)
 
 
