@@ -125,6 +125,13 @@ def test_install_service_fresh_registration_skips_removal(monkeypatch):
     assert ["nssm.exe", "start", "svc"] in calls
 
 
+def test_start_service_runs_nssm_start(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))
+    winservice.start_service("nssm.exe", "svc")
+    assert calls == [["nssm.exe", "start", "svc"]]
+
+
 def test_install_service_start_false_skips_start(monkeypatch):
     calls: list[list[str]] = []
     monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))

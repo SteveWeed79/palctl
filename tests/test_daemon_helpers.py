@@ -201,6 +201,78 @@ def test_desired_running_tolerates_garbage_state(tmp_path, monkeypatch):
     assert daemon_mod._load_desired_running() is True  # fail open to normal behavior
 
 
+# ---------------- switching startup modes cleans up the old one ----------------
+
+
+def test_install_service_windows_clears_login_startup_and_stray_daemon(monkeypatch):
+    # Switching login startup → service: the Run key must go (or the next
+    # login spawns a rival daemon), and a surviving login-startup daemon must
+    # be stopped BETWEEN registration and start — otherwise the service daemon
+    # can't bind the control port and NSSM restart-loops it while the old
+    # daemon keeps serving.
+    import palctl.startup as startup_mod
+    import palctl.winservice as winservice
+
+    calls: list[str] = []
+    registered_kwargs: dict = {}
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+    monkeypatch.setattr(startup_mod, "uninstall_startup", lambda: calls.append("runkey"))
+    monkeypatch.setattr(winservice, "ensure_nssm", lambda d: "nssm.exe")
+
+    def fake_install(nssm, name, exe, args, app_dir, **kw):
+        registered_kwargs.update(kw)
+        calls.append("register")
+
+    monkeypatch.setattr(winservice, "install_service", fake_install)
+    monkeypatch.setattr(
+        winservice, "start_service", lambda nssm, name: calls.append("start")
+    )
+    monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: True)
+    monkeypatch.setattr(daemon_mod, "_stop_daemon_process", lambda: calls.append("stop"))
+
+    daemon_mod.install_service()
+
+    assert calls == ["runkey", "register", "stop", "start"]
+    assert registered_kwargs["start"] is False  # nothing starts before the port is clear
+
+
+def test_install_service_linux_stops_a_stray_daemon_but_not_the_units_own(monkeypatch):
+    # A dev `python -m palctl.daemon` in a terminal holds the control port and
+    # would crash-loop the fresh unit — kill it. The unit's own daemon is
+    # systemd's to replace (the restart inside install), never ours to kill.
+    import palctl.systemd as systemd
+
+    calls: list[str] = []
+    monkeypatch.setattr(daemon_mod.sys, "platform", "linux")
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    monkeypatch.setattr(
+        systemd, "install_service", lambda *a, **k: calls.append("install")
+    )
+    monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: True)
+    monkeypatch.setattr(daemon_mod, "_stop_daemon_process", lambda: calls.append("stop"))
+
+    monkeypatch.setattr(systemd, "is_active", lambda name: False)  # a stray
+    daemon_mod.install_service()
+    assert calls == ["stop", "install"]
+
+    calls.clear()
+    monkeypatch.setattr(systemd, "is_active", lambda name: True)  # the unit's own
+    daemon_mod.install_service()
+    assert calls == ["install"]
+
+
+def test_disable_background_startup_removes_both_and_stops_the_daemon(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(daemon_mod, "uninstall_startup", lambda: calls.append("runkey"))
+    monkeypatch.setattr(daemon_mod, "uninstall_service", lambda: calls.append("service"))
+    monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: True)
+    monkeypatch.setattr(daemon_mod, "_stop_daemon_process", lambda: calls.append("stop"))
+
+    daemon_mod.disable_background_startup()
+
+    assert calls == ["runkey", "service", "stop"]
+
+
 # ---------------- login-startup daemon replacement ----------------
 
 # start_detached is the login-startup counterpart to the service-reinstall fix:

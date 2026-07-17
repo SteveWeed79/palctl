@@ -41,6 +41,19 @@ def test_install_restarts_so_reinstall_picks_up_new_unit(tmp_path, monkeypatch):
     assert ["systemctl", "start", "palctl-daemon"] not in calls
 
 
+def test_is_active_parses_systemctl_output(monkeypatch):
+    import types
+
+    monkeypatch.setattr(
+        systemd, "_run", lambda cmd: types.SimpleNamespace(stdout="active\n")
+    )
+    assert systemd.is_active("svc") is True
+    monkeypatch.setattr(
+        systemd, "_run", lambda cmd: types.SimpleNamespace(stdout="inactive\n")
+    )
+    assert systemd.is_active("svc") is False
+
+
 def test_install_without_start_does_not_touch_the_running_unit(tmp_path, monkeypatch):
     calls: list[list[str]] = []
     monkeypatch.setattr(systemd, "_run", lambda cmd: calls.append(cmd))

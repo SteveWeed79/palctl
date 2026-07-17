@@ -38,6 +38,7 @@ def env(tmp_path, monkeypatch):
         services_registered=[],
         daemon_service=0,
         login_startup=0,
+        startup_disabled=0,
         rest_api=[],
         run_update_calls=0,
         backups_created=[],
@@ -115,9 +116,17 @@ def env(tmp_path, monkeypatch):
     def _daemon_install_startup():
         rec.login_startup += 1
 
+    def _daemon_disable_background():
+        rec.startup_disabled += 1
+
     monkeypatch.setattr("palctl.daemon.install_service", _daemon_install_service)
     monkeypatch.setattr("palctl.daemon.install_startup", _daemon_install_startup)
     monkeypatch.setattr("palctl.daemon.start_detached", lambda: True)
+    monkeypatch.setattr(
+        "palctl.daemon.disable_background_startup", _daemon_disable_background
+    )
+    # No daemon service registered by default (needs_admin probes for one).
+    monkeypatch.setattr("palctl.winservice.service_exists", lambda name: False)
 
     # Verify step: a server that answers, no network lookups.
     class _FakeApi:
@@ -179,14 +188,45 @@ def test_minimal_run_saves_config_and_reports_success(env):
 
 
 @pytest.mark.parametrize(
-    "startup, expect_service, expect_login",
-    [("none", 0, 0), ("service", 1, 0), ("login", 0, 1)],
+    "startup, expect_service, expect_login, expect_disabled",
+    [("none", 0, 0, 1), ("service", 1, 0, 0), ("login", 0, 1, 0)],
 )
-def test_daemon_startup_permutations(env, startup, expect_service, expect_login):
+def test_daemon_startup_permutations(
+    env, startup, expect_service, expect_login, expect_disabled
+):
     result, _ = env.run(_plan(env.tmp_path, daemon_startup=startup))
     assert result.ok is True
     assert env.daemon_service == expect_service
     assert env.login_startup == expect_login
+    # "none" is not "leave it alone": unticking the background group on a
+    # re-run must actually remove the previous run's autostart (same contract
+    # as the Discord toggle).
+    assert env.startup_disabled == expect_disabled
+
+
+# ---------------- elevation requirements ----------------
+
+
+def test_needs_admin_for_any_service_registration():
+    from palctl.setup_flow import needs_admin
+
+    assert needs_admin(register_server_service=True, daemon_startup="none") is True
+    assert needs_admin(register_server_service=False, daemon_startup="service") is True
+
+
+def test_needs_admin_to_remove_a_registered_daemon_service(monkeypatch):
+    # Switching AWAY from a daemon service (to login startup or none) has to
+    # unregister it — which needs elevation too, or the removal fails silently
+    # and the old daemon keeps running.
+    import palctl.winservice as winservice
+    from palctl.setup_flow import needs_admin
+
+    monkeypatch.setattr(winservice, "service_exists", lambda name: True)
+    assert needs_admin(register_server_service=False, daemon_startup="login") is True
+    assert needs_admin(register_server_service=False, daemon_startup="none") is True
+
+    monkeypatch.setattr(winservice, "service_exists", lambda name: False)
+    assert needs_admin(register_server_service=False, daemon_startup="login") is False
 
 
 def test_discord_section_writes_token_channel_and_role(env):

@@ -75,6 +75,12 @@ def install_service(
         _run(["systemctl", "restart", name])
 
 
+def is_active(name: str) -> bool:
+    """Whether the unit is currently active — i.e. the running daemon is
+    systemd's to replace on restart, rather than a stray process."""
+    return _run(["systemctl", "is-active", name]).stdout.strip() == "active"
+
+
 def remove_service(name: str) -> None:
     _run(["systemctl", "stop", name])
     _run(["systemctl", "disable", name])

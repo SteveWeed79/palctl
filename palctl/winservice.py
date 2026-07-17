@@ -161,6 +161,13 @@ def install_service(
         _run([str(nssm), "start", name])
 
 
+def start_service(nssm: str | Path, name: str) -> None:
+    """Start a registered service. Split out so a caller can do work between
+    registering (install_service(start=False)) and starting — e.g. clearing a
+    stale daemon off the port the service is about to need."""
+    _run([str(nssm), "start", name])
+
+
 def remove_service(nssm: str | Path, name: str) -> None:
     _run([str(nssm), "stop", name])
     _run([str(nssm), "remove", name, "confirm"])

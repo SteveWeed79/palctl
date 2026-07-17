@@ -876,9 +876,8 @@ def install_service(as_user: bool = False) -> None:
     exe, args, app_dir = service_target()
     if sys.platform.startswith("win"):
         import getpass
-        import os
 
-        from . import winservice
+        from . import startup, winservice
 
         user = password = None
         if as_user:
@@ -892,11 +891,22 @@ def install_service(as_user: bool = False) -> None:
             )
             password = getpass.getpass(f"Password for {user}: ")
 
+        # Switching FROM login startup: drop the Run key, or the next login
+        # spawns a second daemon that fights this service over the control port.
+        startup.uninstall_startup()
         nssm = winservice.ensure_nssm(config_dir() / "bin")
         winservice.install_service(
             nssm, SERVICE_NAME, exe, args, app_dir,
             user=user, password=password, appdata=os.environ.get("APPDATA"),
+            start=False,
         )
+        # The registration is fresh and stopped, so anything still holding the
+        # control port is a leftover login-startup (or dev) daemon. Stop it
+        # before starting, or the service daemon can't bind the port and NSSM
+        # restart-loops it while the old daemon keeps serving.
+        if _daemon_reachable():
+            _stop_daemon_process()
+        winservice.start_service(nssm, SERVICE_NAME)
         # A user-account service is the one path that can hit Error 1069 (the
         # account has no password / is PIN-only). If it didn't come up, don't
         # leave the user staring at a dead service — point them at login startup.
@@ -922,6 +932,12 @@ def install_service(as_user: bool = False) -> None:
         run_as = os.environ.get("SUDO_USER") or None
         if run_as == "root":
             run_as = None
+        # A stray daemon the unit doesn't own (e.g. a dev `python -m
+        # palctl.daemon` in a terminal) holds the control port and would
+        # crash-loop the fresh unit. The unit's own daemon needs no killing —
+        # the `systemctl restart` inside install replaces it.
+        if _daemon_reachable() and not systemd.is_active(SERVICE_NAME):
+            _stop_daemon_process()
         exec_start = f"{exe} {args}".strip()
         systemd.install_service(
             SERVICE_NAME, exec_start, description="palctl daemon",
@@ -980,6 +996,17 @@ def uninstall_startup() -> None:
 
     startup.uninstall_startup()
     print("[daemon] removed palctl from login startup.")
+
+
+def disable_background_startup() -> None:
+    """Turn background startup fully off: remove BOTH autostart mechanisms
+    (whichever a previous install registered) and stop any daemon still
+    running. Setup's 'background box unticked' path — unticking must actually
+    turn it off. A first run with nothing registered is a harmless no-op."""
+    uninstall_startup()
+    uninstall_service()
+    if _daemon_reachable():
+        _stop_daemon_process()
 
 
 def _daemon_reachable() -> bool:

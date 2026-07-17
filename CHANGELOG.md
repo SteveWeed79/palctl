@@ -63,6 +63,23 @@ Installers for every release are on the
   and encrypts the connection.
 
 ### Fixed
+- **Switching how palctl starts in the background now cleans up the old mode.**
+  Re-running setup with a different background-startup choice used to leave the
+  previous mechanism behind: picking the Windows service kept the login Run key
+  (so the next login spawned a second daemon that fought the service over the
+  control port), the fresh service couldn't bind that port while the old
+  login-startup daemon still held it (NSSM restart-looped the new daemon while
+  the old one kept serving), and unticking the background group entirely did
+  nothing at all. Now the service install removes the Run key and clears the
+  port before starting, login startup already replaces the service, and
+  unticking removes both mechanisms and stops the running daemon — the same
+  "unticking actually turns it off" contract the Discord toggle has. Setup also
+  asks for admin rights when switching *away* from a registered service (the
+  removal needs elevation, and used to fail silently without it), and the
+  wizard now pre-selects "Windows service" when that's what is currently
+  registered instead of silently defaulting back to login startup. On Linux, a
+  stray non-service daemon (e.g. a dev checkout run by hand) is stopped before
+  the systemd unit starts, instead of crash-looping it.
 - **Re-running the daemon install now actually restarts the daemon.** Installing
   the service over an already-running daemon wrote the new unit/exe/params but
   left the old process up: `systemctl start` no-ops on an active unit and
