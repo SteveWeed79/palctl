@@ -132,6 +132,27 @@ def service_account_warning(username: str, cfg_dir: str) -> str | None:
     )
 
 
+class _BadRequest(Exception):
+    """A client error in an /action request (missing/invalid field). Surfaces as
+    HTTP 400 with a useful message, rather than the bare KeyError repr + 500 a
+    raw ``body["field"]`` would produce."""
+
+
+# The dashboard inlines this same shield-with-heartbeat as its <link rel="icon">
+# (a data: URI). Browsers still probe /favicon.ico on their own, so we serve it
+# here too — otherwise every dashboard visit logs a 401 for a file the token
+# gate had no business rejecting. SVG with the right content-type renders as a
+# favicon in every current browser.
+_FAVICON_SVG = (
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' "
+    "stroke='#2a78d6' stroke-width='2' stroke-linecap='round' "
+    "stroke-linejoin='round'>"
+    "<path d='M12 2.5 L19.5 5.5 V11.5 C19.5 16.3 16.2 20.1 12 21.5 "
+    "C7.8 20.1 4.5 16.3 4.5 11.5 V5.5 Z'/>"
+    "<path d='M6.5 12 H9 L10.5 8.5 L13 15.5 L14.5 12 H17.5'/></svg>"
+)
+
+
 def make_auth_middleware(token: str, exempt: frozenset[str] = frozenset()):
     """aiohttp middleware that rejects any request without the shared token.
     `exempt` paths skip the check — only the dashboard page itself, which
@@ -524,10 +545,14 @@ class Daemon:
     # ---------- localhost API for the GUI ----------
 
     def _routes(self) -> web.Application:
-        # Every request must carry the shared token — see localauth. The one
-        # exception is "/", the dashboard page: static markup, no data.
+        # Every request must carry the shared token — see localauth. The
+        # exceptions are "/", the dashboard page (static markup, no data), and
+        # "/favicon.ico", which browsers fetch on their own before they could
+        # ever attach a token.
         app = web.Application(
-            middlewares=[make_auth_middleware(self._token, exempt=frozenset({"/"}))]
+            middlewares=[
+                make_auth_middleware(self._token, exempt=frozenset({"/", "/favicon.ico"}))
+            ]
         )
 
         dashboard = Path(__file__).with_name("dashboard.html")
@@ -538,6 +563,9 @@ class Daemon:
             except OSError:
                 return web.Response(status=404, text="dashboard not bundled")
             return web.Response(text=html, content_type="text/html")
+
+        async def favicon(_: web.Request) -> web.Response:
+            return web.Response(body=_FAVICON_SVG, content_type="image/svg+xml")
 
         async def state(_: web.Request) -> web.Response:
             # Both of these block (psutil enumeration; an sc.exe subprocess), so
@@ -563,8 +591,23 @@ class Daemon:
             )
 
         async def action(request: web.Request) -> web.Response:
-            body = await request.json() if request.can_read_body else {}
+            try:
+                body = await request.json() if request.can_read_body else {}
+            except (json.JSONDecodeError, ValueError):
+                return web.json_response(
+                    {"error": "request body is not valid JSON"}, status=400
+                )
+            if not isinstance(body, dict):
+                return web.json_response(
+                    {"error": "request body must be a JSON object"}, status=400
+                )
             what = request.match_info["what"]
+
+            def require(field: str) -> str:
+                value = body.get(field)
+                if not isinstance(value, str) or not value:
+                    raise _BadRequest(f"missing required field: {field}")
+                return value
 
             try:
                 if what == "start":
@@ -594,7 +637,7 @@ class Daemon:
                         )
                     )
                 elif what == "announce":
-                    await self.api.announce(body["message"])
+                    await self.api.announce(require("message"))
                 elif what == "save":
                     await self.api.save()
                 elif what == "backup":
@@ -610,13 +653,13 @@ class Daemon:
                     if self.control.busy:
                         return _busy_response(self.control.current_op)
                     self._desired_running = True
-                    self._spawn(self.scheduler.restore_backup(body["name"]))
+                    self._spawn(self.scheduler.restore_backup(require("name")))
                 elif what == "kick":
-                    await self.api.kick(body["user_id"], body.get("reason", ""))
+                    await self.api.kick(require("user_id"), body.get("reason", ""))
                 elif what == "ban":
-                    await self.api.ban(body["user_id"], body.get("reason", ""))
+                    await self.api.ban(require("user_id"), body.get("reason", ""))
                 elif what == "unban":
-                    await self.api.unban(body["user_id"])
+                    await self.api.unban(require("user_id"))
                 elif what == "reload-config":
                     self.cfg = Config.load()
                     self.api = PalApi(
@@ -630,6 +673,8 @@ class Daemon:
                     self._reload_bot()
                 else:
                     return web.json_response({"error": f"unknown action {what}"}, status=400)
+            except _BadRequest as e:
+                return web.json_response({"error": str(e)}, status=400)
             except Exception as e:
                 return web.json_response({"error": str(e)}, status=500)
 
@@ -644,6 +689,7 @@ class Daemon:
             )
 
         app.router.add_get("/", index)
+        app.router.add_get("/favicon.ico", favicon)
         app.router.add_get("/state", state)
         app.router.add_get("/backups", list_backups)
         app.router.add_post("/action/{what}", action)
