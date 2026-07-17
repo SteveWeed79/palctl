@@ -150,7 +150,7 @@ internet. Don't port-forward 8830 on your router — same rule as 8212.
 `/status` `/players` `/playtime` `/announce` `/save` `/backup` `/backups` `/restore` `/restart` `/update` `/kick` `/ban`
 plus join/leave, level-up, watchdog, server up/down, and update-available
 notifications — with an optional auto-refreshing status message and a
-`{name}` join welcome.
+`{name}` join welcome. Full setup: [docs/discord.md](docs/discord.md).
 
 ---
 
@@ -273,9 +273,14 @@ lands, grab the installer from the
 
 ### Discord (optional)
 
-Create an app at discord.com/developers → Bot → copy the token → invite it to your
-server with `applications.commands` and `bot` scopes. Paste the token into the
-GUI's Config tab. Restart the daemon.
+Quick version: create an app at discord.com/developers → Bot → copy the token →
+invite it to your server with the `bot` and `applications.commands` scopes → paste
+the token into the GUI's **Config → Discord bot** tab → Save & reload.
+
+For the full walkthrough — inviting with the right **channel permissions**, the
+**role-ID vs user-ID** gotcha behind `/announce` saying *"Not allowed"*, every
+notification toggle, headless-Linux config, and troubleshooting — see the
+**[Discord bot setup guide](docs/discord.md)**.
 
 ---
 
