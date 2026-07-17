@@ -63,6 +63,14 @@ Installers for every release are on the
   and encrypts the connection.
 
 ### Fixed
+- **CPU in `palctl status` (and the dashboard/bot) is no longer stuck at 0%.**
+  Process metrics are sampled by re-finding PalServer on every poll, which handed
+  psutil a brand-new `Process` object each time — and `cpu_percent(interval=None)`
+  always returns `0.0` on the first call for a given object, since it has no prior
+  sample to diff against. We now keep the same `Process` across polls (rebinding
+  when the server restarts), so CPU measures across the poll interval. The value
+  is also normalized to 0–100% of the whole machine instead of psutil's raw
+  per-core sum, so an N-core box no longer reads e.g. "750%".
 - **A Stop that doesn't actually stop is no longer reported as success.** The
   daemon's HTTP `/action/stop` (used by the web dashboard and the `palctl stop`
   CLI) discarded the result of the service stop and always answered `ok`, so a
