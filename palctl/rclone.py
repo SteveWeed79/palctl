@@ -18,17 +18,18 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .backups import BACKUP_NAME_RE
+
 # An rclone remote is `name:path`, where name is [A-Za-z0-9_-]+. A *single*
 # letter before the colon is a Windows drive (D:\Backups), not a remote — the
 # same rule rclone itself uses, so `backup_mirror` can stay a single field that
 # accepts either a path or a remote.
 _REMOTE_RE = re.compile(r"^[A-Za-z0-9_-]+:")
 
-# palctl backups are named "<YYYY-MM-DD_HH-MM-SS>-<label>" (see backups._stamp).
-# Only directories matching this are ours to count for retention or purge: a
+# Only directories matching palctl's own backup-name pattern (BACKUP_NAME_RE,
+# defined next to backups._stamp) are ours to count for retention or purge: a
 # remote can legitimately be a shared folder — or a bare Drive root — holding the
 # user's own directories, and we must never list, count, or delete those.
-_BACKUP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-")
 
 # Network metadata ops (list/test/purge/version) get a bounded timeout so a
 # stalled remote can't hang a worker thread (or the GUI "Test" button) forever —
@@ -117,7 +118,7 @@ def listing(remote: str) -> list[str]:
     the user's own folders, and those are never ours to list, count, or delete."""
     out = _run(["lsf", "--dirs-only", remote], timeout=_META_TIMEOUT).stdout
     names = [line.rstrip("/") for line in out.splitlines() if line.strip()]
-    names = [n for n in names if _BACKUP_RE.match(n)]
+    names = [n for n in names if BACKUP_NAME_RE.match(n)]
     return sorted(names, reverse=True)
 
 

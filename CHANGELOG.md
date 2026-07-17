@@ -20,12 +20,14 @@ Installers for every release are on the
   Uploads are idempotent, a mirror failure never fails the primary backup, and
   the daemon warns at startup if a remote is configured but rclone isn't
   installed.
-  - **Retention stays inside palctl's own folder.** A cloud mirror must point at
-    a dedicated folder (`gdrive:PalworldBackups`, not the bare `gdrive:` root),
-    and retention only ever lists and purges directories matching palctl's own
-    dated backup names — so a shared remote can never lose the user's other data
-    to pruning. Metadata calls (list/test/purge) are bounded by a timeout so a
-    stalled remote can't hang the daemon or the Test button.
+  - **Retention only ever deletes palctl's own backups.** Pruning (local mirror
+    *and* cloud) now lists and purges only directories matching palctl's own
+    dated backup names, so a mirror pointed at a populated location — a shared
+    network folder, another disk's root, or an rclone remote holding the user's
+    other files — can never lose the user's unrelated data to retention. A cloud
+    mirror must additionally point at a dedicated folder (`gdrive:PalworldBackups`,
+    not the bare `gdrive:` root). Metadata calls (list/test/purge) are bounded by
+    a timeout so a stalled remote can't hang the daemon or the Test button.
   - The **Config tab** now has a Backup mirror field with a **Test** button
     that verifies the target works (rclone auth + a dedicated folder for a
     remote, writability for a local path) before backups rely on it — run off

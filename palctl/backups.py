@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,6 +26,14 @@ class Backup:
 
 def _stamp() -> str:
     return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+
+# A palctl backup directory is "<stamp>-<label>" (see _stamp above). This
+# identifies our own backups, so retention pointed at a shared or populated
+# location — a mirror on the user's whole drive, or an rclone remote with the
+# user's other folders in it — only ever prunes what palctl created, never the
+# user's own data. rclone.py imports this same pattern for the cloud mirror.
+BACKUP_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-")
 
 
 def _dir_size_mb(path: Path) -> float:
@@ -239,9 +248,16 @@ def prune(backup_root: Path, retain: int) -> list[str]:
     `retain` is clamped to at least 1: a hand-edited (or future-version)
     config with backup_retain <= 0 must read as "keep the latest", never as
     "delete every backup ever taken" — prune runs right after each create.
+
+    Only directories named like palctl's own backups are counted or deleted, so
+    a mirror pointed at a populated location (another disk's root, a shared
+    network folder) can never lose the user's unrelated data to retention.
     """
     retain = max(1, retain)
-    prunable = [b for b in listing(backup_root) if not b.name.endswith("-pre-restore")]
+    prunable = [
+        b for b in listing(backup_root)
+        if BACKUP_NAME_RE.match(b.name) and not b.name.endswith("-pre-restore")
+    ]
     doomed = prunable[retain:]
     for b in doomed:
         shutil.rmtree(b.path)

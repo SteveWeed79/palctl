@@ -279,3 +279,23 @@ def test_prune_keeps_newest_and_pre_restore(tmp_path: Path):
     remaining = {d.name for d in root.iterdir()}
     assert "2026-01-01_12-00-00-pre-restore" in remaining
     assert len(remaining) == 3
+
+
+def test_prune_never_deletes_non_backup_dirs(tmp_path: Path):
+    # Symmetric with the rclone mirror: a local mirror pointed at a populated
+    # location (another disk's root, a shared network folder) must only ever
+    # prune palctl's own backups — never the user's unrelated directories, even
+    # when those sort above or below the timestamped backups.
+    root = tmp_path / "shared_disk"
+    root.mkdir()
+    (root / "Photos").mkdir()          # sorts above the timestamps
+    (root / "0-user-folder").mkdir()   # sorts below the timestamps
+    for stamp in ("2026-01-01_00-00-00", "2026-01-02_00-00-00", "2026-01-03_00-00-00"):
+        (root / f"{stamp}-scheduled").mkdir()
+
+    doomed = backups.prune(root, retain=1)
+
+    assert doomed == ["2026-01-02_00-00-00-scheduled", "2026-01-01_00-00-00-scheduled"]
+    remaining = {d.name for d in root.iterdir()}
+    assert "Photos" in remaining and "0-user-folder" in remaining  # untouched
+    assert "2026-01-03_00-00-00-scheduled" in remaining  # newest backup kept
