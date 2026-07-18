@@ -20,6 +20,7 @@ charges for that.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -132,9 +133,22 @@ def _migrate(db: sqlite3.Connection) -> None:
         """
     )
     db.execute("CREATE INDEX IF NOT EXISTS idx_metrics_at ON metrics(at)")
-    # Sessions a previous daemon run never closed can't be closed correctly
-    # (we don't know when the player left), and they'd shadow the player's
-    # next real session in close_session(). Close them at zero length.
+    # Close sessions a previous daemon run left open (it died without a
+    # close_session), or they'd shadow the player's next real session. Estimate
+    # the leave time as the daemon's last recorded activity — the newest metrics
+    # sample, written every poll while the server was up — rather than collapsing
+    # to joined_at. A daemon restart with players online then keeps the
+    # in-progress session's playtime up to the last poll instead of zeroing it.
+    # Fall back to joined_at when there's no activity to point at (or the estimate
+    # would predate the join, so left_at can never land before joined_at).
+    row = db.execute("SELECT max(at) FROM metrics").fetchone()
+    last_at = row[0] if row and row[0] is not None else None
+    if last_at is not None:
+        approx = datetime.fromtimestamp(last_at, UTC).isoformat()
+        db.execute(
+            "UPDATE sessions SET left_at = ? WHERE left_at IS NULL AND joined_at <= ?",
+            (approx, approx),
+        )
     db.execute("UPDATE sessions SET left_at = joined_at WHERE left_at IS NULL")
     db.commit()
 
@@ -145,6 +159,12 @@ def _connect_and_migrate(target: Path | str) -> sqlite3.Connection:
     # _open_store can catch and quarantine them.
     db = sqlite3.connect(target, check_same_thread=False)
     try:
+        # WAL + synchronous=NORMAL: writers don't block readers and each commit
+        # skips a full fsync, so the per-poll metrics/session writes (some of
+        # which the player differ makes while other writes run on worker threads)
+        # don't stall on disk. Harmlessly ignored for an in-memory fallback DB.
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=NORMAL")
         _migrate(db)
     except BaseException:
         db.close()
@@ -189,6 +209,20 @@ class SessionStore:
             self._db.execute(
                 "INSERT INTO sessions (user_id, name, joined_at, level_start) VALUES (?,?,?,?)",
                 (p.user_id, p.name, datetime.now(UTC).isoformat(), p.level),
+            )
+            self._db.commit()
+
+    def open_sessions(self, players: list[Player]) -> None:
+        """Open sessions for several players in a single transaction. The prime
+        path after a (re)start adopts a whole populated server at once, so it
+        does one commit instead of one fsync per player."""
+        if not players:
+            return
+        now = datetime.now(UTC).isoformat()
+        with self._lock:
+            self._db.executemany(
+                "INSERT INTO sessions (user_id, name, joined_at, level_start) VALUES (?,?,?,?)",
+                [(p.user_id, p.name, now, p.level) for p in players],
             )
             self._db.commit()
 
@@ -345,6 +379,12 @@ class SessionStore:
             )
             self._db.commit()
 
+    def close(self) -> None:
+        """Close the underlying connection — called on graceful daemon shutdown
+        so a WAL checkpoint flushes and the file is left clean."""
+        with self._lock:
+            self._db.close()
+
 
 # ---------------- the differ ----------------
 
@@ -362,17 +402,20 @@ class PlayerTracker:
         current = {p.user_id: p for p in players if p.user_id}
 
         # First poll after startup: adopt state silently. Otherwise a daemon
-        # restart spams "5 players joined!" for people who were already on.
+        # restart spams "5 players joined!" for people who were already on. The
+        # bulk insert runs off the event loop (one commit for the whole server).
         if not self._primed:
             self._known = current
             self._primed = True
-            for p in current.values():
-                self._store.open_session(p)
+            await asyncio.to_thread(self._store.open_sessions, list(current.values()))
             return
 
         for uid, p in current.items():
             if uid not in self._known:
-                self._store.open_session(p)
+                # SQLite writes go through a lock the metrics writer also holds on
+                # a worker thread; do them off the loop so a contended commit can't
+                # stall polling/the control API.
+                await asyncio.to_thread(self._store.open_session, p)
                 await self._bus.emit(
                     Event("join", f"**{p.name}** joined (level {p.level})",
                           {"name": p.name, "user_id": uid, "level": p.level})
@@ -388,7 +431,7 @@ class PlayerTracker:
 
         for uid, old in self._known.items():
             if uid not in current:
-                minutes = self._store.close_session(uid, old.level)
+                minutes = await asyncio.to_thread(self._store.close_session, uid, old.level)
                 await self._bus.emit(
                     Event("leave",
                           f"**{old.name}** left (played {minutes:.0f}m)",
@@ -399,10 +442,11 @@ class PlayerTracker:
 
     async def handle_server_down(self) -> None:
         """Server died. Close sessions rather than leaving them dangling forever."""
-        for uid, p in self._known.items():
-            self._store.close_session(uid, p.level)
+        known = list(self._known.items())
         self._known = {}
         self._primed = False
+        for uid, p in known:
+            await asyncio.to_thread(self._store.close_session, uid, p.level)
 
     @property
     def online(self) -> list[Player]:
