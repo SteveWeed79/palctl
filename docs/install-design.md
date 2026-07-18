@@ -1,0 +1,141 @@
+# Install & service-lifecycle design
+
+Why palctl's install code looks the way it does, and the rules it must keep
+obeying. Written after an audit that found (and fixed) a series of reinstall
+and mode-switching bugs; the point of this document is that nobody has to
+rediscover these the hard way.
+
+## Why install code is a bug magnet
+
+palctl deliberately does **runtime self-installation**: the wizard and the CLI
+register services themselves, so a non-technical host never opens an admin
+terminal. That's the right UX for this audience — but it means palctl re-owns
+problems that installer frameworks (MSI, Inno service directives, distro
+packaging) solved decades ago. Four structural traps come with that choice:
+
+1. **Installation is a state machine, not a script.** "Do the install steps in
+   order" is correct exactly once — on a clean machine. The real requirement is
+   *reconciliation*: any prior state (service registered, Run key set, daemon
+   running, mode switched, wrong elevation) must converge to the desired state.
+   Every install bug found in the audit was a missing transition:
+   running → reinstalled, login → service, something → none.
+
+2. **The OS lies by omission.** `systemctl start` on an active unit,
+   `nssm install` on an existing service, `sc start` on a running one — all
+   silently succeed while doing nothing. Code that ignores exit codes and
+   states never observes its own failure.
+
+3. **The service manager is asynchronous.** Stops and deletions *land after
+   the command returns*. Windows keeps a removed service in "pending deletion"
+   while anything holds a handle to it (an open `services.msc` is enough), and
+   re-creating the name in that state fails.
+
+4. **Install code runs rarely and mutates global state with no rollback.**
+   Bugs here don't die; they hibernate until the next reinstall.
+
+## The rules
+
+These are enforced by unit tests (`test_winservice.py`, `test_systemd.py`,
+`test_daemon_helpers.py`, `test_setup_flow.py`) and by the `install-lifecycle`
+CI job, which exercises the real state machine against a real Windows SCM.
+
+### 1. Reinstall replaces; it never patches
+
+* **Windows:** stop → wait for STOPPED → delete → wait until the name is
+  actually gone → register from a freshly written config → start. The WinSW
+  config XML is the *whole truth*, rewritten every install, so stale settings
+  can't survive by construction. If the name never frees ("pending deletion"),
+  raise with the cause instead of configuring a zombie.
+* **Linux:** the unit file is fully rewritten (write **is** the reinstall),
+  then `daemon-reload` → `enable` → **`restart`** (never `start`, which no-ops
+  on an active unit). This mirrors Debian's own packaging convention:
+  `dh_installsystemd` generates `restart` on upgrade, `start` on fresh install.
+
+### 2. Exactly one startup mechanism owns the daemon
+
+Three modes exist: **service** (WinSW / systemd), **login startup** (HKCU Run
+key, Windows only), and **none**. Switching modes removes the other mechanism
+*first* — order matters:
+
+* login → service: drop the Run key, register the service **stopped**, kill
+  whatever still holds the control port, then start. (Starting first would
+  lose the port to the old daemon and restart-loop the new one.)
+* service → login: remove the service **before** killing the daemon process —
+  a service manager resurrects anything its service owns, and the resurrected
+  copy would fight the fresh daemon for the port.
+* → none: remove **both** mechanisms and stop the running daemon. Unticking
+  must actually turn the thing off (the same contract the Discord toggle
+  documents in `setup_flow.py`).
+
+The chosen mode is persisted (`Config.daemon_startup`), so a wizard re-run
+defaults to what the user actually picked instead of silently switching back.
+
+### 3. Success is verified, never assumed
+
+The service manager's opinion is not the success signal — **the daemon's own
+control port answering is**. `install_service` and `start_detached` return a
+verified result after a bounded wait, and failure messages say where to look
+(`palctl-daemon run` in a console on Windows; `systemctl status` /
+`journalctl -u` on Linux). The CLI install commands exit nonzero on verified
+failure so scripts and CI can assert outcomes.
+
+### 4. Elevation is demanded when it's actually needed
+
+Registering a service needs admin — and so does **removing** one, which means
+switching *away* from a registered service (to login startup or none) needs
+admin too. Preflight (`setup_flow.needs_admin`) checks the real system state,
+not just the requested mode; an unelevated removal that silently fails would
+leave the old daemon running while setup claims success.
+
+### 5. Downloads are pinned or signature-verified
+
+Anything downloaded and then run as SYSTEM must be verifiable:
+
+* **WinSW** — SHA-256-pinned to an exact release asset (`WINSW_SHA256`),
+  re-verified from independent infrastructure by the CI lifecycle job on every
+  run. Refuse on mismatch; never unpack-then-check.
+* **VC++ redistributable** — evergreen URL, can't be pinned; Authenticode
+  signature is the integrity anchor (fail closed only on a positive tamper
+  signal).
+* **SteamCMD** — TLS to Valve's CDN; content changes too often to pin.
+
+## Why WinSW (and not NSSM)
+
+NSSM's last release was 2014; it is unmaintained. Beyond maintenance, the
+decisive property is **declarative config**: NSSM stores each setting
+individually in the registry, and its `install`/`set` commands only overwrite
+what the *current* invocation specifies — which is how re-installs inherited a
+stale service account or stale launch arguments. WinSW's one-XML-file model
+makes that class impossible. WinSW also grants the "Log on as a service" right
+itself (`<allowservicelogon>`), removing one cause of Error 1069 for
+`--as-user` installs.
+
+Removal and start/stop go through plain `sc.exe`, which works on *any*
+service — so palctl versions that used NSSM migrate cleanly: the next install
+stops and deletes the old NSSM-wrapped service and registers the WinSW one.
+
+## The layers
+
+| Layer | Owns | Files |
+|---|---|---|
+| Runtime self-install | services, Run key, mode switching, verification | `winservice.py`, `systemd.py`, `startup.py`, `daemon.py` (install/uninstall/`start_detached`) |
+| Setup orchestration | ordering, preflight, persistence, user-facing log | `setup_flow.py` (+ wizard as a thin view) |
+| Packaged installer | file copy, upgrades over a running daemon, uninstall | `packaging/installer.iss` |
+
+The Inno installer must keep stopping the service **and** killing a login-mode
+daemon before file copy (both hold the exe open), and restarting the right one
+after — see the comments in `installer.iss`. Known accepted limitation: its
+HKCU Run-key probe runs in the elevated user's hive, so the
+standard-user-plus-admin-credentials case won't auto-restart a login-mode
+daemon after upgrade.
+
+## Sources
+
+* [dh_installsystemd — restart-on-upgrade convention](https://manpages.debian.org/testing/debhelper/dh_installsystemd.1.en.html)
+* [sc delete — Microsoft Learn](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/sc-delete)
+* [Error 1072 "marked for deletion" — causes and cleanup](https://troubleshooter879859767.wordpress.com/2020/12/21/1072-the-specified-service-has-been-marked-for-deletion/)
+* [kardianos/service — Install() errors on existing service by design](https://pkg.go.dev/github.com/kardianos/service)
+* [tailscaled — daemon-owned install/uninstall commands](https://tailscale.com/docs/reference/tailscaled)
+* [WinSW CLI commands](https://github.com/winsw/winsw/blob/v3/docs/cli-commands.md)
+* [Servy vs NSSM vs WinSW — wrapper landscape](https://dev.to/aelassas/servy-vs-nssm-vs-winsw-2k46)
+* [Inno Setup AppMutex](https://jrsoftware.org/ishelp/topic_setup_appmutex.htm)
