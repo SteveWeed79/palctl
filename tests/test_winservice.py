@@ -96,8 +96,16 @@ def test_install_service_replaces_an_existing_registration(monkeypatch):
     # AppParameters, an old ObjectName account) would survive — and `nssm
     # start` no-ops on a running service, leaving the OLD process up.
     calls: list[list[str]] = []
-    monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))
-    monkeypatch.setattr(winservice, "service_exists", lambda name: True)
+    state = {"exists": True}
+
+    def run(cmd):
+        calls.append(cmd)
+        if cmd[1] == "remove":  # the SCM lets go once the remove lands
+            state["exists"] = False
+
+    monkeypatch.setattr(winservice, "_run", run)
+    monkeypatch.setattr(winservice, "service_exists", lambda name: state["exists"])
+    monkeypatch.setattr("palctl.procs.service_state", lambda name: "STOPPED")
 
     winservice.install_service("nssm.exe", "palctl-daemon", "svc.exe")
 
@@ -111,6 +119,32 @@ def test_install_service_replaces_an_existing_registration(monkeypatch):
         < calls.index(install)
         < calls.index(start)
     )
+
+
+def test_install_service_raises_when_old_registration_wont_die(monkeypatch):
+    # The SCM keeps a removed service "pending deletion" while anything holds a
+    # handle to it, and re-creating the name then fails. Surface that with the
+    # cause instead of silently configuring a zombie registration.
+    monkeypatch.setattr(winservice, "_run", lambda cmd: None)
+    monkeypatch.setattr(winservice, "service_exists", lambda name: True)
+    monkeypatch.setattr("palctl.procs.service_state", lambda name: "STOPPED")
+    monkeypatch.setattr(  # single-shot wait so the test doesn't sit out the timeout
+        winservice, "_wait_for", lambda pred, timeout, interval=1.0: pred()
+    )
+
+    with pytest.raises(RuntimeError, match="pending deletion"):
+        winservice.install_service("nssm.exe", "svc", "svc.exe")
+
+
+def test_wait_for_polls_until_true(monkeypatch):
+    monkeypatch.setattr(winservice.time, "sleep", lambda s: None)
+    vals = iter([False, False, True])
+    assert winservice._wait_for(lambda: next(vals), timeout=60.0) is True
+
+
+def test_wait_for_times_out(monkeypatch):
+    monkeypatch.setattr(winservice.time, "sleep", lambda s: None)
+    assert winservice._wait_for(lambda: False, timeout=0.0) is False
 
 
 def test_install_service_fresh_registration_skips_removal(monkeypatch):

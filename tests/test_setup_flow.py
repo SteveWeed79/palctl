@@ -112,6 +112,7 @@ def env(tmp_path, monkeypatch):
 
     def _daemon_install_service():
         rec.daemon_service += 1
+        return True  # verified-up, like the real one reports
 
     def _daemon_install_startup():
         rec.login_startup += 1

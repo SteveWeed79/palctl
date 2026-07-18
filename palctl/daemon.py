@@ -863,9 +863,22 @@ def service_target() -> tuple[str, str, str]:
     return sys.executable, "-m palctl.daemon", str(Path(__file__).resolve().parents[1])
 
 
-def install_service(as_user: bool = False) -> None:
+def _wait_until(predicate, timeout: float, interval: float = 1.0) -> bool:
+    """Poll `predicate` until it's true or `timeout` elapses. Sync — used only
+    by the install/CLI paths, never on the daemon's event loop."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def install_service(as_user: bool = False) -> bool:
     """Register (and start) the palctl daemon as a service — NSSM on Windows,
-    systemd on Linux.
+    systemd on Linux. Returns whether the daemon is confirmed up afterward
+    (its control port answering) — success is verified, never assumed.
 
     On Windows the account matters (see winservice.install_commands). With
     `as_user` we register the service under the invoking account, which shares
@@ -891,10 +904,11 @@ def install_service(as_user: bool = False) -> None:
             )
             password = getpass.getpass(f"Password for {user}: ")
 
+        # NSSM first: if the download fails, nothing has been touched yet.
+        nssm = winservice.ensure_nssm(config_dir() / "bin")
         # Switching FROM login startup: drop the Run key, or the next login
         # spawns a second daemon that fights this service over the control port.
         startup.uninstall_startup()
-        nssm = winservice.ensure_nssm(config_dir() / "bin")
         winservice.install_service(
             nssm, SERVICE_NAME, exe, args, app_dir,
             user=user, password=password, appdata=os.environ.get("APPDATA"),
@@ -910,7 +924,9 @@ def install_service(as_user: bool = False) -> None:
         # A user-account service is the one path that can hit Error 1069 (the
         # account has no password / is PIN-only). If it didn't come up, don't
         # leave the user staring at a dead service — point them at login startup.
-        if as_user and procs.service_state(SERVICE_NAME) != "RUNNING":
+        if as_user and not _wait_until(
+            lambda: procs.service_state(SERVICE_NAME) == "RUNNING", timeout=15.0
+        ):
             print(
                 "[daemon] The service registered but did NOT start. This is almost\n"
                 "         always Error 1069: a PIN-only or passwordless Windows\n"
@@ -919,7 +935,7 @@ def install_service(as_user: bool = False) -> None:
                 "             palctl-daemon uninstall-service\n"
                 "             palctl-daemon install-startup"
             )
-            return
+            return False
     else:
         from . import systemd
 
@@ -946,7 +962,22 @@ def install_service(as_user: bool = False) -> None:
         if run_as:
             print(f"[daemon] the service runs as '{run_as}' (not root), sharing that")
             print("         account's ~/.config/palctl token with the palctl CLI.")
-    print(f"[daemon] service '{SERVICE_NAME}' installed and started.")
+    # Don't claim success on the service manager's say-so — the daemon's own
+    # control port answering is the signal that it actually came up.
+    if _wait_until(_daemon_reachable, timeout=30.0):
+        print(f"[daemon] service '{SERVICE_NAME}' installed and started.")
+        return True
+    hint = (
+        "run `palctl-daemon run` in a console to see the startup error"
+        if sys.platform.startswith("win")
+        else f"check `systemctl status {SERVICE_NAME}` and "
+        f"`journalctl -u {SERVICE_NAME}`"
+    )
+    print(
+        f"[daemon] service '{SERVICE_NAME}' is registered, but the daemon is "
+        f"not answering on its control port — {hint}."
+    )
+    return False
 
 
 def uninstall_service() -> None:
@@ -1086,7 +1117,8 @@ def start_detached() -> bool:
         subprocess, "CREATE_NO_WINDOW", 0
     )
     subprocess.Popen(argv, cwd=app_dir, creationflags=flags, close_fds=True)
-    return True
+    # Verified, not assumed: True only once the control port actually answers.
+    return _wait_until(_daemon_reachable, timeout=30.0)
 
 
 def _hide_console() -> None:

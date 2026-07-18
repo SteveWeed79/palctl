@@ -63,6 +63,18 @@ Installers for every release are on the
   and encrypts the connection.
 
 ### Fixed
+- **The install verifies what it claims, instead of assuming.** "Installed and
+  started" used to print no matter what the service manager actually did (every
+  `systemctl`/`nssm` exit code was ignored), and login startup reported
+  "running now" the instant the process was spawned. Now the daemon install
+  only claims success once the daemon's own control port answers — on any
+  platform — and otherwise says exactly where to look (`palctl-daemon run` in a
+  console on Windows, `systemctl status`/`journalctl` on Linux). The re-install
+  also sequences the Windows service manager properly: wait for the old service
+  to actually stop before removing it, and for the removal to actually land
+  before re-registering the name — a service left "pending deletion" (something
+  holding a handle, e.g. an open services.msc) is now reported with its cause
+  instead of being silently configured as a zombie.
 - **Switching how palctl starts in the background now cleans up the old mode.**
   Re-running setup with a different background-startup choice used to leave the
   previous mechanism behind: picking the Windows service kept the login Run key

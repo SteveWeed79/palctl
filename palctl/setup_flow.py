@@ -350,9 +350,15 @@ def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
 def _register_daemon_service(log: Log) -> None:
     from . import daemon
 
-    log(f"Registering the '{daemon.SERVICE_NAME}' Windows service…")
-    daemon.install_service()
-    log(f"  Service '{daemon.SERVICE_NAME}' registered and started.")
+    log(f"Registering the '{daemon.SERVICE_NAME}' service…")
+    if daemon.install_service():
+        log(f"  Service '{daemon.SERVICE_NAME}' registered and started.")
+    else:
+        log(
+            f"  ⚠️ Service '{daemon.SERVICE_NAME}' registered, but the daemon "
+            "isn't answering yet — check the service in services.msc "
+            "(or systemctl on Linux)."
+        )
 
 
 def _remove_daemon_startup(log: Log) -> None:
@@ -383,4 +389,7 @@ def _setup_login_startup(log: Log) -> None:
     if daemon.start_detached():
         log("  Done — palctl is running now and will start at each login.")
     else:
-        log("  Done — palctl will start at your next login.")
+        log(
+            "  ⚠️ Login startup is registered, but the daemon isn't confirmed "
+            "running yet — it will start at your next login if not sooner."
+        )

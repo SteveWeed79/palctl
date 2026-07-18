@@ -23,6 +23,7 @@ import hashlib
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -130,6 +131,19 @@ def service_exists(name: str) -> bool:
     return procs.service_state(name) != "UNKNOWN"
 
 
+def _wait_for(predicate, timeout: float, interval: float = 1.0) -> bool:
+    """Poll `predicate` until it's true or `timeout` elapses. The SCM acts
+    asynchronously (stops and deletions land after the command returns), so
+    anything sequencing service operations needs this."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
 def install_service(
     nssm: str | Path,
     name: str,
@@ -153,6 +167,17 @@ def install_service(
     guarantees nothing stale survives from the old registration."""
     if service_exists(name):
         remove_service(nssm, name)
+        # The SCM deletes asynchronously, and re-creating a name whose old
+        # registration is still pending deletion fails. Wait until it's
+        # actually gone before registering — and if it never goes, say why
+        # instead of silently issuing commands against a zombie registration.
+        if not _wait_for(lambda: not service_exists(name), timeout=30.0):
+            raise RuntimeError(
+                f"Windows still reports service '{name}' as registered after "
+                "removal — it is pending deletion, which usually means "
+                "something holds a handle to it (an open services.msc or Task "
+                "Manager). Close those and run the install again."
+            )
     for cmd in install_commands(
         nssm, name, exe, args, app_dir, user=user, password=password, appdata=appdata
     ):
@@ -169,7 +194,16 @@ def start_service(nssm: str | Path, name: str) -> None:
 
 
 def remove_service(nssm: str | Path, name: str) -> None:
+    from . import procs
+
     _run([str(nssm), "stop", name])
+    # Removing a service that hasn't fully stopped marks it "pending deletion"
+    # in the SCM — a state that blocks re-creating the name until every handle
+    # closes. Wait for the stop to land first (PalServer can take a while
+    # saving the world on the way down).
+    _wait_for(
+        lambda: procs.service_state(name) in ("STOPPED", "UNKNOWN"), timeout=90.0
+    )
     _run([str(nssm), "remove", name, "confirm"])
 
 
