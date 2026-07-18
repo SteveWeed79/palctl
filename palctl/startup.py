@@ -50,7 +50,10 @@ def install_startup(exe: str, args: str = "") -> str:
     import winreg
 
     cmd = startup_command(exe, args)
-    with winreg.OpenKey(
+    # CreateKeyEx, not OpenKey: the Run key exists on any lived-in profile,
+    # but a pristine one (a brand-new Windows account, a CI runner) may not
+    # have it yet — OpenKey then raises FileNotFoundError. Open-or-create.
+    with winreg.CreateKeyEx(
         winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE
     ) as key:
         winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, cmd)
