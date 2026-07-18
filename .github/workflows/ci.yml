@@ -104,6 +104,25 @@ jobs:
           }
           exit 0
 
+  installer-syntax:
+    # Compile installer.iss against stub build output so script errors surface
+    # on every push instead of at tag time — a malformed Code comment already
+    # broke the 1.0.0 release build once.
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - name: Compile installer.iss with ISCC
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          New-Item -ItemType Directory -Force dist\palctl | Out-Null
+          "MZ" | Set-Content dist\palctl\palctl-gui.exe
+          "MZ" | Set-Content dist\palctl\palctl-daemon.exe
+          "MZ" | Set-Content dist\palctl\palctl.exe
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=0.0.0 packaging\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
   lint:
     runs-on: ubuntu-latest
     steps:

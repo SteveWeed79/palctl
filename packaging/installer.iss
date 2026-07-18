@@ -129,43 +129,86 @@ begin
     NB: no comment line may BEGIN with a bracket — ISCC reads a line-leading
     bracket as a section tag even inside a Code comment, and exactly that
     broke the 1.0.0 release build. }
-  LoginStartupWasRegistered := RegValueExists(HKEY_CURRENT_USER,
-    'Software\Microsoft\Windows\CurrentVersion\Run', 'palctl-daemon');
+  { Probe the ORIGINAL user's hive, not the elevated one: Setup runs elevated,
+    and when a standard user elevates with a separate admin account, plain
+    RegValueExists on HKCU reads the ADMIN's hive — missing the real user's
+    Run key, so their daemon would be killed and never brought back. reg.exe
+    run as the original user reads the right hive; it exits 0 when the value
+    exists. }
+  LoginStartupWasRegistered :=
+    ExecAsOriginalUser(ExpandConstant('{sys}\reg.exe'),
+      'query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v palctl-daemon',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM palctl-daemon.exe', '',
     SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Result := '';
 end;
 
-function NeedsServiceRestart: Boolean;
+function DaemonServiceRunning: Boolean;
+var
+  ResultCode: Integer;
 begin
-  { Restart the daemon ourselves only when it was already registered AND the
-    user did not tick the daemonservice task — that task's [Run] step already
-    re-registers and starts it, so we must not double up. }
-  Result := ServiceWasRegistered and not WizardIsTaskSelected('daemonservice');
+  { findstr exits 0 only when the SCM reports the RUNNING state — sc.exe's own
+    exit code is 0 for a stopped service too, so it can't be trusted alone. }
+  Result := Exec(ExpandConstant('{cmd}'),
+    '/C sc query palctl-daemon | findstr /C:"RUNNING"', '',
+    SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
 end;
 
-function NeedsLoginDaemonRestart: Boolean;
+procedure RestartDaemonAfterUpgrade;
+var
+  ResultCode: Integer;
+  Tries: Integer;
 begin
-  { Same idea for the login-startup mode: bring the daemon back after the
-    upgrade killed it, or the watchdog/scheduler/bot silently stay dead until
-    the next sign-in. Skipped if a service is (being) registered — one daemon
-    only. }
-  Result := LoginStartupWasRegistered and not ServiceWasRegistered
-    and not WizardIsTaskSelected('daemonservice');
+  { The daemonservice task's [Run] entry re-registers and starts the service
+    itself; doing anything here would double up. }
+  if WizardIsTaskSelected('daemonservice') then
+    exit;
+  if ServiceWasRegistered then
+  begin
+    Exec(ExpandConstant('{sys}\net.exe'), 'start palctl-daemon', '',
+      SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    { VERIFY the start instead of assuming it — net start's result used to be
+      ignored, which left machines with NO daemon after an upgrade whenever
+      the registration was stale (an old exe path or old arguments from a
+      previous install) and could not actually start. Give a slow service a
+      moment to reach RUNNING before concluding. }
+    for Tries := 1 to 15 do
+    begin
+      if DaemonServiceRunning then
+        exit;
+      Sleep(1000);
+    end;
+    Log('palctl-daemon service did not reach RUNNING after the upgrade.');
+    { A dead service registration must not leave the box daemon-less: if login
+      startup is registered too — the wizard's default, and the common state
+      after older palctl versions left a stale service behind — fall back to
+      the login-mode daemon rather than exiting with nothing running. }
+    if not LoginStartupWasRegistered then
+      exit;
+  end;
+  if LoginStartupWasRegistered then
+    { Relaunch the way the Run key would at login — as the original,
+      non-elevated user, so it reads that user's config and DPAPI secrets
+      (the Discord token). }
+    ExecAsOriginalUser(ExpandConstant('{app}\palctl-daemon.exe'),
+      'run --headless', '', SW_HIDE, ewNoWait, ResultCode);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    RestartDaemonAfterUpgrade;
 end;
 
 [Run]
 ; Self-register the daemon service (downloads the WinSW wrapper on first use).
 Filename: "{app}\palctl-daemon.exe"; Parameters: "install-service"; Tasks: daemonservice; Flags: runhidden waituntilterminated; StatusMsg: "Registering the palctl service..."
-; On an upgrade of an existing (wizard-registered) service, PrepareToInstall
-; stopped it to free the exe; start it back so the watchdog/scheduler/bot don't
-; stay dead until reboot. Skipped when the daemonservice task above already did it.
-Filename: "{sys}\net.exe"; Parameters: "start palctl-daemon"; Check: NeedsServiceRestart; Flags: runhidden waituntilterminated; StatusMsg: "Restarting the palctl background service..."
-; Same for the login-startup mode (the wizard's DEFAULT): PrepareToInstall
-; killed the running daemon to free the exe; relaunch it the way the Run key
-; would at login — as the original, non-elevated user, so it reads that user's
-; config and DPAPI secrets (the Discord token).
-Filename: "{app}\palctl-daemon.exe"; Parameters: "run --headless"; Check: NeedsLoginDaemonRestart; Flags: runhidden nowait runasoriginaluser; StatusMsg: "Restarting palctl in the background..."
+; The upgrade restart of an existing daemon (service or login-startup mode)
+; happens in RestartDaemonAfterUpgrade above — in [Code], not here, because it
+; VERIFIES the service actually reached RUNNING and falls back to the
+; login-mode daemon when a stale registration can't start. Blind [Run] entries
+; can't express "check, then fall back".
 ; Offer to launch the GUI (which runs the first-run wizard) at the end.
 Filename: "{app}\palctl-gui.exe"; Description: "Launch palctl"; Flags: nowait postinstall skipifsilent
 

@@ -79,6 +79,19 @@ Installers for every release are on the
   can assert the outcome.
 
 ### Fixed
+- **The installer now actually brings the daemon back after an upgrade.**
+  Upgrading over a running palctl stopped/killed the daemon to free its exe,
+  then restarted it blind: `net start`'s result was ignored, so if the service
+  registration was stale (an old exe path or old arguments left by a previous
+  install — while you actually ran via login startup), the upgrade finished
+  with NO daemon running and said nothing. The restart is now verified against
+  the service manager, and when a dead service registration can't start but
+  login startup is registered too, the installer falls back to relaunching the
+  login-mode daemon instead of leaving the box daemon-less. The login-startup
+  probe also now reads the *original* user's registry hive — under elevation
+  with a separate admin account it used to read the admin's hive, miss the Run
+  key, and kill the daemon without ever bringing it back. CI now compiles the
+  installer script on every push, so .iss errors can't hide until release day.
 - **The install verifies what it claims, instead of assuming.** "Installed and
   started" used to print no matter what the service manager actually did (every
   `systemctl`/`nssm` exit code was ignored), and login startup reported
