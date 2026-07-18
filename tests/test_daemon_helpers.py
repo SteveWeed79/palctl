@@ -310,6 +310,52 @@ def test_install_service_windows_reports_blocked_wrapper_download(monkeypatch, c
     assert "download" in out and "github" in out
 
 
+def test_install_service_windows_reports_failed_registration(monkeypatch, capsys):
+    # winservice.install_service raising (WinSW refused, or the old name is
+    # stuck pending deletion) is a verified failure: the CLI must print the
+    # cause and return False — a clean nonzero exit, not a traceback.
+    import palctl.preflight as preflight
+    import palctl.startup as startup_mod
+    import palctl.winservice as winservice
+
+    started: list[str] = []
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+    monkeypatch.setattr(preflight, "is_elevated", lambda: True)
+    monkeypatch.setattr(startup_mod, "uninstall_startup", lambda: None)
+    monkeypatch.setattr(winservice, "ensure_winsw", lambda d: "winsw.exe")
+    monkeypatch.setattr(
+        winservice, "install_service",
+        lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("pending deletion — close services.msc")
+        ),
+    )
+    monkeypatch.setattr(
+        winservice, "start_service", lambda name: started.append("start")
+    )
+
+    assert daemon_mod.install_service() is False
+    assert started == []  # nothing gets started against a failed registration
+    assert "pending deletion" in capsys.readouterr().out
+
+
+def test_install_service_linux_reports_needing_root(monkeypatch, capsys):
+    # Writing the unit into /etc/systemd/system without root raises
+    # PermissionError — the CLI must turn that into "re-run with sudo" and a
+    # False (nonzero exit), not a traceback.
+    import palctl.systemd as systemd
+
+    monkeypatch.setattr(daemon_mod.sys, "platform", "linux")
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: False)
+    monkeypatch.setattr(
+        systemd, "install_service",
+        lambda *a, **k: (_ for _ in ()).throw(PermissionError(13, "denied")),
+    )
+
+    assert daemon_mod.install_service() is False
+    assert "sudo" in capsys.readouterr().out
+
+
 def test_install_service_windows_surfaces_logon_failure(monkeypatch, capsys):
     # Registered but the SCM won't start it (Error 1069 &c.): surface the real
     # reason read from WIN32_EXIT_CODE, not a generic "not answering".

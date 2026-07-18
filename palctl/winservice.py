@@ -27,6 +27,7 @@ unit tested anywhere; the runners no-op / raise cleanly off Windows.
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import subprocess
 import tempfile
@@ -213,7 +214,20 @@ def install_service(
         ),
         encoding="utf-8",
     )
-    _run([str(svc_exe), "install"])
+    cp = _run([str(svc_exe), "install"])
+    if cp.returncode != 0:
+        # WinSW registering the service is the one step here with no later
+        # verification to catch it (the daemon-reachable check belongs to the
+        # caller, and the PalServer service isn't started until setup's verify
+        # step). Claiming "registered" after a failed install is exactly the
+        # silent-failure class this module exists to prevent.
+        detail = " ".join(
+            part for part in ((cp.stderr or "").strip(), (cp.stdout or "").strip()) if part
+        )
+        raise RuntimeError(
+            f"WinSW could not register the '{name}' service "
+            f"(exit {cp.returncode})" + (f": {detail}" if detail else "")
+        )
     if start:
         _run([str(svc_exe), "start"])
 
@@ -248,17 +262,25 @@ def ensure_winsw(
 ) -> Path:
     """
     Return a usable WinSW exe, downloading and caching it under ``cache_dir``
-    the first time. Subsequent calls reuse the cached copy. The download is
-    verified against the pinned SHA-256 before it lands as the cached binary;
-    pass ``sha256=""`` only to deliberately skip that (there is no good reason
-    to in production).
+    the first time. The cached copy is re-verified against the pinned SHA-256
+    on every call — the cache is not a trust store: a copy that no longer
+    matches the pin (the pinned WinSW version moved, or the file was corrupted
+    or replaced on disk) is refreshed from the pinned URL instead of being
+    handed out to run as SYSTEM. Pass ``sha256=""`` only to deliberately skip
+    verification (there is no good reason to in production).
     """
     cached = cache_dir / "winsw.exe"
     if cached.exists():
-        return cached
+        if not sha256 or _sha256_of(cached) == sha256.lower():
+            return cached
+        cached.unlink()
 
     cache_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as tmp:
+    # Download into the cache dir itself so the final os.replace is atomic:
+    # a crash mid-write can never leave a half-written winsw.exe behind.
+    with tempfile.NamedTemporaryFile(
+        suffix=".exe.part", dir=cache_dir, delete=False
+    ) as tmp:
         tmp_path = Path(tmp.name)
     try:
         # Timeout so a hung/blocked CDN can't stall setup indefinitely.
@@ -275,7 +297,7 @@ def ensure_winsw(
                 "open a palctl issue if the release asset has genuinely been "
                 "reissued."
             )
-        shutil.copy2(tmp_path, cached)
+        os.replace(tmp_path, cached)
         return cached
     finally:
         tmp_path.unlink(missing_ok=True)

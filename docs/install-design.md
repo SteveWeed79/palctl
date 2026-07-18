@@ -79,6 +79,13 @@ verified result after a bounded wait, and failure messages say where to look
 `journalctl -u` on Linux). The CLI install commands exit nonzero on verified
 failure so scripts and CI can assert outcomes.
 
+The port check can't see everything, so the steps it can't cover check their
+own exit codes and raise with the tool's own words: WinSW's `install` (the
+PalServer service is registered stopped, so nothing later would notice a
+failed registration), and every systemctl step — a failed `enable` means "no
+start at boot" while the daemon still comes up fine right now, invisible to
+any reachability probe.
+
 ### 4. Elevation is demanded when it's actually needed
 
 Registering a service needs admin — and so does **removing** one, which means
@@ -93,7 +100,12 @@ Anything downloaded and then run as SYSTEM must be verifiable:
 
 * **WinSW** — SHA-256-pinned to an exact release asset (`WINSW_SHA256`),
   re-verified from independent infrastructure by the CI lifecycle job on every
-  run. Refuse on mismatch; never unpack-then-check.
+  run. Refuse on mismatch; never unpack-then-check. The download cache is not
+  a trust store: the cached exe is re-hashed against the pin on every use, so
+  a corrupted/replaced file is refetched instead of registered as SYSTEM —
+  and a pin bump actually reaches existing installs. The cache write is
+  atomic (`os.replace` from a same-directory temp file), so a crash mid-write
+  can't leave a half-written binary behind.
 * **VC++ redistributable** — evergreen URL, can't be pinned; Authenticode
   signature is the integrity anchor (fail closed only on a positive tamper
   signal).

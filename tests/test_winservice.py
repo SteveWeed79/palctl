@@ -89,6 +89,8 @@ def test_wrapper_paths_pair_by_basename(tmp_path: Path):
 
 def _install_env(monkeypatch, tmp_path: Path, *, exists: bool):
     """A fake SCM: records commands, flips service existence on `sc delete`."""
+    import subprocess
+
     calls: list[list[str]] = []
     state = {"exists": exists}
 
@@ -96,6 +98,7 @@ def _install_env(monkeypatch, tmp_path: Path, *, exists: bool):
         calls.append(cmd)
         if cmd[:2] == ["sc.exe", "delete"]:
             state["exists"] = False
+        return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(winservice, "_run", run)
     monkeypatch.setattr(winservice, "service_exists", lambda name: state["exists"])
@@ -158,6 +161,26 @@ def test_install_service_fresh_registration_skips_removal(monkeypatch, tmp_path)
     assert not any(c[:2] == ["sc.exe", "delete"] for c in calls)
     svc_exe, _ = winservice.wrapper_paths(tmp_path, "svc")
     assert [str(svc_exe), "start"] in calls
+
+
+def test_install_service_raises_when_registration_fails(monkeypatch, tmp_path):
+    # WinSW's `install` failing used to be silently ignored, and setup then
+    # logged "Service registered" for a service that doesn't exist. A nonzero
+    # exit must surface, with WinSW's own words as the cause.
+    import subprocess
+
+    def run(cmd):
+        if cmd[1:] == ["install"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "access is denied")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(winservice, "_run", run)
+    monkeypatch.setattr(winservice, "service_exists", lambda name: False)
+    winsw = tmp_path / "winsw.exe"
+    winsw.write_bytes(b"MZ-winsw")
+
+    with pytest.raises(RuntimeError, match="access is denied"):
+        winservice.install_service(winsw, "svc", "svc.exe")
 
 
 def test_install_service_start_false_skips_start(monkeypatch, tmp_path):
@@ -235,5 +258,26 @@ def test_ensure_winsw_refuses_a_tampered_download(tmp_path: Path, monkeypatch):
     cache = tmp_path / "cache"
     with pytest.raises(winservice.WrapperChecksumError):
         winservice.ensure_winsw(cache, sha256="f" * 64)
-    # Nothing unverified was left on disk as the usable binary.
-    assert not (cache / "winsw.exe").exists()
+    # Nothing unverified was left on disk — not the usable binary, and not a
+    # stray .part download either.
+    assert not any(cache.iterdir())
+
+
+def test_ensure_winsw_replaces_a_cached_copy_that_fails_the_pin(
+    tmp_path: Path, monkeypatch
+):
+    # The cache is not a trust store. A cached winsw.exe that no longer matches
+    # the pin — the pinned version moved, or the file was corrupted/replaced on
+    # disk — must be re-fetched and re-verified, never handed out to run as
+    # SYSTEM. (This is also what makes a WINSW_URL/WINSW_SHA256 bump actually
+    # reach existing installs: before, the stale cache won forever.)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "winsw.exe").write_bytes(b"MZ-old-or-corrupted")
+    good_data = b"MZ-pinned-winsw"
+    _fake_download(monkeypatch, good_data)
+
+    out = winservice.ensure_winsw(cache, sha256=hashlib.sha256(good_data).hexdigest())
+
+    assert out == cache / "winsw.exe"
+    assert out.read_bytes() == good_data

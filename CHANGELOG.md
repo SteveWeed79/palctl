@@ -125,6 +125,22 @@ Installers for every release are on the
   can assert the outcome.
 
 ### Fixed
+- **The WinSW wrapper cache is re-verified against the pinned SHA-256 on
+  every use.** Before, whatever `winsw.exe` sat in the cache was trusted
+  forever: a corrupted or replaced file would be registered to run as SYSTEM
+  unchecked, and bumping the pinned WinSW version could never reach existing
+  installs because the stale cached copy always won. A cached copy that fails
+  the pin is now refetched from the pinned URL, and the cache write is atomic
+  so an interrupted download can't leave a half-written binary behind.
+- **A failed service registration can no longer masquerade as success.**
+  WinSW's `install` exit code was ignored — setup could log "Service
+  registered" for a service that doesn't exist — and on Linux every systemctl
+  step was fire-and-forget, so a failed `enable` (unit will *not* start at
+  boot, the exact thing you asked for) was invisible because the daemon still
+  came up fine right now. Both now fail loudly with the tool's own error text,
+  and the CLI turns them into a clean message + nonzero exit instead of a
+  traceback — including "re-run with sudo" when installing or removing the
+  systemd unit without root.
 - **The memory-leak watchdog no longer goes blind when the server runs under a
   different Windows account than palctl.** In the common setup — PalServer as a
   LocalSystem service, the daemon under your login user — palctl couldn't read

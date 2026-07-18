@@ -56,6 +56,21 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+def _run_checked(cmd: list[str]) -> None:
+    """Run a systemctl step that install depends on, surfacing failure with
+    systemctl's own words. `systemctl enable` failing (a masked unit, a broken
+    symlink farm) means the service will NOT start at boot — exactly the thing
+    the user asked for — and nothing later would catch it: the daemon still
+    starts fine right now, so the port check can't see it."""
+    cp = _run(cmd)
+    if cp.returncode != 0:
+        detail = (cp.stderr or "").strip() or (cp.stdout or "").strip()
+        raise RuntimeError(
+            f"`{' '.join(cmd)}` failed (exit {cp.returncode})"
+            + (f": {detail}" if detail else "")
+        )
+
+
 def install_service(
     name: str,
     exec_start: str,
@@ -73,14 +88,14 @@ def install_service(
         ),
         encoding="utf-8",
     )
-    _run(["systemctl", "daemon-reload"])
-    _run(["systemctl", "enable", name])
+    _run_checked(["systemctl", "daemon-reload"])
+    _run_checked(["systemctl", "enable", name])
     if start:
         # `systemctl start` is a no-op when the unit is already active, so a
         # re-install over a running daemon would leave the OLD process up with
         # the stale unit/binary. `restart` starts it if stopped and re-launches
         # it if running, so a reinstall actually picks up the rewritten unit.
-        _run(["systemctl", "restart", name])
+        _run_checked(["systemctl", "restart", name])
 
 
 def is_active(name: str) -> bool:

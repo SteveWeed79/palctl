@@ -1280,11 +1280,19 @@ def install_service(as_user: bool = False, password: str | None = None) -> bool:
         # Switching FROM login startup: drop the Run key, or the next login
         # spawns a second daemon that fights this service over the control port.
         startup.uninstall_startup()
-        winservice.install_service(
-            winsw, SERVICE_NAME, exe, args, app_dir,
-            user=user, password=password, appdata=os.environ.get("APPDATA"),
-            start=False,
-        )
+        try:
+            winservice.install_service(
+                winsw, SERVICE_NAME, exe, args, app_dir,
+                user=user, password=password, appdata=os.environ.get("APPDATA"),
+                start=False,
+            )
+        except RuntimeError as e:
+            # A verified registration failure (WinSW refused, or the old name
+            # is stuck pending deletion) — the message already carries the
+            # cause and the fix, so report it and exit nonzero rather than
+            # letting a traceback bury it.
+            print(f"[daemon] {e}")
+            return False
         # The registration is fresh and stopped, so anything still holding the
         # control port is a leftover login-startup (or dev) daemon. Stop it
         # before starting, or the service daemon can't bind the port and the
@@ -1326,10 +1334,23 @@ def install_service(as_user: bool = False, password: str | None = None) -> bool:
         if _daemon_reachable() and not systemd.is_active(SERVICE_NAME):
             _stop_daemon_process()
         exec_start = f"{exe} {args}".strip()
-        systemd.install_service(
-            SERVICE_NAME, exec_start, description="palctl daemon",
-            working_dir=app_dir, user=run_as,
-        )
+        try:
+            systemd.install_service(
+                SERVICE_NAME, exec_start, description="palctl daemon",
+                working_dir=app_dir, user=run_as,
+            )
+        except PermissionError:
+            print(
+                "[daemon] installing the systemd service writes to "
+                f"{systemd.UNIT_DIR}, which needs root. Re-run with sudo:\n"
+                "             sudo palctl-daemon install-service"
+            )
+            return False
+        except RuntimeError as e:
+            # A systemctl step failed (reload/enable/restart) — its own stderr
+            # is the most useful thing to show.
+            print(f"[daemon] {e}")
+            return False
         if run_as:
             print(f"[daemon] the service runs as '{run_as}' (not root), sharing that")
             print("         account's ~/.config/palctl token with the palctl CLI.")
@@ -1601,7 +1622,19 @@ def main() -> None:
     if args.command == "install-service":
         sys.exit(0 if install_service(as_user=args.as_user) else 1)
     if args.command == "uninstall-service":
-        uninstall_service()
+        try:
+            uninstall_service()
+        except PermissionError:
+            # Linux: removing the unit from /etc/systemd/system needs root.
+            # (Windows has its own elevation gate inside uninstall_service.)
+            # setup_flow handles this same OSError itself, so raising stays
+            # right for that caller — only the CLI needs the friendly exit.
+            print(
+                f"[daemon] removing the '{SERVICE_NAME}' service needs root. "
+                "Re-run with sudo:\n"
+                "             sudo palctl-daemon uninstall-service"
+            )
+            sys.exit(1)
         return
     if args.command == "install-startup":
         install_startup()
