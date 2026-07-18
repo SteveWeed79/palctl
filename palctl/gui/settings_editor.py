@@ -19,6 +19,7 @@ from pathlib import Path
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
@@ -99,7 +100,100 @@ RANGES: dict[str, tuple[float, float]] = {
     "RCONPort": (1, 65535),
 }
 
+# Settings whose value is one of a fixed, named set. Palworld classifies these
+# as bare identifiers, so the parser sees an "enum" and — before this — dropped
+# them into a free-text box, where a typo ("Nomal", "itemandequipment") is a
+# silently-broken setting the game just ignores. A dropdown makes that
+# impossible. Values are the exact tokens the game writes, case included.
+ENUM_CHOICES: dict[str, tuple[str, ...]] = {
+    # None here is "custom" — the individual rate settings take over.
+    "Difficulty": ("None", "Casual", "Normal", "Hard"),
+    "DeathPenalty": ("None", "Item", "ItemAndEquipment", "All"),
+    "RandomizerType": ("None", "Region", "All"),
+    "LogFormatType": ("Text", "Json"),
+    # Deprecated in favour of CrossplayPlatforms, but still honoured; single value.
+    "AllowConnectPlatform": ("Steam", "Xbox", "PS5", "Mac"),
+}
+
+# Tuple settings whose value is a subset of a fixed list — a row of checkboxes,
+# not a comma-string you have to spell perfectly.
+MULTI_CHOICES: dict[str, tuple[str, ...]] = {
+    "CrossplayPlatforms": ("Steam", "Xbox", "PS5", "Mac"),
+}
+
+# One-line helpers for the settings whose behaviour bites people. Shown as a
+# hover tooltip, with an ⓘ flag on the label so you know to hover — a raw key
+# like "bPalLost" or "AllowConnectPlatform" tells you nothing about the footgun
+# behind it. Kept terse: a form of 200 fields can't afford paragraphs.
+HELP: dict[str, str] = {
+    "Difficulty": (
+        "None = use the custom rates below. A preset (Casual/Normal/Hard) "
+        "overrides most of those multipliers."
+    ),
+    "DeathPenalty": (
+        "What you drop when you die:  None = nothing · Item = inventory · "
+        "ItemAndEquipment = + equipped gear · All = + your active Pals."
+    ),
+    "RESTAPIEnabled": (
+        "palctl drives the server through this REST API — it must be True, or "
+        "palctl can't talk to the server at all."
+    ),
+    "AdminPassword": (
+        "Also the REST API password palctl uses. The game stores it here in "
+        "cleartext, so this is where palctl reads it from."
+    ),
+    "AllowConnectPlatform": (
+        "Deprecated — set CrossplayPlatforms instead. Kept only for old configs."
+    ),
+    "CrossplayPlatforms": (
+        "Which platforms may connect. Uncheck all but Steam for a PC-only server."
+    ),
+    "bHardcore": "Permadeath: a player who dies can't respawn on this server.",
+    "bPalLost": (
+        "In hardcore, a player's Pals are gone for good on death — not just "
+        "dropped to be recaptured."
+    ),
+    "RandomizerType": (
+        "Shuffle where Pals spawn:  None = normal · Region = within each region · "
+        "All = globally."
+    ),
+    "RandomizerSeed": (
+        "Only matters when RandomizerType isn't None. The same seed reproduces "
+        "the same shuffle."
+    ),
+    "LogFormatType": (
+        "Server log format. Text is human-readable; Json is for log-analysis tools."
+    ),
+}
+
 SECRET_KEYS = {"AdminPassword", "ServerPassword"}
+
+
+class MultiSelect(QWidget):
+    """A row of checkboxes for a tuple-of-known-values setting.
+
+    Any currently-set value we don't recognise (a future platform, say) is kept
+    as its own checked box, so saving never silently drops it."""
+
+    def __init__(self, options: tuple[str, ...], selected: list[str]) -> None:
+        super().__init__()
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        selected_set = {str(s) for s in selected}
+        # Known options first, then anything set that we don't know about.
+        ordered = list(options) + [s for s in selected_set if s not in options]
+
+        self._boxes: list[QCheckBox] = []
+        for name in ordered:
+            box = QCheckBox(name)
+            box.setChecked(name in selected_set)
+            self._boxes.append(box)
+            lay.addWidget(box)
+        lay.addStretch(1)
+
+    def values(self) -> list[str]:
+        return [b.text() for b in self._boxes if b.isChecked()]
 
 
 class SettingsEditor(QWidget):
@@ -154,7 +248,10 @@ class SettingsEditor(QWidget):
         self._note.setText(
             "⚠️ Changes take effect on the next server restart — the game reads this "
             "file only at startup. Every save takes a timestamped .bak, because a "
-            "SteamCMD validate can wipe this file."
+            "SteamCMD validate can wipe this file. Note: once a world exists, the game "
+            "copies most of these into that world's WorldOption.sav and reads them from "
+            "there — server name, ports and player caps still come from here, but a "
+            "changed rate may not apply until WorldOption.sav is removed."
         )
         self._build()
 
@@ -221,11 +318,27 @@ class SettingsEditor(QWidget):
             opt = self._settings.option(key)
             w = self._widget_for(key, opt.kind, opt.value)
             self._widgets[key] = w
-            form.addRow(QLabel(key), w)
+
+            label = QLabel(key)
+            help_text = HELP.get(key)
+            if help_text:
+                # ⓘ flags that there's a tooltip — invisible help helps no one.
+                label.setText(f"{key} ⓘ")
+                label.setToolTip(help_text)
+                w.setToolTip(help_text)
+            form.addRow(label, w)
 
         return box
 
     def _widget_for(self, key: str, kind: str, value: object) -> QWidget:
+        # Fixed-choice settings get real pickers regardless of how the parser
+        # classified the raw text — a dropdown/checkboxes can't hold a typo.
+        if key in ENUM_CHOICES:
+            return self._enum_combo(key, value)
+        if key in MULTI_CHOICES:
+            selected = value if isinstance(value, list) else [str(value)] if value else []
+            return MultiSelect(MULTI_CHOICES[key], selected)
+
         lo, hi = RANGES.get(key, (None, None))  # type: ignore[assignment]
 
         if kind == ValueKind.BOOL:
@@ -253,6 +366,18 @@ class SettingsEditor(QWidget):
             w.setEchoMode(QLineEdit.EchoMode.Password)
         return w
 
+    def _enum_combo(self, key: str, value: object) -> QComboBox:
+        w = QComboBox()
+        choices = list(ENUM_CHOICES[key])
+        current = str(value)
+        # Preserve a value we don't recognise (custom, or from a future patch)
+        # by making it a selectable option rather than throwing it away.
+        if current and current not in choices:
+            choices.insert(0, current)
+        w.addItems(choices)
+        w.setCurrentText(current)
+        return w
+
     # ---------- save ----------
 
     def _save(self) -> None:
@@ -260,7 +385,11 @@ class SettingsEditor(QWidget):
             return
 
         for key, w in self._widgets.items():
-            if isinstance(w, QCheckBox):
+            if isinstance(w, MultiSelect):
+                self._settings.set(key, w.values())
+            elif isinstance(w, QComboBox):
+                self._settings.set(key, w.currentText())
+            elif isinstance(w, QCheckBox):
                 self._settings.set(key, w.isChecked())
             elif isinstance(w, QSpinBox):
                 self._settings.set(key, w.value())
