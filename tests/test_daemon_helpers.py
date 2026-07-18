@@ -287,9 +287,15 @@ def _startup_env(monkeypatch, *, service: bool, reachable: bool) -> list[str]:
     import palctl.winservice as winservice
 
     calls: list[str] = []
+    state = {"service": service}
     monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
-    monkeypatch.setattr(winservice, "service_exists", lambda name: service)
-    monkeypatch.setattr(daemon_mod, "uninstall_service", lambda: calls.append("uninstall"))
+    monkeypatch.setattr(winservice, "service_exists", lambda name: state["service"])
+
+    def _uninstall():  # a successful removal — the re-check must see it gone
+        calls.append("uninstall")
+        state["service"] = False
+
+    monkeypatch.setattr(daemon_mod, "uninstall_service", _uninstall)
     monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: reachable)
     monkeypatch.setattr(daemon_mod, "_stop_daemon_process", lambda: calls.append("stop"))
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: calls.append("spawn"))
@@ -308,6 +314,19 @@ def test_start_detached_fresh_spawn_touches_nothing(monkeypatch):
     calls = _startup_env(monkeypatch, service=False, reachable=False)
     assert daemon_mod.start_detached() is True
     assert calls == ["spawn"]
+
+
+def test_start_detached_aborts_when_service_removal_fails(monkeypatch):
+    # Unelevated: nssm remove fails and the service stays registered. Killing
+    # the daemon would just get it resurrected by the service manager, and a
+    # fresh spawn would lose the port fight to it — report failure (with the
+    # admin-prompt fix printed) instead of pretending it worked.
+    calls = _startup_env(monkeypatch, service=True, reachable=True)
+    monkeypatch.setattr(  # a removal that does NOT clear the registration
+        daemon_mod, "uninstall_service", lambda: calls.append("uninstall")
+    )
+    assert daemon_mod.start_detached() is False
+    assert calls == ["uninstall"]  # no kill, no spawn
 
 
 def test_start_detached_noop_off_windows(monkeypatch):

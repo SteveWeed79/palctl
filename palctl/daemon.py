@@ -1064,6 +1064,18 @@ def start_detached() -> bool:
 
     if winservice.service_exists(SERVICE_NAME):
         uninstall_service()
+        if winservice.service_exists(SERVICE_NAME):
+            # Removal failed — almost always: not elevated. Killing the daemon
+            # process now would just get it resurrected by the service manager,
+            # and a fresh spawn would lose the port fight to it, so stop here
+            # with the actual fix instead of pretending it worked.
+            print(
+                "[daemon] The existing palctl-daemon service could not be removed\n"
+                "         (removing a service needs an administrator prompt). Run:\n"
+                "             palctl-daemon uninstall-service\n"
+                "         as administrator, then set up login startup again."
+            )
+            return False
     if _daemon_reachable():
         _stop_daemon_process()
     import subprocess
@@ -1135,6 +1147,11 @@ def main() -> None:
         return
     if args.command == "install-startup":
         install_startup()
+        # Replace any running daemon now (removing a leftover service first),
+        # the same way setup does — the Run key alone only takes effect at the
+        # NEXT login, which would leave an old daemon serving until then.
+        if sys.platform.startswith("win") and start_detached():
+            print("[daemon] palctl is running now — no logout needed.")
         return
     if args.command == "uninstall-startup":
         uninstall_startup()

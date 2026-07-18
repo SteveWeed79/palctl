@@ -79,7 +79,13 @@ Installers for every release are on the
   wizard now pre-selects "Windows service" when that's what is currently
   registered instead of silently defaulting back to login startup. On Linux, a
   stray non-service daemon (e.g. a dev checkout run by hand) is stopped before
-  the systemd unit starts, instead of crash-looping it.
+  the systemd unit starts, instead of crash-looping it. The chosen mode —
+  including "off" — is now persisted in the config, so a wizard re-run defaults
+  to what you actually picked. `palctl-daemon install-startup` on the command
+  line now also replaces any running daemon immediately (the Run key alone only
+  takes effect at the next login), and when a leftover daemon service can't be
+  removed because the prompt isn't elevated, it says so and prints the fix
+  instead of pretending it worked.
 - **Re-running the daemon install now actually restarts the daemon.** Installing
   the service over an already-running daemon wrote the new unit/exe/params but
   left the old process up: `systemctl start` no-ops on an active unit and

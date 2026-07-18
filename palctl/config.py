@@ -154,6 +154,14 @@ class Config:
     # Check GitHub for a newer palctl on startup (best-effort; just notifies).
     check_for_updates: bool = True
 
+    # How the daemon starts in the background, as last chosen in setup: "login"
+    # (HKCU Run key), "service" (Windows service / systemd unit), or "none".
+    # "" = setup never recorded a choice (a config from before this field
+    # existed); the wizard then falls back to probing what's registered. Only
+    # setup writes this — it's what makes a re-run default to the mode the user
+    # actually picked instead of silently switching back to login startup.
+    daemon_startup: str = ""
+
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)

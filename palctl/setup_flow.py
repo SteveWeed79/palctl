@@ -76,6 +76,7 @@ def run_setup(cfg: Config, plan: SetupPlan, log: Log) -> SetupResult:
         cfg.steamcmd_path = plan.steamcmd_path
         cfg.api_port = plan.api_port
         cfg.service_name = plan.service_name
+        cfg.daemon_startup = plan.daemon_startup
         # Local backups always run — write the folder and cadence
         # unconditionally; the off-site copy is the opt-in part.
         cfg.backup_root = plan.backup_root

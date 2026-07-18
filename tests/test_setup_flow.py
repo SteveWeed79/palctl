@@ -202,6 +202,9 @@ def test_daemon_startup_permutations(
     # re-run must actually remove the previous run's autostart (same contract
     # as the Discord toggle).
     assert env.startup_disabled == expect_disabled
+    # The choice is persisted, so a wizard re-run defaults to what the user
+    # actually picked instead of silently switching back to login startup.
+    assert Config.load().daemon_startup == startup
 
 
 # ---------------- elevation requirements ----------------
