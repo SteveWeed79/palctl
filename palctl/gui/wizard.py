@@ -215,8 +215,19 @@ class SetupWizard(QDialog):
         self._svc_pw_host = QWidget()
         self._svc_pw_host.setLayout(svc_pw_form)
         bgf.addWidget(self._svc_pw_host)
-        self._svc_pw_host.setEnabled(self.startup_service.isChecked())
-        self.startup_service.toggled.connect(self._svc_pw_host.setEnabled)
+
+        def _sync_service_password_enabled(*_a) -> None:
+            # Needed whenever the daemon runs as you AND palctl registers the
+            # server, so the server lands on your account too (never SYSTEM).
+            self._svc_pw_host.setEnabled(
+                self.startup_service.isChecked()
+                or (self.startup_login.isChecked() and self.reg_server.isChecked())
+            )
+
+        self.startup_service.toggled.connect(_sync_service_password_enabled)
+        self.startup_login.toggled.connect(_sync_service_password_enabled)
+        self.reg_server.toggled.connect(_sync_service_password_enabled)
+        _sync_service_password_enabled()
         # Restore the previously chosen mode (setup persists it), so a re-run
         # doesn't silently switch a "service" or "none" choice back to the
         # login-startup default. A config from before the field existed ("")
@@ -480,6 +491,27 @@ class SetupWizard(QDialog):
                 "server and the Discord bot keeps working. Windows needs your "
                 "account password to create that service — enter it above, or "
                 "switch to “Start when I log in”.",
+            )
+            return
+
+        # Never let setup put palctl and the server on different accounts — the
+        # login-startup daemon (runs as you) plus a server service registered as
+        # SYSTEM is the split that blinds the watchdog. One shared rule with the
+        # setup flow, so the GUI can't wave through what run_setup would refuse.
+        from ..setup_flow import would_split_accounts
+
+        if would_split_accounts(
+            daemon_startup=self._daemon_startup(),
+            service_password=service_password,
+            register_server_service=self.reg_server.isChecked(),
+        ):
+            QMessageBox.warning(
+                self, "Windows password needed",
+                "palctl would run as your user but the Palworld server as SYSTEM "
+                "— two different accounts, so the memory watchdog couldn't read "
+                "the server. Enter your Windows password above so the server runs "
+                "under your account too, or untick “Register the Palworld server "
+                "as a Windows service”.",
             )
             return
 

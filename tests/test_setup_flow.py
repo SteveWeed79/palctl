@@ -258,6 +258,47 @@ def test_service_mode_without_password_stays_localsystem(env):
     assert env.server_service_kwargs.get("user") is None
 
 
+def test_would_split_accounts_rule():
+    from palctl.setup_flow import would_split_accounts
+
+    # The default footgun: login-startup daemon (runs as you) + a server service
+    # with no password (registers as SYSTEM) = split.
+    assert would_split_accounts(
+        daemon_startup="login", service_password="", register_server_service=True
+    )
+    # Path A (service + password) and login + password both keep them together.
+    assert not would_split_accounts(
+        daemon_startup="service", service_password="pw", register_server_service=True
+    )
+    assert not would_split_accounts(
+        daemon_startup="login", service_password="pw", register_server_service=True
+    )
+    # No server service / no daemon / passwordless service → nothing to split.
+    assert not would_split_accounts(
+        daemon_startup="login", service_password="", register_server_service=False
+    )
+    assert not would_split_accounts(
+        daemon_startup="none", service_password="", register_server_service=True
+    )
+    assert not would_split_accounts(
+        daemon_startup="service", service_password="", register_server_service=True
+    )
+
+
+def test_run_setup_refuses_an_account_split(env):
+    # Setup must REFUSE login startup + a SYSTEM server service (not just warn) —
+    # that split silently blinds the watchdog, so it can't be installable.
+    result, lines = env.run(
+        _plan(env.tmp_path, daemon_startup="login", register_server_service=True)
+    )
+    assert result.ok is False
+    assert any("different Windows accounts" in ln for ln in lines)
+    # Refused before doing anything: nothing registered.
+    assert env.daemon_service == 0
+    assert env.login_startup == 0
+    assert env.services_registered == []
+
+
 # ---------------- elevation requirements ----------------
 
 
