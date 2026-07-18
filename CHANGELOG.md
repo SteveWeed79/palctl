@@ -125,6 +125,23 @@ Installers for every release are on the
   can assert the outcome.
 
 ### Fixed
+- **The memory-leak watchdog no longer goes blind when the server runs under a
+  different Windows account than palctl.** In the common setup — PalServer as a
+  LocalSystem service, the daemon under your login user — palctl couldn't read
+  the real multi-GB `PalServer-Win64-Shipping.exe` and silently fell back to the
+  ~7 MB bootstrap launcher: memory read near-zero, CPU read 0%, and the watchdog
+  could *never* fire (this is what three rounds of "CPU reads 0%" fixes were
+  really chasing). `find_process()` now follows the launcher to the real server
+  it spawned, even when the server's name can't be read across the privilege
+  boundary; and the daemon warns once — in the log and the event feed — when the
+  server and daemon run under different accounts, naming the fix.
+- **One clean install path: palctl *and* the game server under your user
+  account ("Path A").** The "Run as a Windows service" option now registers both
+  services under the invoking account (with a Windows-password field in the
+  setup wizard), so they share one account — the watchdog can read the server,
+  the Discord bot's DPAPI token stays readable, and both start at boot. This
+  replaces the old lose-lose choice between a login-startup daemon that can't
+  watch a SYSTEM server and a LocalSystem service that can't run the Discord bot.
 - **A failed Windows service install now says *why* instead of a misleading
   catch-all.** `palctl-daemon install-service` used to let `sc.exe`/WinSW fail
   silently when not elevated, wait out a 30-second probe, and then blame the

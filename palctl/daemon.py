@@ -298,6 +298,9 @@ class Daemon:
         # is wrong (rotated out from under us, say) — NOT an outage. Warn once,
         # not every poll, and never let it drive down-detection/auto-recovery.
         self._auth_warned = False
+        # One-shot: warn if the server process runs under a different account
+        # than the daemon (the watchdog-blinding split — see _maybe_warn_account_mismatch).
+        self._account_warned = False
         # Wall-clock of the last completed poll, for the /healthz liveness probe.
         self._last_poll_at = 0.0
         # Set by a SIGTERM/SIGINT handler to unblock run() into graceful shutdown.
@@ -556,6 +559,7 @@ class Daemon:
         self._down_polls = 0
         self._api_fail_streak = 0
         self._auth_warned = False  # a good poll re-arms the password warning
+        await self._maybe_warn_account_mismatch()
 
         await self.tracker.update(players)
 
@@ -582,6 +586,28 @@ class Daemon:
         self._history.append(sample)
         del self._history[:-720]  # ~2h at 10s polling
         await asyncio.to_thread(self.store.log_metrics, sample)
+
+    async def _maybe_warn_account_mismatch(self) -> None:
+        """Once per daemon run: if the server process runs under a different
+        account than the daemon, say so loudly. That split is what makes the
+        watchdog watch the idle ~7 MB launcher instead of the real multi-GB
+        server — memory/CPU read wrong and the leak watchdog can never fire. The
+        fix is to run both under the same account (Path A: services as-user).
+        psutil enumeration runs off the event loop."""
+        if self._account_warned:
+            return
+        self._account_warned = True
+        import getpass
+
+        try:
+            warning = await asyncio.to_thread(
+                procs.server_account_mismatch, getpass.getuser()
+            )
+        except Exception:
+            warning = None
+        if warning:
+            self.log.warning("%s", warning)
+            await self.bus.emit(Event("error", "⚠️ " + warning))
 
     # ---------- crash / hang auto-recovery ----------
 
@@ -1179,7 +1205,7 @@ def _wait_until(predicate, timeout: float, interval: float = 1.0) -> bool:
         time.sleep(interval)
 
 
-def install_service(as_user: bool = False) -> bool:
+def install_service(as_user: bool = False, password: str | None = None) -> bool:
     """Register (and start) the palctl daemon as a service — WinSW on Windows,
     systemd on Linux. Returns whether the daemon is confirmed up afterward
     (its control port answering) — success is verified, never assumed.
@@ -1215,17 +1241,22 @@ def install_service(as_user: bool = False) -> bool:
             )
             return False
 
-        user = password = None
+        user = None
         if as_user:
             username = os.environ.get("USERNAME", "")
             user = f".\\{username}"
-            print(
-                f"[daemon] The service will log on as {user} so it shares your\n"
-                "         config, token, and saved secrets. Windows needs your\n"
-                "         account password to register that (palctl does not\n"
-                "         store it — it goes straight to the service manager)."
-            )
-            password = getpass.getpass(f"Password for {user}: ")
+            # A password passed in (the setup flow / GUI, which collect it in a
+            # field) is used as-is; only an interactive CLI run prompts for it.
+            if password is None:
+                print(
+                    f"[daemon] The service will log on as {user} so it shares your\n"
+                    "         config, token, and saved secrets. Windows needs your\n"
+                    "         account password to register that (palctl does not\n"
+                    "         store it — it goes straight to the service manager)."
+                )
+                password = getpass.getpass(f"Password for {user}: ")
+        else:
+            password = None  # LocalSystem — no account password
 
         # Wrapper first: if the download fails, nothing has been touched yet. A
         # blocked download (corporate proxy, antivirus, offline box) or a

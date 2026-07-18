@@ -42,6 +42,14 @@ class SetupPlan:
     # key, the default), "service" (Windows service, starts on boot), or "none".
     daemon_startup: str
     service_name: str
+    # Windows account password for user-account services (Path A: the daemon and
+    # the game server both run as the invoking user, so palctl can read the
+    # server process it watches AND its own DPAPI secrets). Set → both services
+    # register under your account; blank → LocalSystem, which can't see a
+    # user-owned server, can't read the Discord token, and — for a login-startup
+    # daemon — leaves the watchdog watching the wrong process. The wizard
+    # requires it for the "Windows service" option.
+    service_password: str = ""
     # Backups. Local always runs (folder + cadence written unconditionally); the
     # off-site copy is the opt-in part, gated by backup_mirror_enabled.
     backup_root: str = ""
@@ -124,7 +132,7 @@ def run_setup(cfg: Config, plan: SetupPlan, log: Log) -> SetupResult:
         if plan.daemon_startup == "login":
             _setup_login_startup(log)
         elif plan.daemon_startup == "service":
-            _register_daemon_service(log)
+            _register_daemon_service(plan, log)
         elif plan.daemon_startup == "none":
             _remove_daemon_startup(log)
 
@@ -327,7 +335,13 @@ def _verify_and_report(plan: SetupPlan, server_registered: bool, log: Log) -> No
 def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
     """Register the PalServer Windows service. Returns False (skipped) when
     PalServer.exe isn't there yet, so the caller doesn't try to start a service
-    that was never created."""
+    that was never created.
+
+    With a service password (Path A), it registers under the invoking user — so
+    palctl, running as that same user, can actually read the server process it
+    watches; otherwise it stays LocalSystem."""
+    import os
+
     from . import winservice
 
     exe = Path(plan.server_root) / "PalServer.exe"
@@ -338,20 +352,36 @@ def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
             "root, then run setup again."
         )
         return False
+    user = password = None
+    if plan.service_password:
+        user = f".\\{os.environ.get('USERNAME', '')}"
+        password = plan.service_password
     log(f"Registering the '{plan.service_name}' Windows service…")
     winsw = winservice.ensure_winsw(config_dir() / "bin")
     winservice.install_service(
-        winsw, plan.service_name, exe, PALSERVER_ARGS, plan.server_root, start=False
+        winsw, plan.service_name, exe, PALSERVER_ARGS, plan.server_root,
+        user=user, password=password, start=False,
     )
-    log(f"  Service '{plan.service_name}' registered.")
+    log(
+        f"  Service '{plan.service_name}' registered"
+        + (f" (runs as {user})." if user else ".")
+    )
     return True
 
 
-def _register_daemon_service(log: Log) -> None:
+def _register_daemon_service(plan: SetupPlan, log: Log) -> None:
     from . import daemon
 
-    log(f"Registering the '{daemon.SERVICE_NAME}' service…")
-    if daemon.install_service():
+    # Path A: with a service password, run the daemon as the invoking user so it
+    # shares that account with the game server — and can read the server it
+    # manages plus its own DPAPI secrets (the Discord token). No password keeps
+    # the old LocalSystem behaviour.
+    as_user = bool(plan.service_password)
+    log(
+        f"Registering the '{daemon.SERVICE_NAME}' service"
+        + (" under your account…" if as_user else "…")
+    )
+    if daemon.install_service(as_user=as_user, password=plan.service_password or None):
         log(f"  Service '{daemon.SERVICE_NAME}' registered and started.")
     else:
         log(

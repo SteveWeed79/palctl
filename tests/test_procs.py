@@ -83,6 +83,90 @@ def test_pal_process_names_cover_both_platforms():
     assert "PalServer-Linux-Shipping" in procs.PAL_PROCESS_NAMES
 
 
+# ---------- find_process: watch the real server, not the launcher ----------
+
+
+class _FakeEnumProc:
+    """Stand-in for psutil.Process during enumeration. `name=None` models a name
+    psutil couldn't read across a privilege boundary."""
+
+    def __init__(self, name, *, children=None, owner=None):
+        self._name = name
+        self.info = {"name": name}
+        self._children = children or []
+        self._owner = owner
+
+    def name(self):
+        if self._name is None:
+            raise psutil.AccessDenied()
+        return self._name
+
+    def children(self):
+        return self._children
+
+    def username(self):
+        if self._owner is None:
+            raise psutil.AccessDenied()
+        return self._owner
+
+
+def _fake_iter(monkeypatch, procs_list):
+    monkeypatch.setattr(procs.psutil, "process_iter", lambda attrs=None: procs_list)
+
+
+def test_find_process_prefers_shipping_seen_directly(monkeypatch):
+    shipping = _FakeEnumProc("PalServer-Win64-Shipping.exe")
+    launcher = _FakeEnumProc("PalServer.exe", children=[shipping])
+    _fake_iter(monkeypatch, [launcher, shipping])
+    assert procs.find_process() is shipping  # the real server, not the launcher
+
+
+def test_find_process_follows_launcher_to_named_child(monkeypatch):
+    # The server runs as SYSTEM: its name wasn't enumerable (info name None), so
+    # it's not a top-level candidate — but the launcher's child IS it.
+    child = _FakeEnumProc("PalServer-Win64-Shipping.exe")
+    launcher = _FakeEnumProc("PalServer.exe", children=[child])
+    unnamed_top = _FakeEnumProc(None)  # the same server, name unreadable up top
+    _fake_iter(monkeypatch, [launcher, unnamed_top])
+    assert procs.find_process() is child
+
+
+def test_find_process_follows_launcher_to_sole_unnamed_child(monkeypatch):
+    # Even if the child's name can't be read, a launcher with exactly one child
+    # IS the server — never settle for the idle launcher.
+    child = _FakeEnumProc(None)
+    launcher = _FakeEnumProc("PalServer.exe", children=[child])
+    _fake_iter(monkeypatch, [launcher])
+    assert procs.find_process() is child
+
+
+def test_find_process_none_when_nothing_running(monkeypatch):
+    _fake_iter(monkeypatch, [_FakeEnumProc("explorer.exe")])
+    assert procs.find_process() is None
+
+
+# ---------- account-split detection (the watchdog-blinding bug) ----------
+
+
+def test_account_mismatch_warning_flags_system_vs_user():
+    w = procs.account_mismatch_warning("NT AUTHORITY\\SYSTEM", "DESKTOP\\server sw")
+    assert w and "SYSTEM" in w and "install-service --as-user" in w
+
+
+def test_account_mismatch_warning_silent_when_same_account():
+    # Same trailing account name (domain prefix differs) → no warning.
+    assert procs.account_mismatch_warning("DESKTOP\\server sw", "server sw") is None
+    # Unknown owner → nothing to say.
+    assert procs.account_mismatch_warning(None, "server sw") is None
+
+
+def test_process_owner_reads_username(monkeypatch):
+    assert procs.process_owner(_FakeEnumProc("x", owner="NT AUTHORITY\\SYSTEM")) == (
+        "NT AUTHORITY\\SYSTEM"
+    )
+    assert procs.process_owner(_FakeEnumProc("x", owner=None)) is None  # AccessDenied
+
+
 # ---------- process metrics (the always-0 CPU bug) ----------
 
 

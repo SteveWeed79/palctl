@@ -360,6 +360,43 @@ def test_install_service_windows_reports_registration_blocked(monkeypatch, capsy
     assert "did not get registered" in capsys.readouterr().out
 
 
+def test_install_service_windows_as_user_uses_passed_password(monkeypatch):
+    # Path A: the setup flow / GUI pass the Windows password in a field, so a
+    # user-account service registers non-interactively — never blocking on a
+    # getpass prompt the GUI can't answer.
+    import getpass
+
+    import palctl.preflight as preflight
+    import palctl.startup as startup_mod
+    import palctl.winservice as winservice
+
+    registered: dict = {}
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+    monkeypatch.setattr(preflight, "is_elevated", lambda: True)
+    monkeypatch.setattr(startup_mod, "uninstall_startup", lambda: None)
+    monkeypatch.setattr(winservice, "ensure_winsw", lambda d: "winsw.exe")
+    monkeypatch.setattr(
+        getpass, "getpass",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("prompted for a password")),
+    )
+
+    def fake_install(winsw, name, exe, args, app_dir, **kw):
+        registered.update(kw)
+
+    monkeypatch.setattr(winservice, "install_service", fake_install)
+    monkeypatch.setattr(winservice, "start_service", lambda name: None)
+    # The --as-user path waits for the service to reach RUNNING (its Error 1069
+    # guard); make it so, so we exercise the happy path.
+    monkeypatch.setattr("palctl.procs.service_state", lambda name: "RUNNING")
+    monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: True)
+    monkeypatch.setattr(daemon_mod, "_stop_daemon_process", lambda: None)
+    monkeypatch.setenv("USERNAME", "server sw")
+
+    assert daemon_mod.install_service(as_user=True, password="hunter2") is True
+    assert registered["user"] == ".\\server sw"
+    assert registered["password"] == "hunter2"
+
+
 def test_uninstall_service_windows_refuses_when_not_elevated(monkeypatch, capsys):
     # Removing a service needs admin too; a refused sc delete must not print
     # "removed" and leave the old registration in place.

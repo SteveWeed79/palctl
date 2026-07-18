@@ -186,16 +186,37 @@ class SetupWizard(QDialog):
         bg.setChecked(True)
         bgf = QVBoxLayout(bg)
         self.startup_login = QRadioButton(
-            "Start when I log in  —  recommended (no password, works with the "
-            "Discord bot)"
+            "Start when I log in  —  no password, but only runs while you're "
+            "logged in (the memory watchdog can't read a server that runs as a "
+            "service)"
         )
         self.startup_login.setChecked(True)
         self.startup_service = QRadioButton(
-            "Run as a Windows service  —  starts on boot before login, but can't "
-            "use the Discord bot"
+            "Run as a Windows service under your account  —  recommended: starts "
+            "on boot, and the memory watchdog and Discord bot both work (needs "
+            "your Windows password)"
         )
         bgf.addWidget(self.startup_login)
         bgf.addWidget(self.startup_service)
+        # Path A: a service registered under YOUR account (not LocalSystem) both
+        # starts on boot AND shares your account with the game server, so palctl
+        # can read the server it watches and decrypt your DPAPI secrets (the
+        # Discord token). Windows needs the account password to create a
+        # user-account service — it goes straight to the service manager; palctl
+        # never stores it. Enabled only while the service option is selected.
+        self.service_password = QLineEdit()
+        self.service_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.service_password.setPlaceholderText(
+            "Your Windows account password (for the service logon)"
+        )
+        svc_pw_form = QFormLayout()
+        svc_pw_form.setContentsMargins(24, 0, 0, 0)
+        svc_pw_form.addRow("Windows password", self.service_password)
+        self._svc_pw_host = QWidget()
+        self._svc_pw_host.setLayout(svc_pw_form)
+        bgf.addWidget(self._svc_pw_host)
+        self._svc_pw_host.setEnabled(self.startup_service.isChecked())
+        self.startup_service.toggled.connect(self._svc_pw_host.setEnabled)
         # Restore the previously chosen mode (setup persists it), so a re-run
         # doesn't silently switch a "service" or "none" choice back to the
         # login-startup default. A config from before the field existed ("")
@@ -448,6 +469,20 @@ class SetupWizard(QDialog):
             )
             return
 
+        # Path A: a user-account service can't be registered without the Windows
+        # account password (WinSW hands it straight to the service manager).
+        service_password = self.service_password.text()
+        if self._daemon_startup() == "service" and not service_password:
+            QMessageBox.warning(
+                self, "Windows password needed",
+                "Running palctl as a Windows service registers it (and the game "
+                "server) under your account, so the memory watchdog can read the "
+                "server and the Discord bot keeps working. Windows needs your "
+                "account password to create that service — enter it above, or "
+                "switch to “Start when I log in”.",
+            )
+            return
+
         # Off-site copy is opt-in: if ticked, it needs a location to copy to.
         mirror_enabled = self.mirror_enabled.isChecked()
         backup_mirror = self.backup_mirror.text().strip()
@@ -497,6 +532,7 @@ class SetupWizard(QDialog):
             register_server_service=self.reg_server.isChecked(),
             daemon_startup=self._daemon_startup(),
             service_name=self._cfg.service_name or "PalServer",
+            service_password=service_password,
             backup_root=self.backup_root.text().strip(),
             backup_hours=self.backup_hours.value(),
             backup_mirror_enabled=mirror_enabled,
