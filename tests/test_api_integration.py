@@ -126,6 +126,24 @@ def test_favicon_is_served_without_a_token(daemon):
     assert "image/svg+xml" in r.headers.get("content-type", "")
 
 
+def test_healthz_is_public_and_reports_liveness(daemon):
+    # Liveness probe for an external monitor: no token, small JSON, 200 while the
+    # daemon is up (the server being down is not a daemon-health failure).
+    r = httpx.get(f"{BASE}/healthz", timeout=5)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert "last_poll_age_seconds" in body
+
+
+def test_logs_requires_token_and_returns_text(daemon):
+    assert httpx.get(f"{BASE}/logs", timeout=5).status_code == 401
+    r = httpx.get(f"{BASE}/logs?n=50", headers=_auth(daemon), timeout=5)
+    assert r.status_code == 200
+    assert "text/plain" in r.headers.get("content-type", "")
+    assert "daemon up" in r.text  # the startup line the daemon logs
+
+
 def test_unknown_action_is_a_400_not_a_500(daemon):
     r = httpx.post(f"{BASE}/action/nope", headers=_auth(daemon), json={}, timeout=5)
     assert r.status_code == 400

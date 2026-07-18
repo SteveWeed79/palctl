@@ -483,3 +483,63 @@ def test_reload_before_run_started_is_harmless():
     d = _bare_daemon(bot=None, task=None)
     d._reload_bot()  # no crash, nothing started
     assert d._started == 0
+
+
+# ---------------- sd_notify (systemd liveness) ----------------
+
+import socket  # noqa: E402
+import sys  # noqa: E402
+
+
+def test_sd_notify_is_silent_without_a_socket(monkeypatch):
+    monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
+    daemon_mod.sd_notify("READY=1")  # must not raise, nothing to send to
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="AF_UNIX datagram")
+def test_sd_notify_sends_to_the_notify_socket(tmp_path, monkeypatch):
+    sock_path = str(tmp_path / "notify.sock")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    srv.bind(sock_path)
+    srv.settimeout(2.0)
+    try:
+        monkeypatch.setenv("NOTIFY_SOCKET", sock_path)
+        daemon_mod.sd_notify("WATCHDOG=1")
+        assert srv.recv(64) == b"WATCHDOG=1"
+    finally:
+        srv.close()
+
+
+# ---------------- log tail endpoint helper ----------------
+
+
+def test_tail_log_file_returns_last_n_lines(tmp_path, monkeypatch):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "palctl.log").write_text("".join(f"line {i}\n" for i in range(100)), "utf-8")
+    monkeypatch.setattr(daemon_mod, "config_dir", lambda: tmp_path)
+    out = daemon_mod._tail_log_file(5)
+    assert out.splitlines() == ["line 95", "line 96", "line 97", "line 98", "line 99"]
+
+
+def test_tail_log_file_missing_is_not_fatal(tmp_path, monkeypatch):
+    monkeypatch.setattr(daemon_mod, "config_dir", lambda: tmp_path)
+    assert "no daemon log" in daemon_mod._tail_log_file(10)
+
+
+# ---------------- low-disk helper ----------------
+
+
+def test_lowest_free_gb_takes_the_tighter_volume(monkeypatch):
+    d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+    d.cfg = daemon_mod.Config()
+    d.cfg.server_root = "/srv"
+    d.cfg.backup_root = "/backups"
+    import shutil
+
+    def fake_usage(path):
+        free = (50 if path == "/srv" else 3) * (1024**3)
+        return types.SimpleNamespace(total=0, used=0, free=free)
+
+    monkeypatch.setattr(shutil, "disk_usage", fake_usage)
+    assert d._lowest_free_gb() == 3.0  # the backup volume is the tighter one

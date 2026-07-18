@@ -69,6 +69,21 @@ class WatchdogConfig:
     preempt_restart: bool = False  # opt-in: restart early while the server is empty
     preempt_horizon_minutes: int = 90
 
+    # Frame-time / FPS degradation watchdog. Palworld can bog down to a slideshow
+    # while still under the memory limit (the memory watchdog never fires). When
+    # the REST API reports server FPS below `min_server_fps` for
+    # `fps_consecutive_samples` polls, restart on that symptom too. Opt-in, and 0
+    # disables it. A reported FPS of 0 is ignored (server booting / API blip).
+    fps_restart: bool = False
+    min_server_fps: int = 0
+    fps_consecutive_samples: int = 5
+
+    # Low-disk alert. A full disk corrupts saves and crashes the server, and the
+    # backup safety net silently fails. Warn (once per episode) when free space on
+    # the server or backup volume drops below this. 0 disables. Not a restart
+    # trigger — just an alert, since only a human can free space.
+    disk_min_free_gb: int = 5
+
 
 @dataclass
 class ScheduleConfig:
@@ -153,6 +168,17 @@ class Config:
 
     # Check GitHub for a newer palctl on startup (best-effort; just notifies).
     check_for_updates: bool = True
+
+    # A second alert channel besides Discord + the GUI/log, so the daemon can
+    # still reach you when Discord is down or unconfigured. One outbound HTTP
+    # POST to any URL — an ntfy topic, a Slack/Discord incoming webhook, or your
+    # own endpoint. The payload carries the message under `content`/`text`/
+    # `message` so the common receivers accept it unchanged. Off by default;
+    # fires only when enabled AND the URL is non-empty. The URL is not a secret
+    # in the DPAPI sense (it lives in config.json), so treat a webhook URL that
+    # embeds a token like any other capability URL.
+    alert_webhook_enabled: bool = False
+    alert_webhook_url: str = ""
 
     # How the daemon starts in the background, as last chosen in setup: "login"
     # (HKCU Run key), "service" (Windows service / systemd unit), or "none".
