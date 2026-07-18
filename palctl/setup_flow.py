@@ -76,6 +76,7 @@ def run_setup(cfg: Config, plan: SetupPlan, log: Log) -> SetupResult:
         cfg.steamcmd_path = plan.steamcmd_path
         cfg.api_port = plan.api_port
         cfg.service_name = plan.service_name
+        cfg.daemon_startup = plan.daemon_startup
         # Local backups always run — write the folder and cadence
         # unconditionally; the off-site copy is the opt-in part.
         cfg.backup_root = plan.backup_root
@@ -124,6 +125,8 @@ def run_setup(cfg: Config, plan: SetupPlan, log: Log) -> SetupResult:
             _setup_login_startup(log)
         elif plan.daemon_startup == "service":
             _register_daemon_service(log)
+        elif plan.daemon_startup == "none":
+            _remove_daemon_startup(log)
 
         _verify_and_report(plan, server_registered, log)
 
@@ -132,6 +135,19 @@ def run_setup(cfg: Config, plan: SetupPlan, log: Log) -> SetupResult:
     except Exception as e:
         log(f"\n❌ Setup failed: {e}")
         return SetupResult(False)
+
+
+def needs_admin(*, register_server_service: bool, daemon_startup: str) -> bool:
+    """Whether this setup needs an elevated process. Registering any service
+    does — and so does *removing* one: switching the daemon to login startup
+    or to none while its service is still registered has to unregister it,
+    and an unelevated attempt fails silently, leaving the OLD daemon running.
+    The wizard's readiness preview uses this too, so both stay in sync."""
+    if register_server_service or daemon_startup == "service":
+        return True
+    from . import daemon, winservice
+
+    return winservice.service_exists(daemon.SERVICE_NAME)
 
 
 def _preflight(plan: SetupPlan, log: Log) -> bool:
@@ -144,8 +160,10 @@ def _preflight(plan: SetupPlan, log: Log) -> bool:
     checks = preflight.run_all(
         plan.server_root, plan.api_port,
         need_install=plan.install_server,
-        # Login startup needs no elevation; only a service does.
-        need_admin=plan.register_server_service or plan.daemon_startup == "service",
+        need_admin=needs_admin(
+            register_server_service=plan.register_server_service,
+            daemon_startup=plan.daemon_startup,
+        ),
     )
     blocking = False
     for c in checks:
@@ -335,6 +353,24 @@ def _register_daemon_service(log: Log) -> None:
     log(f"Registering the '{daemon.SERVICE_NAME}' Windows service…")
     daemon.install_service()
     log(f"  Service '{daemon.SERVICE_NAME}' registered and started.")
+
+
+def _remove_daemon_startup(log: Log) -> None:
+    """The background group was unticked. Same contract the Discord toggle
+    documents in run_setup: unticking on a re-run must actually turn the thing
+    off — remove whichever startup mechanism a previous run registered and
+    stop any daemon it left running."""
+    from . import daemon
+
+    log("Background startup is unticked — removing palctl autostart…")
+    try:
+        daemon.disable_background_startup()
+    except OSError as e:
+        # Best-effort: an unremovable unit file (e.g. no root on Linux) must
+        # not fail the whole setup that just succeeded.
+        log(f"  ⚠️ couldn't fully remove the old autostart: {e}")
+        return
+    log("  palctl will not run in the background.")
 
 
 def _setup_login_startup(log: Log) -> None:

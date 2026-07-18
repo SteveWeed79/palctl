@@ -63,6 +63,43 @@ Installers for every release are on the
   and encrypts the connection.
 
 ### Fixed
+- **Switching how palctl starts in the background now cleans up the old mode.**
+  Re-running setup with a different background-startup choice used to leave the
+  previous mechanism behind: picking the Windows service kept the login Run key
+  (so the next login spawned a second daemon that fought the service over the
+  control port), the fresh service couldn't bind that port while the old
+  login-startup daemon still held it (NSSM restart-looped the new daemon while
+  the old one kept serving), and unticking the background group entirely did
+  nothing at all. Now the service install removes the Run key and clears the
+  port before starting, login startup already replaces the service, and
+  unticking removes both mechanisms and stops the running daemon — the same
+  "unticking actually turns it off" contract the Discord toggle has. Setup also
+  asks for admin rights when switching *away* from a registered service (the
+  removal needs elevation, and used to fail silently without it), and the
+  wizard now pre-selects "Windows service" when that's what is currently
+  registered instead of silently defaulting back to login startup. On Linux, a
+  stray non-service daemon (e.g. a dev checkout run by hand) is stopped before
+  the systemd unit starts, instead of crash-looping it. The chosen mode —
+  including "off" — is now persisted in the config, so a wizard re-run defaults
+  to what you actually picked. `palctl-daemon install-startup` on the command
+  line now also replaces any running daemon immediately (the Run key alone only
+  takes effect at the next login), and when a leftover daemon service can't be
+  removed because the prompt isn't elevated, it says so and prints the fix
+  instead of pretending it worked.
+- **Re-running the daemon install now actually restarts the daemon.** Installing
+  the service over an already-running daemon wrote the new unit/exe/params but
+  left the old process up: `systemctl start` no-ops on an active unit and
+  `nssm start` no-ops on a running service, so the stale binary and settings kept
+  running. Worse, on Windows an in-place re-install could inherit stale
+  settings from the old registration — the `set` calls only overwrite what the
+  new install specifies, so an old service account or old launch arguments
+  survived. Install now rewrites the unit and restarts on Linux (`systemctl
+  restart`), and on Windows stops, removes, and re-registers the service from
+  scratch before starting it, so a reinstall is exactly what it says. The
+  Windows login-startup path had the same gap — it skipped the launch whenever
+  a daemon was already answering — and now replaces the running daemon instead,
+  removing any leftover daemon *service* registration first so the service
+  manager can't resurrect the old process (or double-start it at the next boot).
 - **CPU in `palctl status` (and the dashboard/bot) is no longer stuck at 0%.**
   Process metrics are sampled by re-finding PalServer on every poll, which handed
   psutil a brand-new `Process` object each time — and `cpu_percent(interval=None)`

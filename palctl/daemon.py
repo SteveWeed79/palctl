@@ -876,9 +876,8 @@ def install_service(as_user: bool = False) -> None:
     exe, args, app_dir = service_target()
     if sys.platform.startswith("win"):
         import getpass
-        import os
 
-        from . import winservice
+        from . import startup, winservice
 
         user = password = None
         if as_user:
@@ -892,11 +891,22 @@ def install_service(as_user: bool = False) -> None:
             )
             password = getpass.getpass(f"Password for {user}: ")
 
+        # Switching FROM login startup: drop the Run key, or the next login
+        # spawns a second daemon that fights this service over the control port.
+        startup.uninstall_startup()
         nssm = winservice.ensure_nssm(config_dir() / "bin")
         winservice.install_service(
             nssm, SERVICE_NAME, exe, args, app_dir,
             user=user, password=password, appdata=os.environ.get("APPDATA"),
+            start=False,
         )
+        # The registration is fresh and stopped, so anything still holding the
+        # control port is a leftover login-startup (or dev) daemon. Stop it
+        # before starting, or the service daemon can't bind the port and NSSM
+        # restart-loops it while the old daemon keeps serving.
+        if _daemon_reachable():
+            _stop_daemon_process()
+        winservice.start_service(nssm, SERVICE_NAME)
         # A user-account service is the one path that can hit Error 1069 (the
         # account has no password / is PIN-only). If it didn't come up, don't
         # leave the user staring at a dead service — point them at login startup.
@@ -922,6 +932,12 @@ def install_service(as_user: bool = False) -> None:
         run_as = os.environ.get("SUDO_USER") or None
         if run_as == "root":
             run_as = None
+        # A stray daemon the unit doesn't own (e.g. a dev `python -m
+        # palctl.daemon` in a terminal) holds the control port and would
+        # crash-loop the fresh unit. The unit's own daemon needs no killing —
+        # the `systemctl restart` inside install replaces it.
+        if _daemon_reachable() and not systemd.is_active(SERVICE_NAME):
+            _stop_daemon_process()
         exec_start = f"{exe} {args}".strip()
         systemd.install_service(
             SERVICE_NAME, exec_start, description="palctl daemon",
@@ -982,6 +998,17 @@ def uninstall_startup() -> None:
     print("[daemon] removed palctl from login startup.")
 
 
+def disable_background_startup() -> None:
+    """Turn background startup fully off: remove BOTH autostart mechanisms
+    (whichever a previous install registered) and stop any daemon still
+    running. Setup's 'background box unticked' path — unticking must actually
+    turn it off. A first run with nothing registered is a harmless no-op."""
+    uninstall_startup()
+    uninstall_service()
+    if _daemon_reachable():
+        _stop_daemon_process()
+
+
 def _daemon_reachable() -> bool:
     """Is a daemon already answering on the localhost control port?"""
     import socket
@@ -991,17 +1018,66 @@ def _daemon_reachable() -> bool:
         return s.connect_ex(("127.0.0.1", DAEMON_PORT)) == 0
 
 
+def _stop_daemon_process() -> None:
+    """Stop whatever process is serving the daemon control port, so a freshly
+    spawned daemon can bind it. Best-effort: anything we can't see or can't
+    kill is left alone rather than guessed at. Uses the same terminate → kill
+    ladder the server force-stop uses."""
+    import psutil
+
+    try:
+        conns = psutil.net_connections(kind="tcp")
+    except Exception:
+        return
+    pids = {
+        c.pid
+        for c in conns
+        if c.pid
+        and c.pid != os.getpid()
+        and c.status == psutil.CONN_LISTEN
+        and c.laddr
+        and c.laddr.port == DAEMON_PORT
+    }
+    for pid in pids:
+        try:
+            proc = psutil.Process(pid)
+            if not asyncio.run(procs.terminate_process(proc)):
+                asyncio.run(procs.kill_process(proc))
+        except Exception:
+            pass
+
+
 def start_detached() -> bool:
     """Launch the daemon now, in the background, hidden — used right after
     registering login startup so the user doesn't have to log out and back in
     first. Returns whether a daemon is running afterward. Windows-only.
 
-    Skips the spawn if one is already up (e.g. a leftover service), so switching
-    to login startup can't end up with two daemons fighting over the port."""
+    Re-running setup lands here too, and any daemon already up is the OLD
+    build/config — so it must be replaced, not skipped. Order matters: a
+    leftover *service* registration has to go first, because its manager would
+    resurrect anything we kill and the resurrected copy would fight the fresh
+    daemon over the port (it would also double-start the daemon at next boot).
+    Only then is it safe to stop a surviving detached daemon and spawn."""
     if not sys.platform.startswith("win"):
         return False
+    from . import winservice
+
+    if winservice.service_exists(SERVICE_NAME):
+        uninstall_service()
+        if winservice.service_exists(SERVICE_NAME):
+            # Removal failed — almost always: not elevated. Killing the daemon
+            # process now would just get it resurrected by the service manager,
+            # and a fresh spawn would lose the port fight to it, so stop here
+            # with the actual fix instead of pretending it worked.
+            print(
+                "[daemon] The existing palctl-daemon service could not be removed\n"
+                "         (removing a service needs an administrator prompt). Run:\n"
+                "             palctl-daemon uninstall-service\n"
+                "         as administrator, then set up login startup again."
+            )
+            return False
     if _daemon_reachable():
-        return True
+        _stop_daemon_process()
     import subprocess
 
     exe, args, app_dir = service_target()
@@ -1071,6 +1147,11 @@ def main() -> None:
         return
     if args.command == "install-startup":
         install_startup()
+        # Replace any running daemon now (removing a leftover service first),
+        # the same way setup does — the Run key alone only takes effect at the
+        # NEXT login, which would leave an old daemon serving until then.
+        if sys.platform.startswith("win") and start_detached():
+            print("[daemon] palctl is running now — no logout needed.")
         return
     if args.command == "uninstall-startup":
         uninstall_startup()

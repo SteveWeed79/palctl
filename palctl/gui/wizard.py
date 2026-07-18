@@ -196,6 +196,23 @@ class SetupWizard(QDialog):
         )
         bgf.addWidget(self.startup_login)
         bgf.addWidget(self.startup_service)
+        # Restore the previously chosen mode (setup persists it), so a re-run
+        # doesn't silently switch a "service" or "none" choice back to the
+        # login-startup default. A config from before the field existed ("")
+        # falls back to probing what's actually registered.
+        if cfg.daemon_startup == "none":
+            bg.setChecked(False)
+        elif cfg.daemon_startup == "service":
+            self.startup_service.setChecked(True)
+        elif not cfg.daemon_startup:
+            try:
+                from .. import winservice
+                from ..daemon import SERVICE_NAME as _DAEMON_SVC
+
+                if winservice.service_exists(_DAEMON_SVC):
+                    self.startup_service.setChecked(True)
+            except Exception:
+                pass  # cosmetic only — never block the wizard over a state probe
         self._bg_group = bg
         form.addWidget(bg)
 
@@ -369,10 +386,15 @@ class SetupWizard(QDialog):
 
         self.log.clear()
         self.log.append("Readiness check:")
+        from ..setup_flow import needs_admin
+
         checks = preflight.run_all(
             self.server_root.text().strip(), self.port.value(),
             need_install=self.install_server.isChecked(),
-            need_admin=self.reg_server.isChecked() or self._daemon_startup() == "service",
+            need_admin=needs_admin(
+                register_server_service=self.reg_server.isChecked(),
+                daemon_startup=self._daemon_startup(),
+            ),
         )
         for c in checks:
             self.log.append(f"  {c.icon} {c.name}: {c.detail}")
