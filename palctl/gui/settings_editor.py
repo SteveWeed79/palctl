@@ -121,6 +121,51 @@ MULTI_CHOICES: dict[str, tuple[str, ...]] = {
     "CrossplayPlatforms": ("Steam", "Xbox", "PS5", "Mac"),
 }
 
+# One-line helpers for the settings whose behaviour bites people. Shown as a
+# hover tooltip, with an ⓘ flag on the label so you know to hover — a raw key
+# like "bPalLost" or "AllowConnectPlatform" tells you nothing about the footgun
+# behind it. Kept terse: a form of 200 fields can't afford paragraphs.
+HELP: dict[str, str] = {
+    "Difficulty": (
+        "None = use the custom rates below. A preset (Casual/Normal/Hard) "
+        "overrides most of those multipliers."
+    ),
+    "DeathPenalty": (
+        "What you drop when you die:  None = nothing · Item = inventory · "
+        "ItemAndEquipment = + equipped gear · All = + your active Pals."
+    ),
+    "RESTAPIEnabled": (
+        "palctl drives the server through this REST API — it must be True, or "
+        "palctl can't talk to the server at all."
+    ),
+    "AdminPassword": (
+        "Also the REST API password palctl uses. The game stores it here in "
+        "cleartext, so this is where palctl reads it from."
+    ),
+    "AllowConnectPlatform": (
+        "Deprecated — set CrossplayPlatforms instead. Kept only for old configs."
+    ),
+    "CrossplayPlatforms": (
+        "Which platforms may connect. Uncheck all but Steam for a PC-only server."
+    ),
+    "bHardcore": "Permadeath: a player who dies can't respawn on this server.",
+    "bPalLost": (
+        "In hardcore, a player's Pals are gone for good on death — not just "
+        "dropped to be recaptured."
+    ),
+    "RandomizerType": (
+        "Shuffle where Pals spawn:  None = normal · Region = within each region · "
+        "All = globally."
+    ),
+    "RandomizerSeed": (
+        "Only matters when RandomizerType isn't None. The same seed reproduces "
+        "the same shuffle."
+    ),
+    "LogFormatType": (
+        "Server log format. Text is human-readable; Json is for log-analysis tools."
+    ),
+}
+
 SECRET_KEYS = {"AdminPassword", "ServerPassword"}
 
 
@@ -203,7 +248,10 @@ class SettingsEditor(QWidget):
         self._note.setText(
             "⚠️ Changes take effect on the next server restart — the game reads this "
             "file only at startup. Every save takes a timestamped .bak, because a "
-            "SteamCMD validate can wipe this file."
+            "SteamCMD validate can wipe this file. Note: once a world exists, the game "
+            "copies most of these into that world's WorldOption.sav and reads them from "
+            "there — server name, ports and player caps still come from here, but a "
+            "changed rate may not apply until WorldOption.sav is removed."
         )
         self._build()
 
@@ -270,7 +318,15 @@ class SettingsEditor(QWidget):
             opt = self._settings.option(key)
             w = self._widget_for(key, opt.kind, opt.value)
             self._widgets[key] = w
-            form.addRow(QLabel(key), w)
+
+            label = QLabel(key)
+            help_text = HELP.get(key)
+            if help_text:
+                # ⓘ flags that there's a tooltip — invisible help helps no one.
+                label.setText(f"{key} ⓘ")
+                label.setToolTip(help_text)
+                w.setToolTip(help_text)
+            form.addRow(label, w)
 
         return box
 

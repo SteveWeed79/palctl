@@ -134,7 +134,15 @@ Installers for every release are on the
   accepts. `CrossplayPlatforms` (Steam/Xbox/PS5/Mac) became a row of checkboxes
   instead of a comma-string you had to spell exactly. A current value the editor
   doesn't recognise — a custom or future-patch token — is preserved as a
-  selectable choice, so saving never quietly drops it.
+  selectable choice, so saving never quietly drops it. The settings with
+  non-obvious behaviour now carry a hover helper (flagged with an ⓘ): what
+  `Difficulty=None` vs a preset actually does, the four `DeathPenalty` levels,
+  that `RESTAPIEnabled` must be on for palctl to work at all, that
+  `AdminPassword` doubles as the REST API password, that `AllowConnectPlatform`
+  is deprecated in favour of `CrossplayPlatforms`, and the permadeath pair
+  (`bHardcore`/`bPalLost`). The editor's restart banner also now warns about the
+  single biggest "my settings won't apply" trap — once a world exists the game
+  reads most of these from that world's `WorldOption.sav`, not this file.
 - **Two clicks, one restart.** Restart/backup/update/restore requests checked
   whether the server was busy and then started the operation as a background
   task — and the busy flag only flipped when that task actually began. Two
