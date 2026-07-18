@@ -1,6 +1,6 @@
 @echo off
 REM Runs the palctl daemon in the foreground (for testing).
-REM For production, wrap it in NSSM - see README.
+REM For production, register the service - see README.
 cd /d "%~dp0"
 if not exist .venv\ (
   echo Creating venv...

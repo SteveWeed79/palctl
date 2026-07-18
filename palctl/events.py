@@ -155,7 +155,7 @@ def _connect_and_migrate(target: Path | str) -> sqlite3.Connection:
 def _open_store(path: Path) -> sqlite3.Connection:
     """
     A corrupt or unwritable sessions.db must not crash-loop the daemon under
-    NSSM — the same policy Config.load applies to config.json: quarantine the
+    the service wrapper — the same policy Config.load applies to config.json: quarantine the
     file and start fresh (history is expendable, the daemon is not), falling
     back to an in-memory store as a last resort.
     """

@@ -104,7 +104,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr("palctl.backups.create", _backup)
 
     # Service registration.
-    monkeypatch.setattr("palctl.winservice.ensure_nssm", lambda d: tmp_path / "nssm.exe")
+    monkeypatch.setattr("palctl.winservice.ensure_winsw", lambda d: tmp_path / "winsw.exe")
     monkeypatch.setattr(
         "palctl.winservice.install_service",
         lambda *a, **k: rec.services_registered.append(a),

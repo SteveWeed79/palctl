@@ -54,7 +54,7 @@ class WatchdogConfig:
     warn_seconds: int = 300  # in-game countdown before the restart
     poll_seconds: int = 60
 
-    # Opt-in crash/hang recovery. NSSM already restarts a *crashed* process, but
+    # Opt-in crash/hang recovery. The service wrapper already restarts a *crashed* process, but
     # it can't fix a server that's still running yet has stopped answering (a
     # hang). If the REST API is unreachable for `crash_confirm_polls` polls while
     # palctl itself didn't stop the server, bring it back — rate-limited so a
@@ -217,7 +217,7 @@ class Config:
         try:
             return cls.from_dict(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
-            # A corrupt config must not crash-loop the daemon under NSSM.
+            # A corrupt config must not crash-loop the daemon under the service wrapper.
             # Set the file aside so the values can still be recovered by hand —
             # and say so: the daemon silently running on default paths (backups
             # start failing, watchdog thresholds reset) is baffling without
@@ -261,7 +261,7 @@ def _get_secret(name: str) -> str:
         # wild: a system `cryptography` with a missing _cffi_backend makes pyo3
         # raise pyo3_runtime.PanicException, which derives from BaseException.
         # That would kill the daemon before asyncio.run — a crash loop under
-        # NSSM/systemd. Reads must never do that (see the module note above), so
+        # WinSW/systemd. Reads must never do that (see the module note above), so
         # log the workaround and fall back to "no secret".
         logging.getLogger("palctl.config").warning(
             "keyring backend failed reading %r (%s: %s); treating as no secret. "

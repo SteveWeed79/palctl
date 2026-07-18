@@ -1,5 +1,5 @@
 """
-The daemon. Headless, wrapped in NSSM, always running.
+The daemon. Headless, wrapped in a service (WinSW/systemd), always running.
 
 This is the part that matters. It runs whether or not you're at the PC, whether
 or not the GUI is open. It polls, it diffs, it watches memory, it schedules, and
@@ -36,10 +36,10 @@ from .logging_setup import setup_logging
 from .scheduler import Scheduler
 from .watchdog import Watchdog
 
-SERVICE_NAME = "palctl-daemon"  # the Windows service name NSSM registers
+SERVICE_NAME = "palctl-daemon"  # the Windows service name palctl registers
 
 # The admin's Stop intent, persisted so it survives daemon restarts (crash +
-# NSSM restart, a palctl upgrade, a manual service bounce). Without this the
+# wrapper restart, a palctl upgrade, a manual service bounce). Without this the
 # in-memory flag resets to True and the daily restart / auto-update schedule
 # would resurrect a server that was deliberately taken down for maintenance.
 _STATE_PATH = config_dir() / "daemon_state.json"
@@ -388,7 +388,7 @@ class Daemon:
         self._tasks.discard(t)
         # Without this, a failed operation surfaces only as asyncio's GC-time
         # "Task exception was never retrieved" on stderr — which service mode
-        # discards entirely (NSSM captures no stdio; only the file log survives).
+        # discards entirely (the service wrapper captures no stdio; only the file log survives).
         if not t.cancelled() and t.exception() is not None:
             self.log.error(
                 "background operation failed", exc_info=t.exception()
@@ -876,7 +876,7 @@ def _wait_until(predicate, timeout: float, interval: float = 1.0) -> bool:
 
 
 def install_service(as_user: bool = False) -> bool:
-    """Register (and start) the palctl daemon as a service — NSSM on Windows,
+    """Register (and start) the palctl daemon as a service — WinSW on Windows,
     systemd on Linux. Returns whether the daemon is confirmed up afterward
     (its control port answering) — success is verified, never assumed.
 
@@ -904,23 +904,23 @@ def install_service(as_user: bool = False) -> bool:
             )
             password = getpass.getpass(f"Password for {user}: ")
 
-        # NSSM first: if the download fails, nothing has been touched yet.
-        nssm = winservice.ensure_nssm(config_dir() / "bin")
+        # Wrapper first: if the download fails, nothing has been touched yet.
+        winsw = winservice.ensure_winsw(config_dir() / "bin")
         # Switching FROM login startup: drop the Run key, or the next login
         # spawns a second daemon that fights this service over the control port.
         startup.uninstall_startup()
         winservice.install_service(
-            nssm, SERVICE_NAME, exe, args, app_dir,
+            winsw, SERVICE_NAME, exe, args, app_dir,
             user=user, password=password, appdata=os.environ.get("APPDATA"),
             start=False,
         )
         # The registration is fresh and stopped, so anything still holding the
         # control port is a leftover login-startup (or dev) daemon. Stop it
-        # before starting, or the service daemon can't bind the port and NSSM
-        # restart-loops it while the old daemon keeps serving.
+        # before starting, or the service daemon can't bind the port and the
+        # wrapper restart-loops it while the old daemon keeps serving.
         if _daemon_reachable():
             _stop_daemon_process()
-        winservice.start_service(nssm, SERVICE_NAME)
+        winservice.start_service(SERVICE_NAME)
         # A user-account service is the one path that can hit Error 1069 (the
         # account has no password / is PIN-only). If it didn't come up, don't
         # leave the user staring at a dead service — point them at login startup.
@@ -984,14 +984,16 @@ def uninstall_service() -> None:
     if sys.platform.startswith("win"):
         from . import winservice
 
-        # Don't download NSSM just to uninstall: if the service was never
-        # registered and there's no cached nssm.exe, there's nothing to remove.
-        cached = config_dir() / "bin" / "nssm.exe"
-        if not cached.exists() and not winservice.service_exists(SERVICE_NAME):
+        # Removal goes through plain sc.exe — no wrapper download needed, and
+        # it works on services registered by the old NSSM builds too.
+        if not winservice.service_exists(SERVICE_NAME):
             print(f"[daemon] service '{SERVICE_NAME}' is not registered; nothing to remove.")
             return
-        nssm = winservice.ensure_nssm(config_dir() / "bin")
-        winservice.remove_service(nssm, SERVICE_NAME)
+        winservice.remove_service(SERVICE_NAME)
+        # Best-effort: drop the per-service wrapper copy + config so nothing in
+        # the cache still describes a service that no longer exists.
+        for p in winservice.wrapper_paths(config_dir() / "bin", SERVICE_NAME):
+            p.unlink(missing_ok=True)
         # Don't leave the dashboard firewall port open after uninstall.
         from . import firewall
 
@@ -1171,9 +1173,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # The install commands exit nonzero on a verified failure, so scripts and
+    # CI can assert the outcome instead of parsing prose.
     if args.command == "install-service":
-        install_service(as_user=args.as_user)
-        return
+        sys.exit(0 if install_service(as_user=args.as_user) else 1)
     if args.command == "uninstall-service":
         uninstall_service()
         return
@@ -1182,8 +1185,11 @@ def main() -> None:
         # Replace any running daemon now (removing a leftover service first),
         # the same way setup does — the Run key alone only takes effect at the
         # NEXT login, which would leave an old daemon serving until then.
-        if sys.platform.startswith("win") and start_detached():
-            print("[daemon] palctl is running now — no logout needed.")
+        if sys.platform.startswith("win"):
+            ok = start_detached()
+            if ok:
+                print("[daemon] palctl is running now — no logout needed.")
+            sys.exit(0 if ok else 1)
         return
     if args.command == "uninstall-startup":
         uninstall_startup()

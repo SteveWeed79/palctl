@@ -227,7 +227,7 @@ def _signature_is_tampered(status: str) -> bool:
     should be there); fail OPEN on anything else — a machine that simply can't
     verify (missing PowerShell, an incomplete cert store → NotTrusted, offline)
     must still be able to install the runtime it needs. The evergreen aka.ms URL
-    can't be hash-pinned like NSSM, so the Microsoft signature is the integrity
+    can't be hash-pinned like the service wrapper, so the Microsoft signature is the integrity
     anchor we have."""
     return status.strip().lower() in {"hashmismatch", "notsigned"}
 

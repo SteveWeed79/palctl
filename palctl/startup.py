@@ -3,7 +3,7 @@ Password-free background startup via the current user's Run key.
 
 Running the daemon as a Windows *service under a user account* needs that account
 to have a real password and the "log on as a service" right. PIN-only /
-Microsoft-account / passwordless home users have neither, so `sc`/NSSM refuses
+Microsoft-account / passwordless home users have neither, so the service manager refuses
 with **Error 1069 (logon failure)** — which would break palctl out of the box for
 a large share of the target audience.
 

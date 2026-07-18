@@ -51,7 +51,7 @@ server's admin password.
 ## Two processes
 
 ```
-palctl.daemon   headless, wrap in NSSM, always running
+palctl.daemon   headless, runs as a service, always running
                 → polls, diffs, watches memory, schedules, runs the Discord bot
 
 palctl.gui      PySide6 window, open it when you want it
@@ -286,7 +286,7 @@ Windows Credential Manager (DPAPI-encrypted), never a config file.
 
 The daemon and its whole core — REST client, memory-leak watchdog, scheduler,
 backups, path detection, and SteamCMD install/update — run on Linux too. Service
-control uses **systemd** instead of NSSM, SteamCMD comes from the Linux tarball,
+control uses **systemd** instead of a WinSW service, SteamCMD comes from the Linux tarball,
 and paths resolve under `~/.steam` / `LinuxServer/`. Register the daemon with:
 
 ```
@@ -373,7 +373,7 @@ count.
 ## Development
 
 The platform-neutral core (ini parser, backups, session tracking, config,
-scheduler, path detection, the SteamCMD argv/ini-guard, NSSM command building,
+scheduler, path detection, the SteamCMD argv/ini-guard, the service config builder,
 the REST-API bootstrap, the server-operation lock, the memory watchdog's
 hold-off logic, the leak forecaster, and the CLI) is covered by tests that run
 on any OS — only the daemon's service control, the actual downloads, and the

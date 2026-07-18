@@ -339,9 +339,9 @@ def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
         )
         return False
     log(f"Registering the '{plan.service_name}' Windows service…")
-    nssm = winservice.ensure_nssm(config_dir() / "bin")
+    winsw = winservice.ensure_winsw(config_dir() / "bin")
     winservice.install_service(
-        nssm, plan.service_name, exe, PALSERVER_ARGS, plan.server_root, start=False
+        winsw, plan.service_name, exe, PALSERVER_ARGS, plan.server_root, start=False
     )
     log(f"  Service '{plan.service_name}' registered.")
     return True

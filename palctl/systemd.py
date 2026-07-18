@@ -1,6 +1,6 @@
 """
 Register a service with systemd on Linux — the counterpart to winservice.py's
-NSSM on Windows.
+WinSW on Windows.
 
 The unit-file text is pure and unit-tested. Installing it writes to
 /etc/systemd/system and runs systemctl, so it needs root and only does anything
@@ -24,7 +24,7 @@ def unit_file(
     user: str | None = None,
 ) -> str:
     """Render a systemd unit. Restart=on-failure gives the same 'keep it up'
-    behaviour NSSM provides on Windows."""
+    behaviour the WinSW wrapper provides on Windows."""
     lines = [
         "[Unit]",
         f"Description={description or name}",

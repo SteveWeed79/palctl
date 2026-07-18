@@ -208,8 +208,8 @@ def test_install_service_windows_clears_login_startup_and_stray_daemon(monkeypat
     # Switching login startup → service: the Run key must go (or the next
     # login spawns a rival daemon), and a surviving login-startup daemon must
     # be stopped BETWEEN registration and start — otherwise the service daemon
-    # can't bind the control port and NSSM restart-loops it while the old
-    # daemon keeps serving.
+    # can't bind the control port and the wrapper restart-loops it while the
+    # old daemon keeps serving.
     import palctl.startup as startup_mod
     import palctl.winservice as winservice
 
@@ -217,16 +217,14 @@ def test_install_service_windows_clears_login_startup_and_stray_daemon(monkeypat
     registered_kwargs: dict = {}
     monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
     monkeypatch.setattr(startup_mod, "uninstall_startup", lambda: calls.append("runkey"))
-    monkeypatch.setattr(winservice, "ensure_nssm", lambda d: "nssm.exe")
+    monkeypatch.setattr(winservice, "ensure_winsw", lambda d: "winsw.exe")
 
-    def fake_install(nssm, name, exe, args, app_dir, **kw):
+    def fake_install(winsw, name, exe, args, app_dir, **kw):
         registered_kwargs.update(kw)
         calls.append("register")
 
     monkeypatch.setattr(winservice, "install_service", fake_install)
-    monkeypatch.setattr(
-        winservice, "start_service", lambda nssm, name: calls.append("start")
-    )
+    monkeypatch.setattr(winservice, "start_service", lambda name: calls.append("start"))
     monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: True)
     monkeypatch.setattr(daemon_mod, "_stop_daemon_process", lambda: calls.append("stop"))
 
@@ -322,7 +320,7 @@ def test_start_detached_fresh_spawn_touches_nothing(monkeypatch):
 
 
 def test_start_detached_aborts_when_service_removal_fails(monkeypatch):
-    # Unelevated: nssm remove fails and the service stays registered. Killing
+    # Unelevated: the service removal fails and it stays registered. Killing
     # the daemon would just get it resurrected by the service manager, and a
     # fresh spawn would lose the port fight to it — report failure (with the
     # admin-prompt fix printed) instead of pretending it worked.

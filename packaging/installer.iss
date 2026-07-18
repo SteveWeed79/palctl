@@ -155,7 +155,7 @@ begin
 end;
 
 [Run]
-; Self-register the daemon service (downloads NSSM on first use).
+; Self-register the daemon service (downloads the WinSW wrapper on first use).
 Filename: "{app}\palctl-daemon.exe"; Parameters: "install-service"; Tasks: daemonservice; Flags: runhidden waituntilterminated; StatusMsg: "Registering the palctl service..."
 ; On an upgrade of an existing (wizard-registered) service, PrepareToInstall
 ; stopped it to free the exe; start it back so the watchdog/scheduler/bot don't
