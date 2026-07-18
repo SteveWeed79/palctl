@@ -49,6 +49,12 @@ class ServerController:
         self._api = api
         self._lock = asyncio.Lock()
         self._current: str | None = None
+        # A synchronous "about to run" marker for operations the daemon spawns as
+        # background tasks. The lock is only taken when that task actually starts,
+        # which is a later event-loop turn — so two HTTP handlers could both see
+        # `busy` as False and both spawn. reserve() closes that window: it flips
+        # busy synchronously, in the same turn as the check, before the task runs.
+        self._reserved: str | None = None
 
     def reconfigure(self, cfg: Config, api: PalApi) -> None:
         self._cfg = cfg
@@ -56,16 +62,33 @@ class ServerController:
 
     @property
     def busy(self) -> bool:
-        return self._lock.locked()
+        return self._lock.locked() or self._reserved is not None
 
     @property
     def current_op(self) -> str | None:
-        """Name of the operation holding the lock, or None."""
-        return self._current
+        """Name of the operation holding (or reserved on) the lock, or None."""
+        return self._current or self._reserved
+
+    def reserve(self, name: str) -> bool:
+        """Synchronously claim the server for an operation the caller is about to
+        spawn as a background task. Returns False if something else already holds
+        or has reserved it. Pair with clear_reservation() in the spawned task's
+        finally, so a task that returns before it ever enters operation() (an
+        early-out, an exception) doesn't leave the server wedged as busy forever;
+        operation() itself clears the reservation the moment it takes the lock."""
+        if self.busy:
+            return False
+        self._reserved = name
+        return True
+
+    def clear_reservation(self, name: str) -> None:
+        if self._reserved == name:
+            self._reserved = None
 
     @contextlib.asynccontextmanager
     async def operation(self, name: str) -> AsyncIterator[None]:
         async with self._lock:
+            self._reserved = None  # the reservation (if any) is now the real lock
             self._current = name
             try:
                 yield
@@ -74,10 +97,10 @@ class ServerController:
 
     def try_operation(self, name: str):
         """The non-blocking variant: the context manager if the server is free,
-        None if another operation holds it. No await between the check and the
-        acquisition (callers enter the context immediately), so on a single
-        event loop this doesn't race."""
-        if self._lock.locked():
+        None if another operation holds OR has reserved it. No await between the
+        check and the acquisition (callers enter the context immediately), so on a
+        single event loop this doesn't race."""
+        if self.busy:
             return None
         return self.operation(name)
 
@@ -160,8 +183,17 @@ class ServerController:
     ) -> bool:
         """Stop, breathe, start, and wait for the REST API to answer again.
         Returns whether the server actually came back. `escalate`/`on_escalate`
-        are forwarded to stop() — see there for the hung-server force-kill."""
-        await self.stop(escalate=escalate, on_escalate=on_escalate)
+        are forwarded to stop() — see there for the hung-server force-kill.
+
+        If the stop never confirmed (even the force-kill ladder couldn't take the
+        server down), the restart did not happen: start() would short-circuit on
+        the still-RUNNING service and wait_until_alive() would see the stale
+        process still answering, so returning True here would report a phantom
+        success. The watchdog would then reset its over-limit counter and cool
+        down for 20 minutes while the leak it was fighting is untouched. Report
+        the failure instead, so the caller surfaces "couldn't restart"."""
+        if not await self.stop(escalate=escalate, on_escalate=on_escalate):
+            return False
         await asyncio.sleep(stop_delay)
         await self.start()
         return await self._api.wait_until_alive(timeout=timeout)

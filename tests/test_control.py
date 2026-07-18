@@ -81,12 +81,61 @@ def test_try_operation_skips_when_busy_and_names_the_holder():
     assert seen["after"] == "watchdog-restart"
 
 
+def test_reserve_makes_the_server_busy_synchronously():
+    # The daemon reserves before spawning a background op. A reservation must read
+    # as busy immediately (same turn), so a second request can't slip a duplicate
+    # op past a busy check while the first task hasn't taken the lock yet.
+    ctl = ServerController(Config(), FakeApi())
+    assert ctl.reserve("restart") is True
+    assert ctl.busy and ctl.current_op == "restart"
+    assert ctl.reserve("backup") is False          # a second claim is refused
+    assert ctl.try_operation("watchdog-restart") is None  # opportunistic callers skip too
+    ctl.clear_reservation("restart")
+    assert not ctl.busy and ctl.current_op is None
+
+
+def test_operation_clears_a_reservation_when_it_takes_the_lock():
+    ctl = ServerController(Config(), FakeApi())
+    assert ctl.reserve("restart") is True
+
+    async def main():
+        async with ctl.operation("restart"):
+            # Inside the real lock now: the reservation has been converted, and a
+            # stale clear_reservation from a wrapper's finally must not free it.
+            assert ctl.busy and ctl.current_op == "restart"
+            ctl.clear_reservation("restart")
+            assert ctl.busy  # still held by the lock, not the reservation
+
+    asyncio.run(main())
+    assert not ctl.busy
+
+
 def test_restart_cycle_order_and_result(monkeypatch):
     calls = []
     _patch_service(monkeypatch, calls)
     ctl = ServerController(Config(), FakeApi(alive=True))
     assert asyncio.run(ctl.restart_cycle(stop_delay=0)) is True
     assert calls == ["stop", "start"]
+
+
+def test_restart_cycle_reports_failure_when_stop_never_took(monkeypatch):
+    # Even the force-kill couldn't stop the server. start() would then no-op on the
+    # still-RUNNING service and the stale process would answer wait_until_alive —
+    # so restart_cycle must report False, not a phantom success, and never start().
+    started = []
+
+    async def never_stops(self, *, escalate=False, on_escalate=None):
+        return False
+
+    async def start(self):
+        started.append(True)
+        return True
+
+    monkeypatch.setattr(ServerController, "stop", never_stops)
+    monkeypatch.setattr(ServerController, "start", start)
+    ctl = ServerController(Config(), FakeApi(alive=True))
+    assert asyncio.run(ctl.restart_cycle(stop_delay=0, escalate=True)) is False
+    assert started == []  # a failed stop must not be followed by a start
 
 
 def test_restart_cycle_reports_server_that_stayed_down(monkeypatch):

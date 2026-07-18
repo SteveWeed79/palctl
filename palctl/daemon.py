@@ -26,7 +26,7 @@ from pathlib import Path
 from aiohttp import web
 
 from . import backups, inifile, leak, localauth, netinfo, procs
-from .api import PalApi, PalApiError
+from .api import PalApi, PalApiError, PalApiUnauthorized
 from .bot import run_bot
 from .client import DAEMON_PORT
 from .config import Config, config_dir, get_admin_password
@@ -241,6 +241,12 @@ class Daemon:
         self._down_polls = 0               # consecutive unreachable polls
         self._api_fail_streak = 0          # debounce for the down/up announcement
         self._autorestart_times: list[float] = []
+        # A 401 from the REST API means the server is UP but the admin password
+        # is wrong (rotated out from under us, say) — NOT an outage. Warn once,
+        # not every poll, and never let it drive down-detection/auto-recovery.
+        self._auth_warned = False
+        # Wall-clock of the last completed poll, for the /healthz liveness probe.
+        self._last_poll_at = 0.0
 
         # Leak forecasting. _epoch_at marks the last server (re)start we saw:
         # samples from a previous process would poison the fit, so the
@@ -394,6 +400,27 @@ class Daemon:
                 "background operation failed", exc_info=t.exception()
             )
 
+    def _spawn_exclusive(self, name: str, coro) -> bool:
+        """Spawn a server-exclusive operation (restart/backup/update/restore) as
+        a background task, but only if the server is free — reserving it
+        synchronously so two near-simultaneous requests can't both get past a
+        `busy` check and queue a second operation behind the first. Returns False
+        (and the caller should answer 409) if something already holds the server.
+        The reservation is cleared when the operation takes the real lock, or by
+        the finally here if it returns/raises before ever getting that far."""
+        if not self.control.reserve(name):
+            coro.close()  # we won't run it; don't leave an un-awaited coroutine
+            return False
+
+        async def _run() -> None:
+            try:
+                await coro
+            finally:
+                self.control.clear_reservation(name)
+
+        self._spawn(_run())
+        return True
+
     async def _persist(self, e: Event) -> None:
         await asyncio.to_thread(self.store.log_event, e)
 
@@ -414,9 +441,29 @@ class Daemon:
             await asyncio.sleep(max(1, self.cfg.poll_seconds))
 
     async def _poll(self) -> None:
+        # Bind the API once: reload-config can swap self.api between awaits, and
+        # a poll that read metrics from the old endpoint and players from the new
+        # one would be internally inconsistent.
+        api = self.api
         try:
-            metrics = await self.api.metrics()
-            players = await self.api.players()
+            metrics = await api.metrics()
+            players = await api.players()
+        except PalApiUnauthorized:
+            # The server is answering — it just rejected the password. Restarting
+            # can't fix that, so this must never look like a crash. Say so once.
+            if not self._auth_warned:
+                self._auth_warned = True
+                await self.bus.emit(
+                    Event(
+                        "error",
+                        "The Palworld REST API rejected the admin password — the "
+                        "server is up but palctl can't authenticate. Fix the "
+                        "password (GUI Config, or AdminPassword in "
+                        "PalWorldSettings.ini) and reload. Not treating this as an "
+                        "outage; auto-recovery will NOT restart the server.",
+                    )
+                )
+            return
         except PalApiError:
             self._api_fail_streak += 1
             # One failed poll is not an outage: a server answering in >6s under
@@ -432,6 +479,9 @@ class Daemon:
                 await self.tracker.handle_server_down()
                 await self.bus.emit(Event("server_down", "🔴 Server is **down**."))
                 self._alive = False
+                # Don't keep serving the last-seen FPS/frametime/uptime next to a
+                # server that's down — /state would read as if it were still up.
+                self._last_metrics = None
             await self._maybe_autorecover()
             return
 
@@ -443,11 +493,13 @@ class Daemon:
         self._ever_alive = True
         self._down_polls = 0
         self._api_fail_streak = 0
+        self._auth_warned = False  # a good poll re-arms the password warning
 
         await self.tracker.update(players)
 
         stats = await asyncio.to_thread(procs.proc_stats)  # psutil enumeration off the loop
         self._last_metrics = metrics
+        self._last_poll_at = time.time()
 
         if first_poll:
             # Daemon (re)started while the server was already up: `_history` was
@@ -504,13 +556,16 @@ class Daemon:
             return
 
         self._down_polls = 0
-        self._autorestart_times.append(now)
         self._spawn(self._autorecover())
 
     async def _autorecover(self) -> None:
         op = self.control.try_operation("auto-recover")
         if op is None:
             return  # something else took the server in the meantime
+        # Count the attempt against the hourly cap only now that we actually hold
+        # the lock — recording it before the try_operation race would spend the
+        # budget on restarts that never happened and could throttle a real one.
+        self._autorestart_times.append(time.time())
         try:
             async with op:
                 await self.bus.emit(
@@ -692,32 +747,32 @@ class Daemon:
                             status=502,
                         )
                 elif what == "restart":
-                    if self.control.busy:
-                        return _busy_response(self.control.current_op)
-                    self._desired_running = True
-                    self._spawn(
+                    if not self._spawn_exclusive(
+                        "restart",
                         self.scheduler.restart_with_countdown(
                             body.get("reason", "Admin restart")
-                        )
-                    )
+                        ),
+                    ):
+                        return _busy_response(self.control.current_op)
+                    self._desired_running = True
                 elif what == "announce":
                     await self.api.announce(require("message"))
                 elif what == "save":
                     await self.api.save()
                 elif what == "backup":
-                    if self.control.busy:
+                    if not self._spawn_exclusive("backup", self.scheduler.backup_now("gui")):
                         return _busy_response(self.control.current_op)
-                    self._spawn(self.scheduler.backup_now("gui"))
                 elif what == "update-server":
-                    if self.control.busy:
+                    if not self._spawn_exclusive("update", self.scheduler.update_server()):
                         return _busy_response(self.control.current_op)
                     self._desired_running = True
-                    self._spawn(self.scheduler.update_server())
                 elif what == "restore":
-                    if self.control.busy:
+                    name = require("name")
+                    if not self._spawn_exclusive(
+                        "restore", self.scheduler.restore_backup(name)
+                    ):
                         return _busy_response(self.control.current_op)
                     self._desired_running = True
-                    self._spawn(self.scheduler.restore_backup(require("name")))
                 elif what == "kick":
                     await self.api.kick(require("user_id"), body.get("reason", ""))
                 elif what == "ban":
