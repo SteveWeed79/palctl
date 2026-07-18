@@ -687,12 +687,56 @@ class ConfigTab(QWidget):
         self.wd_hard.setValue(cfg.watchdog.hard_limit_mb)
         self.wd_skip = QCheckBox(checked=cfg.watchdog.skip_if_players_online)
         self.wd_autorec = QCheckBox(checked=cfg.watchdog.auto_restart_on_crash)
+        self.wd_fps = QCheckBox(checked=cfg.watchdog.fps_restart)
+        self.wd_fps.setToolTip(
+            "Restart when the server's own FPS stays below the floor — the "
+            "'slideshow' failure memory alone can miss. Same courtesies as the "
+            "memory watchdog: several confirming samples, and it holds off "
+            "while players are online."
+        )
+        self.wd_min_fps = NoScrollSpinBox()
+        self.wd_min_fps.setRange(0, 120)
+        self.wd_min_fps.setSuffix(" fps")
+        self.wd_min_fps.setSpecialValueText("off")  # shown at 0
+        self.wd_min_fps.setValue(cfg.watchdog.min_server_fps)
+        self.wd_disk = NoScrollSpinBox()
+        self.wd_disk.setRange(0, 1000)
+        self.wd_disk.setSuffix(" GB")
+        self.wd_disk.setSpecialValueText("off")  # shown at 0
+        self.wd_disk.setValue(cfg.watchdog.disk_min_free_gb)
+        self.wd_disk.setToolTip(
+            "Warn when free space on the server or backup volume drops below "
+            "this. A full disk corrupts saves and silently kills backups."
+        )
         wf.addRow("Enabled", self.wd_enabled)
         wf.addRow("Restart above", self.wd_limit)
         wf.addRow("Force even with players above", self.wd_hard)
         wf.addRow("Hold off while players online", self.wd_skip)
         wf.addRow("Auto-restart on crash / hang", self.wd_autorec)
+        wf.addRow("Restart on low server FPS", self.wd_fps)
+        wf.addRow("FPS floor", self.wd_min_fps)
+        wf.addRow("Warn when free disk below", self.wd_disk)
         v.addWidget(wd)
+
+        al = QGroupBox("Alerts (webhook)")
+        af = QFormLayout(al)
+        self.al_enabled = QCheckBox(checked=cfg.alert_webhook_enabled)
+        self.al_url = QLineEdit(cfg.alert_webhook_url)
+        self.al_url.setPlaceholderText(
+            "https://ntfy.sh/your-topic — or a Discord/Slack webhook URL"
+        )
+        af.addRow("Enabled", self.al_enabled)
+        af.addRow("Webhook URL", self.al_url)
+        al_help = QLabel(
+            "A second alert channel besides the Discord bot, for when Discord is "
+            "down or not set up. Outages, watchdog restarts, backup failures and "
+            "errors are POSTed to this URL — an ntfy topic, a Discord/Slack "
+            "incoming webhook, or your own endpoint. Join/leave chatter is never "
+            "sent."
+        )
+        al_help.setWordWrap(True)
+        af.addRow("", al_help)
+        v.addWidget(al)
 
         sch = QGroupBox("Schedule")
         sf = QFormLayout(sch)
@@ -703,6 +747,16 @@ class ConfigTab(QWidget):
 
         hh, _, mm = cfg.schedule.daily_restart_at.partition(":")
         self.sch_time.setTime(QTime(int(hh), int(mm or 0)))
+        self.sch_every = NoScrollSpinBox()
+        self.sch_every.setRange(0, 24)
+        self.sch_every.setSuffix(" h")
+        self.sch_every.setSpecialValueText("daily at the time above")  # shown at 0
+        self.sch_every.setValue(cfg.schedule.restart_every_hours)
+        self.sch_every.setToolTip(
+            "Restart every N hours instead of once a day — many servers run a "
+            "6-8 h cadence to stay ahead of the memory leak. 0 keeps the daily "
+            "at-a-time schedule."
+        )
         self.sch_backup = NoScrollSpinBox()
         # Capped at 24h so local backups always happen at least once a day.
         self.sch_backup.setRange(1, 24)
@@ -733,6 +787,7 @@ class ConfigTab(QWidget):
         sf.addRow("Enabled", self.sch_enabled)
         sf.addRow("Daily restart", self.sch_restart)
         sf.addRow("At", self.sch_time)
+        sf.addRow("Or restart every", self.sch_every)
         sf.addRow("Backup every", self.sch_backup)
         sf.addRow("Backups to keep (local)", self.sch_retain)
         sf.addRow("Copies to keep (mirror)", self.sch_mirror_retain)
@@ -897,10 +952,17 @@ class ConfigTab(QWidget):
         c.watchdog.hard_limit_mb = self.wd_hard.value()
         c.watchdog.skip_if_players_online = self.wd_skip.isChecked()
         c.watchdog.auto_restart_on_crash = self.wd_autorec.isChecked()
+        c.watchdog.fps_restart = self.wd_fps.isChecked()
+        c.watchdog.min_server_fps = self.wd_min_fps.value()
+        c.watchdog.disk_min_free_gb = self.wd_disk.value()
+
+        c.alert_webhook_enabled = self.al_enabled.isChecked()
+        c.alert_webhook_url = self.al_url.text().strip()
 
         c.schedule.enabled = self.sch_enabled.isChecked()
         c.schedule.daily_restart = self.sch_restart.isChecked()
         c.schedule.daily_restart_at = self.sch_time.time().toString("HH:mm")
+        c.schedule.restart_every_hours = self.sch_every.value()
         c.schedule.backup_hours = self.sch_backup.value()
         c.schedule.backup_retain = self.sch_retain.value()
         c.schedule.mirror_retain = self.sch_mirror_retain.value()

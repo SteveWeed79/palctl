@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import secrets
 import sys
@@ -26,7 +27,8 @@ from pathlib import Path
 from aiohttp import web
 
 from . import backups, inifile, leak, localauth, netinfo, procs
-from .api import PalApi, PalApiError
+from .alerts import WebhookAlerter
+from .api import PalApi, PalApiError, PalApiUnauthorized
 from .bot import run_bot
 from .client import DAEMON_PORT
 from .config import Config, config_dir, get_admin_password
@@ -37,6 +39,28 @@ from .scheduler import Scheduler
 from .watchdog import Watchdog
 
 SERVICE_NAME = "palctl-daemon"  # the Windows service name palctl registers
+
+
+def sd_notify(state: str) -> None:
+    """Send a notification to systemd over $NOTIFY_SOCKET, if we're running under
+    a systemd unit with Type=notify. A no-op everywhere else (Windows, a unit
+    without notify, a dev run) — best-effort, never raises. This is what lets
+    systemd's WatchdogSec detect a *hung* (not crashed) daemon: as long as the
+    poll loop is healthy we send WATCHDOG=1, and if the event loop wedges the
+    pings stop and systemd restarts us."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    try:
+        import socket
+
+        # An abstract-namespace socket path starts with '@' -> leading NUL.
+        path = "\0" + addr[1:] if addr.startswith("@") else addr
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(path)
+            s.sendall(state.encode("utf-8"))
+    except OSError:
+        pass
 
 # The admin's Stop intent, persisted so it survives daemon restarts (crash +
 # wrapper restart, a palctl upgrade, a manual service bounce). Without this the
@@ -60,6 +84,17 @@ def _save_desired_running(value: bool) -> None:
         os.replace(tmp, _STATE_PATH)
     except OSError:
         pass  # best effort — worst case is the old resets-to-True behavior
+
+
+def _tail_log_file(n: int) -> str:
+    """Last `n` lines of the daemon's rotating log. Blocking — call via
+    to_thread. Never raises: a missing/unreadable log returns a note, not a 500."""
+    path = config_dir() / "logs" / "palctl.log"
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return "".join(f.readlines()[-n:])
+    except OSError:
+        return "(no daemon log available)"
 
 
 def _within_window(times: list[float], now: float, window: float = 3600.0) -> list[float]:
@@ -174,7 +209,14 @@ def lan_exposure_warning(host: str) -> str | None:
 def make_auth_middleware(token: str, exempt: frozenset[str] = frozenset()):
     """aiohttp middleware that rejects any request without the shared token.
     `exempt` paths skip the check — only the dashboard page itself, which
-    contains no data (its /state calls still need the token)."""
+    contains no data (its /state calls still need the token).
+
+    Rejections are logged (with the peer address) so probing is visible when the
+    API is LAN-bound — the token is the only credential there, and silence would
+    hide someone guessing at it. Rate-limited so a misconfigured client polling
+    every 2s can't flood the log: the first few are logged, then every 100th."""
+    rejects = {"n": 0}
+    log = logging.getLogger("palctl.daemon")
 
     @web.middleware
     async def _auth(request: web.Request, handler):
@@ -182,6 +224,14 @@ def make_auth_middleware(token: str, exempt: frozenset[str] = frozenset()):
             return await handler(request)
         sent = request.headers.get(localauth.TOKEN_HEADER, "")
         if not secrets.compare_digest(sent, token):
+            rejects["n"] += 1
+            n = rejects["n"]
+            if n <= 5 or n % 100 == 0:
+                log.warning(
+                    "rejected request #%d without a valid token: %s %s from %s",
+                    n, request.method, request.path,
+                    request.remote or "unknown",
+                )
             return web.json_response({"error": "unauthorized"}, status=401)
         return await handler(request)
 
@@ -197,6 +247,9 @@ class Daemon:
         self.cfg = Config.load()
         self.bus = EventBus()
         self.store = SessionStore()
+        # Second alert channel (webhook) besides Discord + the GUI/log. Subscribes
+        # to the bus itself; reconfigured in place on config reload.
+        self.alerter = WebhookAlerter(self.cfg, self.bus)
         self.api = PalApi(
             self.cfg.api_host, self.cfg.api_port, self._admin_password()
         )
@@ -241,6 +294,17 @@ class Daemon:
         self._down_polls = 0               # consecutive unreachable polls
         self._api_fail_streak = 0          # debounce for the down/up announcement
         self._autorestart_times: list[float] = []
+        # A 401 from the REST API means the server is UP but the admin password
+        # is wrong (rotated out from under us, say) — NOT an outage. Warn once,
+        # not every poll, and never let it drive down-detection/auto-recovery.
+        self._auth_warned = False
+        # Wall-clock of the last completed poll, for the /healthz liveness probe.
+        self._last_poll_at = 0.0
+        # Set by a SIGTERM/SIGINT handler to unblock run() into graceful shutdown.
+        self._stop: asyncio.Event | None = None
+        # Short-TTL cache for service_state so /state (polled ~every 2s per open
+        # GUI/dashboard) doesn't spawn an sc.exe/systemctl subprocess every time.
+        self._svc_cache: tuple[float, str] = (0.0, "UNKNOWN")
 
         # Leak forecasting. _epoch_at marks the last server (re)start we saw:
         # samples from a previous process would poison the fit, so the
@@ -368,6 +432,10 @@ class Daemon:
         elif self.bot is not None:
             self.bot.reconfigure(self.cfg, self.api)
 
+    def _sync_alerts(self) -> None:
+        """Apply a config reload to the webhook alerter (enable/disable/URL)."""
+        self.alerter.reconfigure(self.cfg)
+
     @property
     def _desired_running(self) -> bool:
         return self.__desired_running
@@ -394,6 +462,27 @@ class Daemon:
                 "background operation failed", exc_info=t.exception()
             )
 
+    def _spawn_exclusive(self, name: str, coro) -> bool:
+        """Spawn a server-exclusive operation (restart/backup/update/restore) as
+        a background task, but only if the server is free — reserving it
+        synchronously so two near-simultaneous requests can't both get past a
+        `busy` check and queue a second operation behind the first. Returns False
+        (and the caller should answer 409) if something already holds the server.
+        The reservation is cleared when the operation takes the real lock, or by
+        the finally here if it returns/raises before ever getting that far."""
+        if not self.control.reserve(name):
+            coro.close()  # we won't run it; don't leave an un-awaited coroutine
+            return False
+
+        async def _run() -> None:
+            try:
+                await coro
+            finally:
+                self.control.clear_reservation(name)
+
+        self._spawn(_run())
+        return True
+
     async def _persist(self, e: Event) -> None:
         await asyncio.to_thread(self.store.log_event, e)
 
@@ -414,9 +503,29 @@ class Daemon:
             await asyncio.sleep(max(1, self.cfg.poll_seconds))
 
     async def _poll(self) -> None:
+        # Bind the API once: reload-config can swap self.api between awaits, and
+        # a poll that read metrics from the old endpoint and players from the new
+        # one would be internally inconsistent.
+        api = self.api
         try:
-            metrics = await self.api.metrics()
-            players = await self.api.players()
+            metrics = await api.metrics()
+            players = await api.players()
+        except PalApiUnauthorized:
+            # The server is answering — it just rejected the password. Restarting
+            # can't fix that, so this must never look like a crash. Say so once.
+            if not self._auth_warned:
+                self._auth_warned = True
+                await self.bus.emit(
+                    Event(
+                        "error",
+                        "The Palworld REST API rejected the admin password — the "
+                        "server is up but palctl can't authenticate. Fix the "
+                        "password (GUI Config, or AdminPassword in "
+                        "PalWorldSettings.ini) and reload. Not treating this as an "
+                        "outage; auto-recovery will NOT restart the server.",
+                    )
+                )
+            return
         except PalApiError:
             self._api_fail_streak += 1
             # One failed poll is not an outage: a server answering in >6s under
@@ -432,6 +541,9 @@ class Daemon:
                 await self.tracker.handle_server_down()
                 await self.bus.emit(Event("server_down", "🔴 Server is **down**."))
                 self._alive = False
+                # Don't keep serving the last-seen FPS/frametime/uptime next to a
+                # server that's down — /state would read as if it were still up.
+                self._last_metrics = None
             await self._maybe_autorecover()
             return
 
@@ -443,11 +555,13 @@ class Daemon:
         self._ever_alive = True
         self._down_polls = 0
         self._api_fail_streak = 0
+        self._auth_warned = False  # a good poll re-arms the password warning
 
         await self.tracker.update(players)
 
         stats = await asyncio.to_thread(procs.proc_stats)  # psutil enumeration off the loop
         self._last_metrics = metrics
+        self._last_poll_at = time.time()
 
         if first_poll:
             # Daemon (re)started while the server was already up: `_history` was
@@ -504,13 +618,16 @@ class Daemon:
             return
 
         self._down_polls = 0
-        self._autorestart_times.append(now)
         self._spawn(self._autorecover())
 
     async def _autorecover(self) -> None:
         op = self.control.try_operation("auto-recover")
         if op is None:
             return  # something else took the server in the meantime
+        # Count the attempt against the hourly cap only now that we actually hold
+        # the lock — recording it before the try_operation race would spend the
+        # budget on restarts that never happened and could throttle a real one.
+        self._autorestart_times.append(time.time())
         try:
             async with op:
                 await self.bus.emit(
@@ -611,27 +728,48 @@ class Daemon:
         # ever attach a token.
         app = web.Application(
             middlewares=[
-                make_auth_middleware(self._token, exempt=frozenset({"/", "/favicon.ico"}))
+                make_auth_middleware(
+                    self._token, exempt=frozenset({"/", "/favicon.ico", "/healthz"})
+                )
             ]
         )
 
         dashboard = Path(__file__).with_name("dashboard.html")
+        dashboard_cache: dict[str, str] = {}
 
         async def index(_: web.Request) -> web.Response:
-            try:
-                html = await asyncio.to_thread(dashboard.read_text, "utf-8")
-            except OSError:
-                return web.Response(status=404, text="dashboard not bundled")
-            return web.Response(text=html, content_type="text/html")
+            # The page is static; read it once and serve from memory thereafter.
+            if "html" not in dashboard_cache:
+                try:
+                    dashboard_cache["html"] = await asyncio.to_thread(
+                        dashboard.read_text, "utf-8"
+                    )
+                except OSError:
+                    return web.Response(status=404, text="dashboard not bundled")
+            return web.Response(text=dashboard_cache["html"], content_type="text/html")
 
         async def favicon(_: web.Request) -> web.Response:
             return web.Response(body=_FAVICON_SVG, content_type="image/svg+xml")
 
+        async def healthz(_: web.Request) -> web.Response:
+            # Liveness/readiness for an external monitor. No token (no data), so
+            # exempt in the auth middleware. 503 when the poll loop hasn't
+            # completed a cycle in a while — a wedged event loop or a dead poller.
+            age = time.time() - self._last_poll_at if self._last_poll_at else None
+            stale = age is not None and age > max(30, self.cfg.poll_seconds * 6)
+            ok = self._last_poll_at == 0.0 or not stale  # starting up counts as ok
+            return web.json_response(
+                {
+                    "status": "ok" if ok else "stale",
+                    "alive": self._alive,
+                    "last_poll_age_seconds": round(age, 1) if age is not None else None,
+                },
+                status=200 if ok else 503,
+            )
+
         async def state(_: web.Request) -> web.Response:
-            # Both of these block (psutil enumeration; an sc.exe subprocess), so
-            # keep them off the event loop — the GUI polls /state every ~2s.
-            stats = await asyncio.to_thread(procs.proc_stats)
-            service = await asyncio.to_thread(procs.service_state, self.cfg.service_name)
+            stats = await asyncio.to_thread(procs.proc_stats)  # psutil enum off the loop
+            service = await self._service_state_cached()
             return web.json_response(
                 {
                     "service": service,
@@ -692,32 +830,32 @@ class Daemon:
                             status=502,
                         )
                 elif what == "restart":
-                    if self.control.busy:
-                        return _busy_response(self.control.current_op)
-                    self._desired_running = True
-                    self._spawn(
+                    if not self._spawn_exclusive(
+                        "restart",
                         self.scheduler.restart_with_countdown(
                             body.get("reason", "Admin restart")
-                        )
-                    )
+                        ),
+                    ):
+                        return _busy_response(self.control.current_op)
+                    self._desired_running = True
                 elif what == "announce":
                     await self.api.announce(require("message"))
                 elif what == "save":
                     await self.api.save()
                 elif what == "backup":
-                    if self.control.busy:
+                    if not self._spawn_exclusive("backup", self.scheduler.backup_now("gui")):
                         return _busy_response(self.control.current_op)
-                    self._spawn(self.scheduler.backup_now("gui"))
                 elif what == "update-server":
-                    if self.control.busy:
+                    if not self._spawn_exclusive("update", self.scheduler.update_server()):
                         return _busy_response(self.control.current_op)
                     self._desired_running = True
-                    self._spawn(self.scheduler.update_server())
                 elif what == "restore":
-                    if self.control.busy:
+                    name = require("name")
+                    if not self._spawn_exclusive(
+                        "restore", self.scheduler.restore_backup(name)
+                    ):
                         return _busy_response(self.control.current_op)
                     self._desired_running = True
-                    self._spawn(self.scheduler.restore_backup(require("name")))
                 elif what == "kick":
                     await self.api.kick(require("user_id"), body.get("reason", ""))
                 elif what == "ban":
@@ -725,16 +863,25 @@ class Daemon:
                 elif what == "unban":
                     await self.api.unban(require("user_id"))
                 elif what == "reload-config":
-                    self.cfg = Config.load()
-                    self.api = PalApi(
-                        self.cfg.api_host, self.cfg.api_port, self._admin_password()
-                    )
+                    # Don't swap cfg/api out from under a running operation (a
+                    # restart mid-countdown, an update) — let it finish first.
+                    if self.control.busy:
+                        return _busy_response(self.control.current_op)
+                    old_api = self.api
+                    # Config.load() and the keyring/ini read both hit disk; keep
+                    # them off the event loop.
+                    self.cfg = await asyncio.to_thread(Config.load)
+                    password = await asyncio.to_thread(self._admin_password)
+                    self.api = PalApi(self.cfg.api_host, self.cfg.api_port, password)
                     # The workers hold their own cfg/api references; swap them
                     # too or the reload silently changes nothing.
                     self.control.reconfigure(self.cfg, self.api)
                     self.scheduler.reconfigure(self.cfg, self.api)
                     self.watchdog.reconfigure(self.cfg, self.api)
                     self._reload_bot()
+                    self._sync_alerts()
+                    with contextlib.suppress(Exception):
+                        await old_api.aclose()  # drop the old client's connection
                 else:
                     return web.json_response({"error": f"unknown action {what}"}, status=400)
             except _BadRequest as e:
@@ -752,16 +899,44 @@ class Daemon:
                 [{"name": b.name, "size_mb": b.size_mb} for b in bs]
             )
 
+        async def tail_logs(request: web.Request) -> web.Response:
+            # Token-gated remote read of the daemon's own rotating log, so the
+            # daemon can be diagnosed without getting onto the box. Bounded to the
+            # last N lines (?n=, default 200, capped) so it can't stream the whole
+            # file. Read off the loop.
+            try:
+                n = min(2000, max(1, int(request.query.get("n", "200"))))
+            except ValueError:
+                n = 200
+            text = await asyncio.to_thread(_tail_log_file, n)
+            return web.Response(text=text, content_type="text/plain")
+
         app.router.add_get("/", index)
         app.router.add_get("/favicon.ico", favicon)
+        app.router.add_get("/healthz", healthz)
         app.router.add_get("/state", state)
         app.router.add_get("/backups", list_backups)
+        app.router.add_get("/logs", tail_logs)
         app.router.add_post("/action/{what}", action)
         return app
+
+    async def _service_state_cached(self, ttl: float = 2.0) -> str:
+        """service_state() shells out to sc.exe/systemctl; /state is polled every
+        ~2s per open GUI/dashboard, so cache the result briefly to avoid a
+        subprocess per request. Single event loop, so the check is race-free
+        enough — a rare double-miss just runs the query twice."""
+        now = time.monotonic()
+        ts, val = self._svc_cache
+        if now - ts < ttl:
+            return val
+        val = await asyncio.to_thread(procs.service_state, self.cfg.service_name)
+        self._svc_cache = (time.monotonic(), val)
+        return val
 
     # ---------- run ----------
 
     async def run(self) -> None:
+        self._stop = asyncio.Event()
         runner = web.AppRunner(self._routes())
         await runner.setup()
         # Bind loopback by default (localhost only); every request must still
@@ -769,7 +944,18 @@ class Daemon:
         # `ui_bind_host = "0.0.0.0"` to reach the dashboard from other devices on
         # the LAN — the warning below spells out that the token then stands alone.
         host = self.cfg.ui_bind_host or "127.0.0.1"
-        await web.TCPSite(runner, host, DAEMON_PORT).start()
+        try:
+            await web.TCPSite(runner, host, DAEMON_PORT).start()
+        except OSError as e:
+            # The likeliest startup failure — another daemon already on the port.
+            # It must reach the *file* log, not just stderr the service discards.
+            self.log.error(
+                "could not bind the control API on %s:%d (%s) — another palctl "
+                "daemon may already be running. This daemon is exiting.",
+                host, DAEMON_PORT, e,
+            )
+            await runner.cleanup()
+            raise
         self.log.info("daemon up; control API on %s:%d", host, DAEMON_PORT)
         warning = lan_exposure_warning(host)
         if warning:
@@ -777,17 +963,71 @@ class Daemon:
         self._sync_dashboard_firewall(host)
         self._warn_if_cloud_mirror_broken()
 
+        self._install_signal_handlers()
+
         if self.cfg.check_for_updates:
             self._spawn(self._check_palctl_update())
 
         self._start_bot()
-        await asyncio.gather(
-            self._supervised("poll loop", self._poll_loop()),
-            self._supervised("watchdog", self.watchdog.run()),
-            self._supervised("scheduler", self.scheduler.run()),
-            self._supervised("leak forecaster", self._predict_loop()),
-            self._supervised("update check", self._update_check_loop()),
-        )
+        for name, coro in (
+            ("poll loop", self._poll_loop()),
+            ("watchdog", self.watchdog.run()),
+            ("scheduler", self.scheduler.run()),
+            ("leak forecaster", self._predict_loop()),
+            ("update check", self._update_check_loop()),
+            ("disk watch", self._disk_loop()),
+            ("liveness", self._liveness_loop()),
+        ):
+            self._spawn(self._supervised(name, coro))
+
+        sd_notify("READY=1")
+        await self._stop.wait()  # runs until SIGTERM/SIGINT
+        await self._graceful_shutdown(runner)
+
+    def _install_signal_handlers(self) -> None:
+        """Wire SIGTERM/SIGINT to a clean shutdown. `systemctl stop` and WinSW's
+        stop both send a signal; without this the process is just killed
+        mid-write. add_signal_handler is the asyncio-native path (POSIX); the
+        Windows event loop doesn't support it, so fall back to signal.signal."""
+        import signal
+
+        loop = asyncio.get_running_loop()
+
+        def _request_stop(*_a: object) -> None:
+            if self._stop is not None and not self._stop.is_set():
+                self.log.info("shutdown signal received")
+                loop.call_soon_threadsafe(self._stop.set)
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, _request_stop)
+            except (NotImplementedError, AttributeError, ValueError):
+                with contextlib.suppress(ValueError, OSError, RuntimeError):
+                    signal.signal(sig, _request_stop)
+
+    async def _graceful_shutdown(self, runner: web.AppRunner) -> None:
+        """Bounded, best-effort teardown. Must finish well inside the service
+        manager's stop timeout, so every step is guarded and time-boxed. Does
+        NOT touch the game server — that's a separate service and stopping the
+        daemon doesn't stop the game, so there's nothing to announce to players."""
+        self.log.info("shutting down")
+        sd_notify("STOPPING=1")
+        # A maintenance stop often precedes a reboot; flush the world if it's up,
+        # but never let a slow/hung save hold the shutdown open.
+        if self._alive:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self.api.save(), timeout=10)
+        for t in list(self._tasks):
+            t.cancel()
+        with contextlib.suppress(Exception):
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            await runner.cleanup()
+        with contextlib.suppress(Exception):
+            await self.api.aclose()
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(self.store.close)
+        self.log.info("shutdown complete")
 
     async def _supervised(self, name: str, coro) -> None:
         """One escaped exception in any loop must not kill the whole daemon.
@@ -807,6 +1047,70 @@ class Daemon:
                 await self.bus.emit(
                     Event("error", f"{name} crashed and is disabled until restart: {e}")
                 )
+
+    async def _liveness_loop(self) -> None:
+        """systemd Type=notify watchdog ping. A no-op without $WATCHDOG_USEC. The
+        ping runs as an ordinary task on the event loop, so if the loop *wedges*
+        (a blocking call, a lock deadlock) this stops firing and systemd — with
+        WatchdogSec set — restarts the daemon. That's the one failure the process
+        supervisor can't see on its own: a hung-but-alive daemon."""
+        usec = os.environ.get("WATCHDOG_USEC")
+        if not usec:
+            return
+        try:
+            interval = max(1.0, int(usec) / 1_000_000 / 2)  # ping at half the deadline
+        except ValueError:
+            return
+        while True:
+            await asyncio.sleep(interval)
+            sd_notify("WATCHDOG=1")
+
+    def _lowest_free_gb(self) -> float | None:
+        """Free GB on the least-free of the server and backup volumes, or None if
+        neither path can be read. Blocking (statvfs) — call via to_thread."""
+        import shutil
+
+        frees: list[float] = []
+        for p in {self.cfg.server_root, self.cfg.backup_root}:
+            if not p:
+                continue
+            try:
+                frees.append(shutil.disk_usage(p).free / (1024**3))
+            except OSError:
+                pass
+        return min(frees) if frees else None
+
+    async def _disk_loop(self) -> None:
+        """Warn once per episode when free disk runs low on the server or backup
+        volume. Re-arms when space recovers, so a genuinely low disk doesn't spam
+        but a fresh dip is announced. Not a restart trigger — only a human can
+        free space — but a loud, early heads-up beats silent backup failures."""
+        warned = False
+        while True:
+            await asyncio.sleep(300)
+            try:
+                min_gb = self.cfg.watchdog.disk_min_free_gb
+                if min_gb <= 0:
+                    warned = False
+                    continue
+                low = await asyncio.to_thread(self._lowest_free_gb)
+                if low is not None and low < min_gb:
+                    if not warned:
+                        warned = True
+                        await self.bus.emit(
+                            Event(
+                                "error",
+                                f"⚠️ Low disk space: {low:.1f} GB free on the "
+                                f"server/backup volume (below the {min_gb} GB "
+                                "floor). A full disk corrupts saves and stops "
+                                "backups — free some space.",
+                                {"free_gb": round(low, 1), "min_gb": min_gb},
+                            )
+                        )
+                else:
+                    warned = False
+            except Exception as e:
+                self.log.warning("disk check failed: %s", e)
 
     async def _update_check_loop(self) -> None:
         """Ask Steam whether a newer server build exists, a couple of minutes
@@ -1061,6 +1365,14 @@ def _stop_daemon_process() -> None:
     try:
         conns = psutil.net_connections(kind="tcp")
     except Exception:
+        # Can't enumerate sockets at all (no privileges). Say so — the caller
+        # only got here because something IS on the port, and silently returning
+        # makes "couldn't stop it" look like "nothing to stop".
+        print(
+            "[daemon] something is answering on the daemon port but the process "
+            "couldn't be identified (no permission to inspect sockets) — the new "
+            "daemon may lose the port to it. Stop the old daemon manually if so."
+        )
         return
     pids = {
         c.pid
@@ -1071,6 +1383,15 @@ def _stop_daemon_process() -> None:
         and c.laddr
         and c.laddr.port == DAEMON_PORT
     }
+    if not pids:
+        # Same story: the port answers but no visible owner (another user's
+        # process on Linux without root shows pid=None). Fail loudly, not open.
+        print(
+            "[daemon] something is answering on the daemon port but no owning "
+            "process is visible (try again as root/administrator) — the new "
+            "daemon may lose the port to it."
+        )
+        return
     for pid in pids:
         try:
             proc = psutil.Process(pid)
@@ -1201,6 +1522,13 @@ def main() -> None:
         asyncio.run(Daemon().run())
     except KeyboardInterrupt:
         pass
+    except Exception:
+        # In service mode the wrapper discards stderr, so an unhandled startup
+        # failure (a port already bound, a broken config at construction) would
+        # otherwise vanish — the daemon just restart-loops with no trace. Make it
+        # land in the rotating file log before we exit non-zero.
+        setup_logging().exception("daemon exited with an unhandled error")
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

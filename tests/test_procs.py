@@ -45,24 +45,43 @@ def test_pal_process_names_cover_both_platforms():
 
 
 class _FakeMetricsProc:
-    """psutil.Process stand-in for proc_stats. cpu_percent(interval=None) mimics
-    the real thing: 0.0 on the first call for this object, a real value after."""
+    """psutil.Process stand-in for proc_stats.
 
-    def __init__(self, pid=999, cpu_after_first=80.0):
+    cpu_percent here models an interval measurement: given a window (interval>0)
+    it returns a real reading straight away, and — unlike the interval=None API —
+    it never depends on a prior "priming" call, which is the whole point. It also
+    records whether it was asked to sample with a real window, and whether that
+    happened before oneshot() was entered, so the tests can pin down the two ways
+    the old code read 0.0."""
+
+    def __init__(self, pid=999, cpu_raw=80.0):
         self.pid = pid
-        self._cpu = cpu_after_first
-        self.cpu_calls = 0
+        self._cpu = cpu_raw
+        self.cpu_interval = None
+        self.in_oneshot = False
+        self.cpu_sampled_in_oneshot = None
 
     def oneshot(self):
         import contextlib
-        return contextlib.nullcontext()
+
+        @contextlib.contextmanager
+        def _cm():
+            self.in_oneshot = True
+            try:
+                yield
+            finally:
+                self.in_oneshot = False
+
+        return _cm()
 
     def memory_info(self):
         return types.SimpleNamespace(rss=1_048_576 * 100)  # 100 MB
 
     def cpu_percent(self, interval=None):
-        self.cpu_calls += 1
-        return 0.0 if self.cpu_calls == 1 else self._cpu
+        self.cpu_interval = interval
+        self.cpu_sampled_in_oneshot = self.in_oneshot
+        # A real window yields a real number; without one, mimic psutil's 0.0.
+        return self._cpu if interval else 0.0
 
     def num_threads(self):
         return 12
@@ -71,39 +90,35 @@ class _FakeMetricsProc:
         return 0.0
 
 
-def test_proc_stats_reuses_process_so_cpu_is_not_stuck_at_zero(monkeypatch):
-    # find_process() returns a fresh object each call, but proc_stats must reuse
-    # one so psutil's cpu_percent has a prior sample and stops reporting 0.0.
-    proc = _FakeMetricsProc(cpu_after_first=800.0)  # raw per-core sum
+def test_proc_stats_reports_cpu_on_the_very_first_read(monkeypatch):
+    # The always-0 bug: a caller that reads once (the bot's /status, `palctl
+    # status` right after start) must still get a real CPU number. proc_stats
+    # samples over a real window, so even a brand-new process object reads > 0.
+    proc = _FakeMetricsProc(cpu_raw=800.0)  # raw per-core sum
     monkeypatch.setattr(procs, "find_process", lambda: proc)
-    monkeypatch.setattr(procs, "_tracked", None)
     monkeypatch.setattr(procs.psutil, "cpu_count", lambda: 8)
 
-    first = procs.proc_stats()
-    assert first is not None and first.cpu_percent == 0.0  # unavoidable first sample
-
-    second = procs.proc_stats()
-    assert second is not None
-    assert second.cpu_percent == 100.0  # 800% across 8 cores, normalized
+    stats = procs.proc_stats()
+    assert stats is not None
+    assert proc.cpu_interval == procs._CPU_SAMPLE_SECONDS  # measured over a window
+    assert stats.cpu_percent == 100.0  # 800% across 8 cores, normalized
 
 
-def test_tracked_process_rebinds_on_pid_change(monkeypatch):
-    a = _FakeMetricsProc(pid=1)
-    monkeypatch.setattr(procs, "_tracked", None)
-    monkeypatch.setattr(procs, "find_process", lambda: a)
-    assert procs._tracked_process() is a
-    assert procs._tracked_process() is a  # same pid -> same object reused
+def test_proc_stats_samples_cpu_outside_oneshot(monkeypatch):
+    # oneshot() caches cpu_times(), so an interval sample taken inside it diffs a
+    # value against itself and reads 0.0. The CPU sample must happen before the
+    # oneshot block, or the bug comes straight back.
+    proc = _FakeMetricsProc(cpu_raw=100.0)
+    monkeypatch.setattr(procs, "find_process", lambda: proc)
+    monkeypatch.setattr(procs.psutil, "cpu_count", lambda: 1)
 
-    b = _FakeMetricsProc(pid=2)  # server restarted, new pid
-    monkeypatch.setattr(procs, "find_process", lambda: b)
-    assert procs._tracked_process() is b
+    assert procs.proc_stats() is not None
+    assert proc.cpu_sampled_in_oneshot is False
 
 
-def test_tracked_process_clears_cache_when_server_stops(monkeypatch):
-    monkeypatch.setattr(procs, "_tracked", _FakeMetricsProc(pid=1))
+def test_proc_stats_returns_none_when_server_stopped(monkeypatch):
     monkeypatch.setattr(procs, "find_process", lambda: None)
-    assert procs._tracked_process() is None
-    assert procs._tracked is None
+    assert procs.proc_stats() is None
 
 
 # ---------- force-kill escalation primitives ----------

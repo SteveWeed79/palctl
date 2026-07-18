@@ -110,12 +110,27 @@ class PalApi:
         self._base = f"http://{host}:{port}/v1/api"
         self._auth = ("admin", password)
         self._timeout = timeout
+        # One client, reused across requests, so the ~every-10s poll (metrics +
+        # players) keeps a connection alive instead of doing a fresh TCP + auth
+        # handshake each call. Created lazily inside the running loop; closed via
+        # aclose() on daemon shutdown / config reload.
+        self._client: httpx.AsyncClient | None = None
+
+    def _client_or_new(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
 
     async def _request(self, method: str, path: str, json: dict | None = None) -> dict:
         url = f"{self._base}/{path}"
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                r = await client.request(method, url, auth=self._auth, json=json)
+            r = await self._client_or_new().request(
+                method, url, auth=self._auth, json=json
+            )
         except httpx.RequestError as e:
             raise PalApiUnreachable(
                 f"Can't reach the Palworld REST API at {url}. Check, in order: "

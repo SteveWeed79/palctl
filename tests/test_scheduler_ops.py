@@ -799,13 +799,27 @@ def test_restart_countdown_can_be_cancelled_before_restart(monkeypatch):
                 break
             await asyncio.sleep(0)
         assert sched.cancel_countdown() is True
-        await task
+        return await task
 
-    _run(go())
+    result = _run(go())
+    assert result is False  # the scheduled loop needs this to skip today's slot
     assert not any(c[0] in ("stop", "start") for c in calls)  # never restarted
     assert any("cancel" in e.message.lower() for e in events)
     assert sched._cancel_restart is None  # cleaned up
     assert True in intent  # a restart records 'server should be up' at entry
+
+
+def test_restart_countdown_returns_true_when_it_runs(monkeypatch):
+    # The counterpart to the cancel case: a completed restart reports True, so the
+    # daily loop knows it happened (and won't be told to skip the day).
+    monkeypatch.setattr(sched_mod, "COUNTDOWN_MARKS", (0,))  # no waiting
+    cfg = Config()
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+    bus = EventBus()
+    sched = sched_mod.Scheduler(cfg, FakeApi(), bus)
+    assert _run(sched.restart_with_countdown("test")) is True
+    assert [c[0] for c in calls] == ["stop", "start"]  # it actually restarted
 
 
 def test_update_server_records_up_intent(tmp_path, monkeypatch):

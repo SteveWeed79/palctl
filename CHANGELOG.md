@@ -11,6 +11,46 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Added
+- **A frame-time watchdog — restart on the *slideshow*, not just the leak.**
+  The memory watchdog restarts on RSS, but Palworld can bog down to single-digit
+  server FPS while still under the memory limit. Opt-in in Config: when the
+  server's own reported FPS stays below your floor for several consecutive
+  polls, palctl restarts it — with the same courtesies as the memory watchdog
+  (confirming samples, the shared cooldown, holding off while players are
+  online, and ignoring FPS 0 readings from a booting server).
+- **A second alert channel: one generic webhook.** If Discord is down or not
+  set up — exactly when an unattended box has a problem — the daemon can now
+  POST operational events (outages, watchdog restarts, backup failures, errors,
+  updates) to any URL: an ntfy topic, a Discord/Slack incoming webhook, or your
+  own endpoint. The payload carries the message as `content`/`text`/`message`
+  so all the common receivers accept it unchanged. Join/leave chatter is never
+  sent. Configure it in the GUI under Alerts.
+- **Low-disk safety.** A full disk corrupts saves, kills the server, and breaks
+  the backups you'd recover with. The daemon now warns (once per episode) when
+  free space on the server or backup volume drops below a configurable floor,
+  and a backup that wouldn't fit is skipped with a loud error instead of
+  filling the volume mid-copy.
+- **Graceful shutdown.** `systemctl stop` / service stop used to just kill the
+  daemon mid-write. It now catches the stop signal, flushes the world (if the
+  server is up), stops its loops, closes the API client and the database
+  cleanly, and logs the shutdown — all bounded so it finishes well inside the
+  service manager's timeout.
+- **The daemon can now prove it's alive — and be caught when it isn't.**
+  A public `/healthz` endpoint reports whether the poll loop is actually
+  cycling (503 when stale), and under systemd `Type=notify` the daemon sends
+  `READY=1`/`WATCHDOG=1` pings so `WatchdogSec` restarts a daemon whose event
+  loop has wedged — the one failure a process supervisor can't see.
+- **`GET /logs`** — a token-gated tail of the daemon's own rotating log over
+  the control API, so a misbehaving daemon can be diagnosed from the dashboard
+  machine without shelling into the box.
+- **Restart every N hours, not just daily.** Many servers run a 6–8 h restart
+  cadence to stay ahead of the leak; the schedule now supports it (Config →
+  Schedule → "Or restart every"). 0 keeps the daily-at-a-time behaviour.
+- **Probing the LAN-bound API is now visible.** When the dashboard is exposed
+  on the LAN the token is the only credential, so rejected requests are now
+  logged with the peer address (rate-limited so a misconfigured client can't
+  flood the log).
+
 - **A much more capable Discord bot — the real from-anywhere remote control.**
   Since the web dashboard is deliberately not internet-facing, the bot is how
   you run the server when you're away, so it grew the commands that were
@@ -63,6 +103,12 @@ Installers for every release are on the
   and encrypts the connection.
 
 ### Changed
+- **The Linux unit is now `Type=notify` with `WatchdogSec`.** The daemon
+  reports readiness to systemd and sends periodic liveness pings, so a wedged
+  event loop (process alive, daemon not working) gets restarted automatically —
+  re-run `palctl-daemon install-service` to pick up the new unit. The install
+  paths also say so explicitly now when something unidentifiable is holding the
+  daemon port, instead of silently spawning a daemon that loses the port fight.
 - **The Windows service wrapper is now WinSW instead of NSSM.** NSSM's last
   release was 2014 and it is unmaintained; WinSW (the wrapper Jenkins ships) is
   maintained and configured *declaratively* — the whole service definition
@@ -79,6 +125,45 @@ Installers for every release are on the
   can assert the outcome.
 
 ### Fixed
+- **Two clicks, one restart.** Restart/backup/update/restore requests checked
+  whether the server was busy and then started the operation as a background
+  task — and the busy flag only flipped when that task actually began. Two
+  near-simultaneous requests (a double-clicked button, GUI + Discord at once)
+  could both pass the check, and the second operation would run right after the
+  first — a surprise second restart. The server is now reserved synchronously
+  in the same instant as the check; the second request gets the busy answer.
+- **A watchdog restart that couldn't stop the server no longer reports
+  success.** If even the force-kill ladder failed, the restart cycle went on to
+  a no-op start and saw the *old, still-bloated* process answering — and called
+  it recovered, resetting the watchdog for another 20-minute cooldown. It now
+  reports the failure so the event feed says "needs a look" instead of lying.
+- **A rotated admin password no longer triggers restart loops.** The REST API
+  answering 401 (server up, wrong password) was treated like an outage, so
+  crash auto-recovery would restart a perfectly healthy server — repeatedly,
+  since a restart can't fix a password. It's now reported once as a
+  configuration error and never drives recovery.
+- **`/cancel` now actually skips the scheduled daily restart.** Cancelling the
+  countdown used to only postpone it: the scheduler woke again, saw today's
+  restart time still ahead, and immediately started a fresh countdown. A cancel
+  now skips to tomorrow's slot.
+- **Playtime survives a daemon restart.** Sessions left open by a previous
+  daemon run were closed at zero length — so restarting the daemon while
+  players were online discarded their whole in-progress session from
+  `/playtime` and the leaderboard. They're now closed at the daemon's last
+  recorded activity, keeping the playtime up to the restart.
+- **The player differ no longer writes to the database on the daemon's event
+  loop.** Join/leave session writes ran synchronously (and contended a lock
+  with background writers), which could hitch polling and the control API on a
+  slow disk — worst after a restart with a full server, which wrote one
+  fsync'd insert per online player. Writes now run on worker threads, priming
+  is one batched transaction, and the database runs in WAL mode.
+- **Startup failures now reach the log file.** The likeliest one — the control
+  port already taken by a leftover daemon — used to print to the stderr the
+  service wrapper discards, leaving a silent restart-loop. It's now logged
+  (and any unhandled startup error lands in the rotating log before exit).
+- **The status API stopped serving stale data during an outage** (last-seen
+  FPS/uptime next to a down server), and a config reload is refused while an
+  operation is mid-flight instead of swapping settings out from under it.
 - **The install verifies what it claims, instead of assuming.** "Installed and
   started" used to print no matter what the service manager actually did (every
   `systemctl`/`nssm` exit code was ignored), and login startup reported
@@ -128,14 +213,21 @@ Installers for every release are on the
   a daemon was already answering — and now replaces the running daemon instead,
   removing any leftover daemon *service* registration first so the service
   manager can't resurrect the old process (or double-start it at the next boot).
-- **CPU in `palctl status` (and the dashboard/bot) is no longer stuck at 0%.**
-  Process metrics are sampled by re-finding PalServer on every poll, which handed
-  psutil a brand-new `Process` object each time — and `cpu_percent(interval=None)`
-  always returns `0.0` on the first call for a given object, since it has no prior
-  sample to diff against. We now keep the same `Process` across polls (rebinding
-  when the server restarts), so CPU measures across the poll interval. The value
-  is also normalized to 0–100% of the whole machine instead of psutil's raw
-  per-core sum, so an N-core box no longer reads e.g. "750%".
+- **CPU in `palctl status` (and the dashboard/bot) is no longer stuck at 0%
+  — for real this time.** `cpu_percent(interval=None)` measures the work a
+  process did *between two calls on the same object*, so it returns `0.0` the
+  first time and needs a steady stream of prior samples to mean anything. An
+  earlier fix cached one `Process` and reused it, but that still read `0.0` on
+  the first sample, whenever two callers (poll loop, `/state`, the bot) landed
+  back-to-back, and any time the poll loop that primed it stopped running (e.g.
+  the REST API was briefly unreachable — that poll returns early and never
+  samples). `proc_stats()` now measures CPU over a real fixed window on every
+  call instead of relying on cross-call priming, so a single isolated read
+  (the bot's `/status`, a `palctl status` right after start) reports a real
+  number the first time and every time. The sample runs off the event loop, so
+  it doesn't stall the daemon. The value is still normalized to 0–100% of the
+  whole machine instead of psutil's raw per-core sum, so an N-core box doesn't
+  read e.g. "750%".
 - **A Stop that doesn't actually stop is no longer reported as success.** The
   daemon's HTTP `/action/stop` (used by the web dashboard and the `palctl stop`
   CLI) discarded the result of the service stop and always answered `ok`, so a

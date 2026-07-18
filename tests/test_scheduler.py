@@ -4,7 +4,12 @@ import pytest
 
 from palctl.config import Config
 from palctl.events import EventBus
-from palctl.scheduler import Scheduler, backup_interval_hours, next_daily
+from palctl.scheduler import (
+    Scheduler,
+    backup_interval_hours,
+    next_daily,
+    next_restart_target,
+)
 
 
 @pytest.mark.parametrize(
@@ -54,3 +59,25 @@ def test_next_restart_survives_garbage():
     for bad in ("garbage", "25:99", "", "6:xx"):
         target = make(bad)._next_restart()
         assert target > datetime.now()  # falls back instead of raising
+
+
+# ---------------- interval-mode restarts (restart_every_hours) ----------------
+
+
+def test_next_restart_target_interval_mode_wins_over_daily():
+    now = datetime(2026, 1, 1, 3, 0)
+    t = next_restart_target(now, 6, "06:00")
+    assert (t - now).total_seconds() == 6 * 3600  # every-6h, not 06:00 daily
+
+
+def test_next_restart_target_zero_falls_back_to_daily():
+    now = datetime(2026, 1, 1, 3, 0)
+    assert next_restart_target(now, 0, "06:00") == next_daily(now, "06:00")
+
+
+def test_next_restart_target_clamps_a_zero_ish_interval():
+    # A hand-edited restart_every_hours of, say, 1 must never tight-loop; the
+    # clamp floors the interval at one hour.
+    now = datetime(2026, 1, 1, 3, 0)
+    t = next_restart_target(now, 1, "06:00")
+    assert (t - now).total_seconds() == 3600

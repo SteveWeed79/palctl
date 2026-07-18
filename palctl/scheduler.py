@@ -19,6 +19,31 @@ from .inifile import is_blank
 COUNTDOWN_MARKS = (600, 300, 60, 30, 10)
 
 
+def _dir_size_bytes(path: Path | str) -> int:
+    """Total size of a directory tree. Blocking — call via to_thread. Best-effort:
+    unreadable entries are skipped, a missing dir is 0."""
+    total = 0
+    try:
+        for p in Path(path).rglob("*"):
+            try:
+                if p.is_file():
+                    total += p.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return total
+
+
+def _free_bytes(path: Path | str) -> int | None:
+    """Free bytes on the volume holding `path`, or None if unreadable.
+    Blocking — call via to_thread."""
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return None
+
+
 def backup_interval_hours(raw: int) -> int:
     """Effective hours between local backups. Capped at 24 so local backups —
     the safety net — always happen at least once a day, even if a stale or
@@ -38,6 +63,15 @@ def next_daily(now: datetime, time_str: str, fallback_hour: int = 6) -> datetime
     if target <= now:
         target += timedelta(days=1)
     return target
+
+
+def next_restart_target(now: datetime, every_hours: int, time_str: str) -> datetime:
+    """When the next scheduled restart is due. every_hours > 0 = interval mode
+    (every N hours from now, clamped to at least 1h so a hand-edited config
+    can't tight-loop restarts); otherwise the classic daily-at-HH:MM."""
+    if every_hours > 0:
+        return now + timedelta(hours=max(1, every_hours))
+    return next_daily(now, time_str, 6)
 
 
 class Scheduler:
@@ -126,6 +160,24 @@ class Scheduler:
             # Flush the world to disk first, or the backup is a few minutes stale.
             await self._control.save_best_effort(settle=3)
 
+            # Don't start a backup the disk can't hold. A copy that fills the
+            # volume mid-write leaves a corrupt backup AND breaks the live world's
+            # next save. Skip loudly instead — the whole point of backups is to be
+            # there when needed, so a silent out-of-space failure is the worst case.
+            need = await asyncio.to_thread(_dir_size_bytes, self._cfg.savegames_dir)
+            free = await asyncio.to_thread(_free_bytes, self._cfg.backup_root)
+            if need and free is not None and free < need * 1.2:
+                await self._bus.emit(
+                    Event(
+                        "error",
+                        f"Backup skipped: only {free / 1e9:.1f} GB free on the "
+                        f"backup volume but the world is ~{need / 1e9:.1f} GB. Free "
+                        "some space — backups are failing.",
+                        {"free_gb": round(free / 1e9, 1), "need_gb": round(need / 1e9, 1)},
+                    )
+                )
+                return None
+
             b = await asyncio.to_thread(
                 backups.create,
                 self._cfg.savegames_dir,
@@ -212,7 +264,14 @@ class Scheduler:
                 await asyncio.sleep(60)
                 continue
 
-            wait = (self._next_restart() - datetime.now()).total_seconds()
+            # Interval mode (every N hours) or daily-at-a-time — re-read each
+            # cycle so a config reload switches mode on the next lap.
+            target = next_restart_target(
+                datetime.now(),
+                self._cfg.schedule.restart_every_hours,
+                self._cfg.schedule.daily_restart_at,
+            )
+            wait = (target - datetime.now()).total_seconds()
             # Wake before the restart so we can run the countdown.
             await asyncio.sleep(max(0.0, wait - COUNTDOWN_MARKS[0]))
 
@@ -226,16 +285,23 @@ class Scheduler:
                         "stopped on purpose. Start it and it'll resume tomorrow.",
                     )
                 )
-                # Don't busy-wait the mark again; wait out the countdown window.
-                await asyncio.sleep(COUNTDOWN_MARKS[0])
-                continue
+            else:
+                try:
+                    await self.restart_with_countdown("Scheduled daily restart")
+                except Exception as e:
+                    await self._bus.emit(
+                        Event("error", f"Scheduled daily restart failed: {e}")
+                    )
 
-            try:
-                await self.restart_with_countdown("Scheduled daily restart")
-            except Exception as e:
-                await self._bus.emit(
-                    Event("error", f"Scheduled daily restart failed: {e}")
-                )
+            # Advance past today's target before recomputing, or a restart that
+            # finished (or a /cancel that returned) while `now` is still before
+            # the target would resolve _next_restart() to *today* again and
+            # re-fire immediately. A successful restart already runs past the
+            # target (the countdown takes minutes); a cancel or a skip needs this
+            # to wait the window out so /cancel actually skips the day.
+            remaining = (target - datetime.now()).total_seconds()
+            if remaining > 0:
+                await asyncio.sleep(remaining + 1)
 
     # ---------- scheduled auto-update ----------
 
@@ -317,12 +383,14 @@ class Scheduler:
         except TimeoutError:
             return False
 
-    async def restart_with_countdown(self, reason: str) -> None:
+    async def restart_with_countdown(self, reason: str) -> bool:
         """Announce, count down, save, restart. Also used by the GUI/bot buttons.
 
         Holds the op lock for the whole countdown, so an update or a watchdog
         restart can't fire into the middle of it. Cancellable via /cancel right
-        up until the save+restart at the end."""
+        up until the save+restart at the end. Returns True if the restart ran,
+        False if it was cancelled — the scheduled-restart loop needs to tell the
+        two apart so a cancel skips today's slot instead of re-arming it."""
         async with self._control.operation("restart"):
             # A restart intends the server up afterward — record that so it has
             # parity with the daemon's HTTP /action/restart and a prior /stop
@@ -341,7 +409,7 @@ class Scheduler:
                 for mark in COUNTDOWN_MARKS:
                     if await self._sleep_or_cancel(max(0, prev - mark)):
                         await self._bus.emit(Event("restart", cancelled_msg))
-                        return
+                        return False
                     prev = mark
                     label = f"{mark // 60} minute(s)" if mark >= 60 else f"{mark} seconds"
                     try:
@@ -351,7 +419,7 @@ class Scheduler:
 
                 if await self._sleep_or_cancel(prev):
                     await self._bus.emit(Event("restart", cancelled_msg))
-                    return
+                    return False
                 await self._control.save_best_effort(settle=3)
                 ok = await self._control.restart_cycle(
                     escalate=True,
@@ -366,6 +434,7 @@ class Scheduler:
                         {"recovered": ok},
                     )
                 )
+                return True
             finally:
                 self._cancel_restart = None
 

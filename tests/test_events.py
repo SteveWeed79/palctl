@@ -125,6 +125,41 @@ def test_dangling_sessions_closed_on_restart(tmp_path: Path):
     assert rows[0] == 0
 
 
+def test_restart_with_players_online_keeps_session_playtime(tmp_path: Path):
+    # Bug: a daemon restart while a player was online used to close their open
+    # session at joined_at (zero length), losing the whole in-progress session.
+    # Now it closes at the daemon's last recorded activity (newest metrics
+    # sample), so the playtime up to the restart survives.
+    db = tmp_path / "s.db"
+    store = SessionStore(db)
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    store._db.execute(
+        "INSERT INTO sessions (user_id, name, joined_at) VALUES (?,?,?)",
+        ("a", "A", base.isoformat()),
+    )
+    store._db.commit()
+    # The daemon kept polling for 30 minutes before it restarted.
+    store.log_metrics({"at": (base + timedelta(minutes=30)).timestamp(), "memory_mb": 1.0})
+
+    store2 = SessionStore(db)  # new daemon run runs the migration
+    joined, left = store2._db.execute(
+        "SELECT joined_at, left_at FROM sessions WHERE user_id='a'"
+    ).fetchone()
+    assert left is not None  # closed, not left dangling
+    assert 29.0 <= store2.total_playtime_minutes("a") <= 31.0  # ~30m kept, not 0
+
+
+def test_bulk_open_sessions_opens_each_once(tmp_path: Path):
+    store = SessionStore(tmp_path / "s.db")
+    store.open_sessions([player("a"), player("b"), player("c")])
+    open_rows = store._db.execute(
+        "SELECT COUNT(*) FROM sessions WHERE left_at IS NULL"
+    ).fetchone()[0]
+    assert open_rows == 3
+    store.open_sessions([])  # empty is a no-op, no error
+    assert store._db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 3
+
+
 def test_log_event_roundtrip(tmp_path: Path):
     store = SessionStore(tmp_path / "s.db")
     store.log_event(Event("watchdog", "msg", {"memory_mb": 12345.0}))

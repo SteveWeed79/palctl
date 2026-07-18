@@ -24,14 +24,22 @@ def unit_file(
     user: str | None = None,
 ) -> str:
     """Render a systemd unit. Restart=on-failure gives the same 'keep it up'
-    behaviour the WinSW wrapper provides on Windows."""
+    behaviour the WinSW wrapper provides on Windows.
+
+    Type=notify + WatchdogSec closes the gap on-failure can't: a daemon whose
+    event loop has *wedged* while the process stays alive. The daemon sends
+    READY=1 once it's serving and WATCHDOG=1 every half-interval (see
+    daemon.sd_notify / _liveness_loop); if the pings stop, systemd restarts it.
+    on-failure still covers real crashes."""
     lines = [
         "[Unit]",
         f"Description={description or name}",
         "After=network.target",
         "",
         "[Service]",
-        "Type=simple",
+        "Type=notify",
+        "NotifyAccess=main",
+        "WatchdogSec=120",
         f"ExecStart={exec_start}",
         "Restart=on-failure",
         "RestartSec=5",

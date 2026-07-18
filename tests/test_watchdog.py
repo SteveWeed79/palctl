@@ -115,3 +115,87 @@ def test_hold_keeps_confirmation_so_restart_fires_on_recovery(monkeypatch):
     wd._api = FakeApi(players=[])
     asyncio.run(wd._tick())
     assert restarts == [(13_000, 0, False)]
+
+
+# ---------------- frame-time / FPS watchdog ----------------
+
+
+class FpsApi:
+    """metrics() reports a fixed FPS/player count; players() for the memory path."""
+
+    def __init__(self, fps, players=0, down=False):
+        self._fps, self._players, self._down = fps, players, down
+
+    async def metrics(self):
+        if self._down:
+            raise RuntimeError("REST API down")
+        return types.SimpleNamespace(server_fps=self._fps, current_players=self._players)
+
+    async def players(self):
+        return [types.SimpleNamespace(name=f"p{i}") for i in range(self._players)]
+
+
+def make_fps_watchdog(monkeypatch, *, fps_api, min_fps=8, samples=2, memory_mb=1_000):
+    cfg = Config()
+    cfg.watchdog.fps_restart = True
+    cfg.watchdog.min_server_fps = min_fps
+    cfg.watchdog.fps_consecutive_samples = samples
+    bus = FakeBus()
+    wd = Watchdog(cfg, fps_api, bus)
+    monkeypatch.setattr(
+        watchdog_mod.procs, "proc_stats",
+        lambda: types.SimpleNamespace(memory_mb=memory_mb),  # memory path stays quiet
+    )
+    restarts = []
+
+    async def record(fps, players):
+        restarts.append((fps, players))
+
+    monkeypatch.setattr(wd, "_fps_restart", record)
+    return wd, bus, restarts
+
+
+def test_fps_restart_needs_consecutive_samples(monkeypatch):
+    wd, _, restarts = make_fps_watchdog(monkeypatch, fps_api=FpsApi(fps=3), samples=3)
+    asyncio.run(wd._tick())
+    asyncio.run(wd._tick())
+    assert restarts == []          # 2 of 3 — not confirmed yet
+    asyncio.run(wd._tick())
+    assert restarts == [(3, 0)]    # confirmed on the third
+
+
+def test_fps_recovery_resets_the_streak(monkeypatch):
+    api = FpsApi(fps=3)
+    wd, _, restarts = make_fps_watchdog(monkeypatch, fps_api=api, samples=2)
+    asyncio.run(wd._tick())        # low sample 1
+    wd._api = FpsApi(fps=30)
+    asyncio.run(wd._tick())        # healthy again — streak resets
+    wd._api = api
+    asyncio.run(wd._tick())        # low sample 1 (again)
+    assert restarts == []
+
+
+def test_fps_zero_is_a_blip_not_a_collapse(monkeypatch):
+    wd, _, restarts = make_fps_watchdog(monkeypatch, fps_api=FpsApi(fps=0), samples=1)
+    asyncio.run(wd._tick())
+    assert restarts == []  # booting / API hiccup readings never trigger
+
+
+def test_fps_holds_off_with_players_online(monkeypatch):
+    wd, bus, restarts = make_fps_watchdog(
+        monkeypatch, fps_api=FpsApi(fps=3, players=4), samples=1
+    )
+    asyncio.run(wd._tick())
+    asyncio.run(wd._tick())
+    assert restarts == []
+    holds = [e for e in bus.events if e.data.get("action") == "deferred"]
+    assert len(holds) == 1  # announced once, not every poll
+
+
+def test_fps_watchdog_off_by_default(monkeypatch):
+    # Config defaults leave fps_restart False — the tick must not even call
+    # metrics() (the memory-path FakeApi has no metrics(), which is the point).
+    api = FakeApi(players=[])
+    wd, bus, restarts = make_watchdog(monkeypatch, memory_mb=1_000, api=api)
+    asyncio.run(wd._tick())
+    assert restarts == []
