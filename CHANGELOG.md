@@ -125,6 +125,16 @@ Installers for every release are on the
   can assert the outcome.
 
 ### Fixed
+- **The settings editor gives fixed-choice options real pickers instead of a
+  text box.** Palworld writes its enum settings as bare words, so the editor
+  couldn't tell them from free text and showed `Difficulty`, `DeathPenalty`,
+  `RandomizerType`, `LogFormatType`, and `AllowConnectPlatform` as blanks you
+  had to type into — where `Nomal` or `itemandequipment` is a setting the game
+  silently ignores. They're dropdowns now, restricted to the values the game
+  accepts. `CrossplayPlatforms` (Steam/Xbox/PS5/Mac) became a row of checkboxes
+  instead of a comma-string you had to spell exactly. A current value the editor
+  doesn't recognise — a custom or future-patch token — is preserved as a
+  selectable choice, so saving never quietly drops it.
 - **Two clicks, one restart.** Restart/backup/update/restore requests checked
   whether the server was busy and then started the operation as a background
   task — and the busy flag only flipped when that task actually began. Two

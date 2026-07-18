@@ -19,6 +19,7 @@ from pathlib import Path
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
@@ -99,7 +100,55 @@ RANGES: dict[str, tuple[float, float]] = {
     "RCONPort": (1, 65535),
 }
 
+# Settings whose value is one of a fixed, named set. Palworld classifies these
+# as bare identifiers, so the parser sees an "enum" and — before this — dropped
+# them into a free-text box, where a typo ("Nomal", "itemandequipment") is a
+# silently-broken setting the game just ignores. A dropdown makes that
+# impossible. Values are the exact tokens the game writes, case included.
+ENUM_CHOICES: dict[str, tuple[str, ...]] = {
+    # None here is "custom" — the individual rate settings take over.
+    "Difficulty": ("None", "Casual", "Normal", "Hard"),
+    "DeathPenalty": ("None", "Item", "ItemAndEquipment", "All"),
+    "RandomizerType": ("None", "Region", "All"),
+    "LogFormatType": ("Text", "Json"),
+    # Deprecated in favour of CrossplayPlatforms, but still honoured; single value.
+    "AllowConnectPlatform": ("Steam", "Xbox", "PS5", "Mac"),
+}
+
+# Tuple settings whose value is a subset of a fixed list — a row of checkboxes,
+# not a comma-string you have to spell perfectly.
+MULTI_CHOICES: dict[str, tuple[str, ...]] = {
+    "CrossplayPlatforms": ("Steam", "Xbox", "PS5", "Mac"),
+}
+
 SECRET_KEYS = {"AdminPassword", "ServerPassword"}
+
+
+class MultiSelect(QWidget):
+    """A row of checkboxes for a tuple-of-known-values setting.
+
+    Any currently-set value we don't recognise (a future platform, say) is kept
+    as its own checked box, so saving never silently drops it."""
+
+    def __init__(self, options: tuple[str, ...], selected: list[str]) -> None:
+        super().__init__()
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        selected_set = {str(s) for s in selected}
+        # Known options first, then anything set that we don't know about.
+        ordered = list(options) + [s for s in selected_set if s not in options]
+
+        self._boxes: list[QCheckBox] = []
+        for name in ordered:
+            box = QCheckBox(name)
+            box.setChecked(name in selected_set)
+            self._boxes.append(box)
+            lay.addWidget(box)
+        lay.addStretch(1)
+
+    def values(self) -> list[str]:
+        return [b.text() for b in self._boxes if b.isChecked()]
 
 
 class SettingsEditor(QWidget):
@@ -226,6 +275,14 @@ class SettingsEditor(QWidget):
         return box
 
     def _widget_for(self, key: str, kind: str, value: object) -> QWidget:
+        # Fixed-choice settings get real pickers regardless of how the parser
+        # classified the raw text — a dropdown/checkboxes can't hold a typo.
+        if key in ENUM_CHOICES:
+            return self._enum_combo(key, value)
+        if key in MULTI_CHOICES:
+            selected = value if isinstance(value, list) else [str(value)] if value else []
+            return MultiSelect(MULTI_CHOICES[key], selected)
+
         lo, hi = RANGES.get(key, (None, None))  # type: ignore[assignment]
 
         if kind == ValueKind.BOOL:
@@ -253,6 +310,18 @@ class SettingsEditor(QWidget):
             w.setEchoMode(QLineEdit.EchoMode.Password)
         return w
 
+    def _enum_combo(self, key: str, value: object) -> QComboBox:
+        w = QComboBox()
+        choices = list(ENUM_CHOICES[key])
+        current = str(value)
+        # Preserve a value we don't recognise (custom, or from a future patch)
+        # by making it a selectable option rather than throwing it away.
+        if current and current not in choices:
+            choices.insert(0, current)
+        w.addItems(choices)
+        w.setCurrentText(current)
+        return w
+
     # ---------- save ----------
 
     def _save(self) -> None:
@@ -260,7 +329,11 @@ class SettingsEditor(QWidget):
             return
 
         for key, w in self._widgets.items():
-            if isinstance(w, QCheckBox):
+            if isinstance(w, MultiSelect):
+                self._settings.set(key, w.values())
+            elif isinstance(w, QComboBox):
+                self._settings.set(key, w.currentText())
+            elif isinstance(w, QCheckBox):
                 self._settings.set(key, w.isChecked())
             elif isinstance(w, QSpinBox):
                 self._settings.set(key, w.value())
