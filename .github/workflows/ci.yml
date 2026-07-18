@@ -146,7 +146,12 @@ jobs:
       - name: First install (clean box)
         shell: pwsh
         run: |
-          Start-Process -Wait packaging\Output\palctl-setup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+          # WaitForExit on the installer process ONLY — Start-Process -Wait
+          # waits for descendants too, and the upgrade path legitimately
+          # spawns the (never-exiting) daemon as a descendant.
+          $p = Start-Process packaging\Output\palctl-setup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
+          $p.WaitForExit()
+          if ($p.ExitCode -ne 0) { throw "installer exited $($p.ExitCode)" }
       - name: Corrupt the box the way old palctl versions left it
         shell: pwsh
         run: |
@@ -161,7 +166,9 @@ jobs:
       - name: Upgrade over the corrupted state
         shell: pwsh
         run: |
-          Start-Process -Wait packaging\Output\palctl-setup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+          $p = Start-Process packaging\Output\palctl-setup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
+          $p.WaitForExit()
+          if ($p.ExitCode -ne 0) { throw "installer exited $($p.ExitCode)" }
       - name: A daemon must be running again after the upgrade
         shell: pwsh
         run: |
