@@ -1194,7 +1194,26 @@ def install_service(as_user: bool = False) -> bool:
     if sys.platform.startswith("win"):
         import getpass
 
-        from . import startup, winservice
+        from . import preflight, startup, winservice
+
+        # Registering a Windows service needs elevation. Without this gate a
+        # non-elevated `install-service` let sc.exe/WinSW fail silently, then
+        # waited out the 30s reachability probe and reported the WRONG cause
+        # ("registered but not answering") — the real reason (no admin) never
+        # surfaced. Fail fast with the actual fix. Only a definite False blocks;
+        # None (can't tell / not really Windows, e.g. a mocked-platform test)
+        # proceeds, so nothing that isn't genuinely unelevated is refused.
+        if preflight.is_elevated() is False:
+            print(
+                "[daemon] Registering a Windows service needs administrator "
+                "rights, but palctl isn't elevated.\n"
+                "         Re-launch from an admin console (right-click → Run as "
+                "administrator),\n"
+                "         or use password-free login startup instead (no admin, "
+                "no service):\n"
+                "             palctl-daemon install-startup"
+            )
+            return False
 
         user = password = None
         if as_user:
@@ -1208,8 +1227,25 @@ def install_service(as_user: bool = False) -> bool:
             )
             password = getpass.getpass(f"Password for {user}: ")
 
-        # Wrapper first: if the download fails, nothing has been touched yet.
-        winsw = winservice.ensure_winsw(config_dir() / "bin")
+        # Wrapper first: if the download fails, nothing has been touched yet. A
+        # blocked download (corporate proxy, antivirus, offline box) or a
+        # tampered binary must say so plainly, not crash with a traceback or
+        # leave the user staring at a service that never registered.
+        try:
+            winsw = winservice.ensure_winsw(config_dir() / "bin")
+        except winservice.WrapperChecksumError as e:
+            print(f"[daemon] {e}")
+            return False
+        except OSError as e:
+            print(
+                "[daemon] couldn't download the WinSW service wrapper from "
+                f"GitHub ({e}). A proxy, firewall, or antivirus may be blocking "
+                "github.com, or the box is offline. Fix the network and retry, "
+                "or use password-free login startup instead (no download, no "
+                "service):\n"
+                "             palctl-daemon install-startup"
+            )
+            return False
         # Switching FROM login startup: drop the Run key, or the next login
         # spawns a second daemon that fights this service over the control port.
         startup.uninstall_startup()
@@ -1271,6 +1307,30 @@ def install_service(as_user: bool = False) -> bool:
     if _wait_until(_daemon_reachable, timeout=30.0):
         print(f"[daemon] service '{SERVICE_NAME}' installed and started.")
         return True
+
+    # It didn't come up. Say WHY as specifically as we can rather than one
+    # catch-all line: the registration was blocked (nothing to answer with), or
+    # the service exists but the SCM refused to start it (a logon failure —
+    # Error 1069 &c.), or a genuine daemon startup error the console/journal
+    # will show.
+    if sys.platform.startswith("win"):
+        from . import winservice
+
+        if not winservice.service_exists(SERVICE_NAME):
+            print(
+                f"[daemon] the '{SERVICE_NAME}' service did not get registered — "
+                "the registration was blocked. Run this from an administrator "
+                "console (right-click → Run as administrator), or use "
+                "`palctl-daemon install-startup`."
+            )
+            return False
+        reason = procs.service_failure_reason(SERVICE_NAME)
+        if reason:
+            print(
+                f"[daemon] service '{SERVICE_NAME}' is registered but won't "
+                f"start — {reason}"
+            )
+            return False
     hint = (
         "run `palctl-daemon run` in a console to see the startup error"
         if sys.platform.startswith("win")
@@ -1286,12 +1346,23 @@ def install_service(as_user: bool = False) -> bool:
 
 def uninstall_service() -> None:
     if sys.platform.startswith("win"):
-        from . import winservice
+        from . import preflight, winservice
 
         # Removal goes through plain sc.exe — no wrapper download needed, and
         # it works on services registered by the old NSSM builds too.
         if not winservice.service_exists(SERVICE_NAME):
             print(f"[daemon] service '{SERVICE_NAME}' is not registered; nothing to remove.")
+            return
+        # Removing a service needs elevation too. Without this, sc.exe fails
+        # access-denied and this used to print "removed" anyway — leaving the
+        # old daemon registered (and, on a mode switch, fighting the new one for
+        # the port). Say the truth instead. Only a definite False blocks.
+        if preflight.is_elevated() is False:
+            print(
+                f"[daemon] removing the '{SERVICE_NAME}' service needs "
+                "administrator rights. Re-run from an admin console "
+                "(right-click → Run as administrator)."
+            )
             return
         winservice.remove_service(SERVICE_NAME)
         # Best-effort: drop the per-service wrapper copy + config so nothing in

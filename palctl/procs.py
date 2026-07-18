@@ -176,6 +176,67 @@ def service_state(service_name: str) -> str:
     return _parse_sc_state(out) if IS_WINDOWS else _parse_systemctl_state(out)
 
 
+# Windows records the *result of the last start attempt* in a service's
+# WIN32_EXIT_CODE. `sc query` prints it, but _parse_sc_state reads only the
+# STATE token and throws the code away — so a service that registered fine yet
+# can't START (the classic post-install permission failure) otherwise looks like
+# a plain STOPPED with no reason, and the daemon appears down for no visible
+# cause. These map the common start-failure codes to a fix the user can act on.
+SERVICE_START_ERRORS = {
+    1069: (
+        "Error 1069: the service's logon account was rejected. A PIN-only or "
+        "passwordless Windows account can't host a service logon — re-enter the "
+        "account password, or switch to password-free login startup "
+        "(palctl-daemon install-startup)."
+    ),
+    1053: "Error 1053: the service didn't respond to the start request in time.",
+    5: "Error 5: access denied — starting the service needs an administrator.",
+}
+
+
+def _parse_sc_exit_code(out: str) -> int | None:
+    """The WIN32_EXIT_CODE from `sc query` output (0 = clean), or None when the
+    line is absent/unparseable. The line reads e.g.
+    ``WIN32_EXIT_CODE    : 1069  (0x42d)`` — take the first token after the colon
+    (SERVICE_EXIT_CODE is a different line and never matches this substring)."""
+    for line in out.splitlines():
+        if "WIN32_EXIT_CODE" in line:
+            tail = line.split(":", 1)[-1].split()
+            if tail:
+                try:
+                    return int(tail[0])
+                except ValueError:
+                    return None
+    return None
+
+
+def service_failure_reason(service_name: str) -> str | None:
+    """A plain-language reason a Windows service is registered but not running,
+    read from the SCM's recorded start result. ``None`` off Windows, or when the
+    code is 0/unknown — so a caller appends it only when there's something real
+    to say, and never fabricates a problem on a healthy service."""
+    if not IS_WINDOWS:
+        return None
+    code = _parse_sc_exit_code(_run_capture(_state_command(service_name)))
+    if not code:
+        return None
+    return SERVICE_START_ERRORS.get(code, f"the service reported start error {code}.")
+
+
+def service_diagnostics(service_name: str) -> str:
+    """Raw service-manager status for a diagnostics bundle: `sc query` + `sc qc`
+    on Windows (qc shows the logon account and binary path — the two things a
+    permission/1069 report needs, and neither is a secret), or `systemctl status`
+    on Linux. Bounded and non-raising, like every call in this module."""
+    if IS_WINDOWS:
+        blocks = []
+        for cmd in (["sc.exe", "query", service_name], ["sc.exe", "qc", service_name]):
+            blocks.append(f"$ {' '.join(cmd)}\n{_run_capture(cmd) or '(no output)'}")
+        return "\n\n".join(blocks)
+    cmd = ["systemctl", "status", "--no-pager", service_name]
+    return f"$ {' '.join(cmd)}\n{_run_capture(cmd) or '(systemctl unavailable / no output)'}"
+
+
 # The async wrappers run every blocking subprocess call in a worker thread:
 # these coroutines execute on the daemon's single event loop, and a slow
 # sc.exe/systemctl on the loop thread stalls polling, the watchdog, and the

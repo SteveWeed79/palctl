@@ -25,6 +25,48 @@ def test_parse_systemctl_state():
     assert procs._parse_systemctl_state("garbage") == "UNKNOWN"
 
 
+def test_parse_sc_exit_code():
+    out = (
+        "        STATE              : 1  STOPPED\n"
+        "        WIN32_EXIT_CODE    : 1069  (0x42d)\n"
+        "        SERVICE_EXIT_CODE  : 0  (0x0)\n"
+    )
+    assert procs._parse_sc_exit_code(out) == 1069
+    # A clean service reports 0 — that's "nothing wrong", not a missing code.
+    assert procs._parse_sc_exit_code("WIN32_EXIT_CODE    : 0  (0x0)") == 0
+    # SERVICE_EXIT_CODE must not be mistaken for the WIN32 one.
+    assert procs._parse_sc_exit_code("SERVICE_EXIT_CODE  : 42  (0x2a)") is None
+    assert procs._parse_sc_exit_code("no code here") is None
+
+
+def test_service_failure_reason_explains_known_codes(monkeypatch):
+    monkeypatch.setattr(procs, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        procs, "_run_capture",
+        lambda cmd, timeout=30.0: "WIN32_EXIT_CODE    : 1069  (0x42d)",
+    )
+    reason = procs.service_failure_reason("palctl-daemon")
+    assert reason and "1069" in reason and "login startup" in reason
+
+
+def test_service_failure_reason_unknown_code_is_still_reported(monkeypatch):
+    monkeypatch.setattr(procs, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        procs, "_run_capture", lambda cmd, timeout=30.0: "WIN32_EXIT_CODE : 999 (0x3e7)"
+    )
+    assert "999" in procs.service_failure_reason("svc")
+
+
+def test_service_failure_reason_none_when_clean_or_off_windows(monkeypatch):
+    # A healthy service (code 0) must not invent a problem.
+    monkeypatch.setattr(procs, "IS_WINDOWS", True)
+    monkeypatch.setattr(procs, "_run_capture", lambda cmd, timeout=30.0: "WIN32_EXIT_CODE : 0")
+    assert procs.service_failure_reason("svc") is None
+    # Off Windows there's no such code at all.
+    monkeypatch.setattr(procs, "IS_WINDOWS", False)
+    assert procs.service_failure_reason("svc") is None
+
+
 def test_command_builders_match_platform():
     state = procs._state_command("PalServer")
     start = procs._action_command("start", "PalServer")
