@@ -79,6 +79,14 @@ Installers for every release are on the
   can assert the outcome.
 
 ### Fixed
+- **A fresh install now starts palctl immediately.** Installing used to leave
+  nothing running until you launched the GUI and completed the wizard — an
+  always-on daemon that isn't running after install reads as broken, and the
+  GUI is only a view onto the daemon, so the app looked dead out of the box.
+  The installer now registers password-free login startup and starts the
+  daemon at the end of a fresh install (verified up, not fire-and-forget); the
+  wizard still owns switching modes later, and its choice is persisted. CI
+  asserts a daemon is listening after a fresh silent install.
 - **The installer now actually brings the daemon back after an upgrade.**
   Upgrading over a running palctl stopped/killed the daemon to free its exe,
   then restarted it blind: `net start`'s result was ignored, so if the service

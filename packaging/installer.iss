@@ -155,7 +155,7 @@ begin
     SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
 end;
 
-procedure RestartDaemonAfterUpgrade;
+procedure EnsureDaemonRunning;
 var
   ResultCode: Integer;
   Tries: Integer;
@@ -188,27 +188,45 @@ begin
       exit;
   end;
   if LoginStartupWasRegistered then
+  begin
     { Relaunch the way the Run key would at login — as the original,
       non-elevated user, so it reads that user's config and DPAPI secrets
       (the Discord token). }
     ExecAsOriginalUser(ExpandConstant('{app}\palctl-daemon.exe'),
       'run --headless', '', SW_HIDE, ewNoWait, ResultCode);
+    exit;
+  end;
+  if not ServiceWasRegistered then
+  begin
+    { FRESH install: nothing was registered before. An always-on daemon that
+      is not running after install reads as broken — and the GUI is only a
+      view onto the daemon, so nothing works until it starts. Register
+      password-free login startup and start the daemon now, as the original
+      user; install-startup verifies the daemon actually comes up and exits
+      nonzero if it does not. The wizard can still switch modes later — its
+      choice is persisted and reconciled on every setup run. }
+    ExecAsOriginalUser(ExpandConstant('{app}\palctl-daemon.exe'),
+      'install-startup', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    if ResultCode <> 0 then
+      Log('install-startup after fresh install exited ' + IntToStr(ResultCode));
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
-    RestartDaemonAfterUpgrade;
+    EnsureDaemonRunning;
 end;
 
 [Run]
 ; Self-register the daemon service (downloads the WinSW wrapper on first use).
 Filename: "{app}\palctl-daemon.exe"; Parameters: "install-service"; Tasks: daemonservice; Flags: runhidden waituntilterminated; StatusMsg: "Registering the palctl service..."
-; The upgrade restart of an existing daemon (service or login-startup mode)
-; happens in RestartDaemonAfterUpgrade above — in [Code], not here, because it
-; VERIFIES the service actually reached RUNNING and falls back to the
-; login-mode daemon when a stale registration can't start. Blind [Run] entries
-; can't express "check, then fall back".
+; The daemon start/restart happens in EnsureDaemonRunning above — in [Code],
+; not here, because it VERIFIES outcomes and falls back: an upgraded service
+; must actually reach RUNNING (else the login-mode daemon is relaunched), and
+; a FRESH install registers login startup and starts the daemon immediately,
+; so the app never sits installed-but-dead. Blind [Run] entries can't express
+; "check, then fall back".
 ; Offer to launch the GUI (which runs the first-run wizard) at the end.
 Filename: "{app}\palctl-gui.exe"; Description: "Launch palctl"; Flags: nowait postinstall skipifsilent
 

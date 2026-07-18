@@ -129,7 +129,13 @@ jobs:
           using System.Threading;
           class Stub {
             static void Main(string[] args) {
-              // Only `run` serves; install/uninstall subcommands no-op cleanly.
+              // install-startup mirrors the real daemon: spawn self detached, exit 0.
+              if (Array.IndexOf(args, "install-startup") >= 0) {
+                var exe = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                System.Diagnostics.Process.Start(exe, "run --headless");
+                return;
+              }
+              // Only `run` serves; other subcommands no-op cleanly.
               if (Array.IndexOf(args, "run") < 0) return;
               var l = new TcpListener(IPAddress.Loopback, 8830);
               l.Start();
@@ -143,18 +149,26 @@ jobs:
           Copy-Item dist\palctl\palctl-daemon.exe dist\palctl\palctl.exe
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=0.0.0 packaging\installer.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
-      - name: First install (clean box)
+      - name: Fresh install must leave a daemon running (not installed-but-dead)
         shell: pwsh
         run: |
           # WaitForExit on the installer process ONLY — Start-Process -Wait
-          # waits for descendants too, and the upgrade path legitimately
-          # spawns the (never-exiting) daemon as a descendant.
+          # waits for descendants too, and the install legitimately spawns
+          # the (never-exiting) daemon as a descendant.
           $p = Start-Process packaging\Output\palctl-setup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
           $p.WaitForExit()
           if ($p.ExitCode -ne 0) { throw "installer exited $($p.ExitCode)" }
+          $deadline = (Get-Date).AddSeconds(30)
+          while ((Get-Date) -lt $deadline) {
+            if (Get-NetTCPConnection -LocalPort 8830 -State Listen -ErrorAction SilentlyContinue) { exit 0 }
+            Start-Sleep -Seconds 2
+          }
+          throw "no daemon running after a FRESH install"
       - name: Corrupt the box the way old palctl versions left it
         shell: pwsh
         run: |
+          # Start from a deliberate state: kill the fresh-install daemon first.
+          taskkill /F /IM palctl-daemon.exe 2>$null
           sc.exe create palctl-daemon binPath= '"C:\old-palctl\palctl-daemon.exe" run' start= demand
           if ($LASTEXITCODE -ne 0) { throw "sc create failed" }
           $app = "${env:ProgramFiles}\palctl"
