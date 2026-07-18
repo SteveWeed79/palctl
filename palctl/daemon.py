@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import secrets
 import sys
@@ -208,7 +209,14 @@ def lan_exposure_warning(host: str) -> str | None:
 def make_auth_middleware(token: str, exempt: frozenset[str] = frozenset()):
     """aiohttp middleware that rejects any request without the shared token.
     `exempt` paths skip the check — only the dashboard page itself, which
-    contains no data (its /state calls still need the token)."""
+    contains no data (its /state calls still need the token).
+
+    Rejections are logged (with the peer address) so probing is visible when the
+    API is LAN-bound — the token is the only credential there, and silence would
+    hide someone guessing at it. Rate-limited so a misconfigured client polling
+    every 2s can't flood the log: the first few are logged, then every 100th."""
+    rejects = {"n": 0}
+    log = logging.getLogger("palctl.daemon")
 
     @web.middleware
     async def _auth(request: web.Request, handler):
@@ -216,6 +224,14 @@ def make_auth_middleware(token: str, exempt: frozenset[str] = frozenset()):
             return await handler(request)
         sent = request.headers.get(localauth.TOKEN_HEADER, "")
         if not secrets.compare_digest(sent, token):
+            rejects["n"] += 1
+            n = rejects["n"]
+            if n <= 5 or n % 100 == 0:
+                log.warning(
+                    "rejected request #%d without a valid token: %s %s from %s",
+                    n, request.method, request.path,
+                    request.remote or "unknown",
+                )
             return web.json_response({"error": "unauthorized"}, status=401)
         return await handler(request)
 
@@ -1349,6 +1365,14 @@ def _stop_daemon_process() -> None:
     try:
         conns = psutil.net_connections(kind="tcp")
     except Exception:
+        # Can't enumerate sockets at all (no privileges). Say so — the caller
+        # only got here because something IS on the port, and silently returning
+        # makes "couldn't stop it" look like "nothing to stop".
+        print(
+            "[daemon] something is answering on the daemon port but the process "
+            "couldn't be identified (no permission to inspect sockets) — the new "
+            "daemon may lose the port to it. Stop the old daemon manually if so."
+        )
         return
     pids = {
         c.pid
@@ -1359,6 +1383,15 @@ def _stop_daemon_process() -> None:
         and c.laddr
         and c.laddr.port == DAEMON_PORT
     }
+    if not pids:
+        # Same story: the port answers but no visible owner (another user's
+        # process on Linux without root shows pid=None). Fail loudly, not open.
+        print(
+            "[daemon] something is answering on the daemon port but no owning "
+            "process is visible (try again as root/administrator) — the new "
+            "daemon may lose the port to it."
+        )
+        return
     for pid in pids:
         try:
             proc = psutil.Process(pid)

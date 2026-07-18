@@ -105,7 +105,10 @@ def test_auth_middleware_allows_correct_token():
 def test_auth_middleware_rejects_missing_and_wrong_token():
     mw = make_auth_middleware("s3cret")
     for headers in ({}, {TOKEN_HEADER: "wrong"}):
-        req = types.SimpleNamespace(headers=headers)
+        # method/path/remote are what the middleware logs on a rejection.
+        req = types.SimpleNamespace(
+            headers=headers, method="GET", path="/state", remote="127.0.0.1"
+        )
         res = asyncio.run(mw(req, _ok_handler))
         assert res.status == 401
 
@@ -113,9 +116,9 @@ def test_auth_middleware_rejects_missing_and_wrong_token():
 def test_auth_middleware_exempts_only_the_named_paths():
     # "/" serves the dashboard page (no data); everything else keeps the gate.
     mw = make_auth_middleware("s3cret", exempt=frozenset({"/"}))
-    page = types.SimpleNamespace(headers={}, path="/")
+    page = types.SimpleNamespace(headers={}, path="/", method="GET", remote="::1")
     assert asyncio.run(mw(page, _ok_handler)) == "OK"
-    data = types.SimpleNamespace(headers={}, path="/state")
+    data = types.SimpleNamespace(headers={}, path="/state", method="GET", remote="::1")
     assert asyncio.run(mw(data, _ok_handler)).status == 401
 
 

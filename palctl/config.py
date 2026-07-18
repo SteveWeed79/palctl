@@ -90,6 +90,10 @@ class ScheduleConfig:
     enabled: bool = True
     daily_restart: bool = True
     daily_restart_at: str = "06:00"
+    # Restart every N hours instead of once a day at a fixed time. Many servers
+    # run a 6-8h cadence to stay ahead of the leak. 0 (default) = keep the
+    # daily-at-HH:MM behaviour; > 0 takes precedence over daily_restart_at.
+    restart_every_hours: int = 0
     autosave_minutes: int = 15
     # Local backups always run — this is only how often. Capped at 24h (the GUI
     # and the scheduler both enforce it) so backups happen at least once a day;

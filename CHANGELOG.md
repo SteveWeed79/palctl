@@ -43,6 +43,13 @@ Installers for every release are on the
 - **`GET /logs`** — a token-gated tail of the daemon's own rotating log over
   the control API, so a misbehaving daemon can be diagnosed from the dashboard
   machine without shelling into the box.
+- **Restart every N hours, not just daily.** Many servers run a 6–8 h restart
+  cadence to stay ahead of the leak; the schedule now supports it (Config →
+  Schedule → "Or restart every"). 0 keeps the daily-at-a-time behaviour.
+- **Probing the LAN-bound API is now visible.** When the dashboard is exposed
+  on the LAN the token is the only credential, so rejected requests are now
+  logged with the peer address (rate-limited so a misconfigured client can't
+  flood the log).
 
 - **A much more capable Discord bot — the real from-anywhere remote control.**
   Since the web dashboard is deliberately not internet-facing, the bot is how
@@ -96,6 +103,12 @@ Installers for every release are on the
   and encrypts the connection.
 
 ### Changed
+- **The Linux unit is now `Type=notify` with `WatchdogSec`.** The daemon
+  reports readiness to systemd and sends periodic liveness pings, so a wedged
+  event loop (process alive, daemon not working) gets restarted automatically —
+  re-run `palctl-daemon install-service` to pick up the new unit. The install
+  paths also say so explicitly now when something unidentifiable is holding the
+  daemon port, instead of silently spawning a daemon that loses the port fight.
 - **The Windows service wrapper is now WinSW instead of NSSM.** NSSM's last
   release was 2014 and it is unmaintained; WinSW (the wrapper Jenkins ships) is
   maintained and configured *declaratively* — the whole service definition

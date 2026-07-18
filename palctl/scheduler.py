@@ -65,6 +65,15 @@ def next_daily(now: datetime, time_str: str, fallback_hour: int = 6) -> datetime
     return target
 
 
+def next_restart_target(now: datetime, every_hours: int, time_str: str) -> datetime:
+    """When the next scheduled restart is due. every_hours > 0 = interval mode
+    (every N hours from now, clamped to at least 1h so a hand-edited config
+    can't tight-loop restarts); otherwise the classic daily-at-HH:MM."""
+    if every_hours > 0:
+        return now + timedelta(hours=max(1, every_hours))
+    return next_daily(now, time_str, 6)
+
+
 class Scheduler:
     def __init__(
         self,
@@ -255,7 +264,13 @@ class Scheduler:
                 await asyncio.sleep(60)
                 continue
 
-            target = self._next_restart()
+            # Interval mode (every N hours) or daily-at-a-time — re-read each
+            # cycle so a config reload switches mode on the next lap.
+            target = next_restart_target(
+                datetime.now(),
+                self._cfg.schedule.restart_every_hours,
+                self._cfg.schedule.daily_restart_at,
+            )
             wait = (target - datetime.now()).total_seconds()
             # Wake before the restart so we can run the countdown.
             await asyncio.sleep(max(0.0, wait - COUNTDOWN_MARKS[0]))

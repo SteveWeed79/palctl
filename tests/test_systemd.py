@@ -17,6 +17,10 @@ def test_unit_file_has_required_sections():
     assert "User=pal" in u
     assert "Restart=on-failure" in u
     assert "WantedBy=multi-user.target" in u
+    # Type=notify + WatchdogSec: systemd restarts a daemon whose event loop
+    # wedged (pings stop) — the failure Restart=on-failure can't see.
+    assert "Type=notify" in u
+    assert "WatchdogSec=" in u
 
 
 def test_unit_file_omits_optional_fields():

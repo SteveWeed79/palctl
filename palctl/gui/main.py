@@ -747,6 +747,16 @@ class ConfigTab(QWidget):
 
         hh, _, mm = cfg.schedule.daily_restart_at.partition(":")
         self.sch_time.setTime(QTime(int(hh), int(mm or 0)))
+        self.sch_every = NoScrollSpinBox()
+        self.sch_every.setRange(0, 24)
+        self.sch_every.setSuffix(" h")
+        self.sch_every.setSpecialValueText("daily at the time above")  # shown at 0
+        self.sch_every.setValue(cfg.schedule.restart_every_hours)
+        self.sch_every.setToolTip(
+            "Restart every N hours instead of once a day — many servers run a "
+            "6-8 h cadence to stay ahead of the memory leak. 0 keeps the daily "
+            "at-a-time schedule."
+        )
         self.sch_backup = NoScrollSpinBox()
         # Capped at 24h so local backups always happen at least once a day.
         self.sch_backup.setRange(1, 24)
@@ -777,6 +787,7 @@ class ConfigTab(QWidget):
         sf.addRow("Enabled", self.sch_enabled)
         sf.addRow("Daily restart", self.sch_restart)
         sf.addRow("At", self.sch_time)
+        sf.addRow("Or restart every", self.sch_every)
         sf.addRow("Backup every", self.sch_backup)
         sf.addRow("Backups to keep (local)", self.sch_retain)
         sf.addRow("Copies to keep (mirror)", self.sch_mirror_retain)
@@ -951,6 +962,7 @@ class ConfigTab(QWidget):
         c.schedule.enabled = self.sch_enabled.isChecked()
         c.schedule.daily_restart = self.sch_restart.isChecked()
         c.schedule.daily_restart_at = self.sch_time.time().toString("HH:mm")
+        c.schedule.restart_every_hours = self.sch_every.value()
         c.schedule.backup_hours = self.sch_backup.value()
         c.schedule.backup_retain = self.sch_retain.value()
         c.schedule.mirror_retain = self.sch_mirror_retain.value()
