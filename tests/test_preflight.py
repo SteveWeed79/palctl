@@ -75,6 +75,15 @@ def test_windows_checks_are_none_off_windows():
     assert preflight.check_vcredist().ok is None
 
 
+def test_is_elevated_none_off_windows():
+    # Off Windows (or anywhere ctypes.windll isn't real) it must return None, not
+    # False — callers gate on `is False`, so a wrong False would refuse a service
+    # install on a platform that doesn't even have the concept.
+    if sys.platform.startswith("win"):
+        return
+    assert preflight.is_elevated() is None
+
+
 def test_check_icon_mapping():
     assert preflight.Check("x", True, "").icon == "✓"
     assert preflight.Check("x", False, "").icon == "❌"

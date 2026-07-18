@@ -30,6 +30,16 @@ PAL_PROCESS_NAMES = (
     "PalServer.sh",
 )
 
+# The real server binaries — the multi-GB process that actually holds the world
+# and the memory leak. This is what the watchdog must watch.
+SHIPPING_PROCESS_NAMES = ("PalServer-Win64-Shipping.exe", "PalServer-Linux-Shipping")
+
+# The thin bootstrap launchers. Each spawns the real server and then idles at a
+# few MB, so watching one means the leak watchdog watches a process that never
+# grows and never fires. We only ever touch a launcher to reach the real server
+# it spawned (its child) — see find_process().
+LAUNCHER_PROCESS_NAMES = ("PalServer.exe", "PalServer.sh")
+
 
 @dataclass(frozen=True)
 class ProcStats:
@@ -40,31 +50,62 @@ class ProcStats:
     uptime_seconds: float
 
 
+def _server_child_of(launcher: psutil.Process) -> psutil.Process | None:
+    """The real server the launcher spawned. Prefer a child we can positively
+    name as the Shipping binary; failing that, a bootstrap launcher with exactly
+    one child IS the server — its *name* may be unreadable across a privilege
+    boundary (server as SYSTEM, daemon as the login user), but its pid and memory
+    usually aren't. None if it has no usable child."""
+    try:
+        kids = launcher.children()
+    except psutil.Error:
+        return None
+    for child in kids:
+        try:
+            if child.name() in SHIPPING_PROCESS_NAMES:
+                return child
+        except psutil.Error:
+            continue
+    return kids[0] if len(kids) == 1 else None
+
+
 def find_process() -> psutil.Process | None:
     """
-    Prefer the Shipping binary — PalServer.exe is a thin launcher that spawns it
-    and holds almost no memory. Watching the launcher would mean the leak
-    watchdog never fires, which is the whole point of this module.
+    The real Palworld server process — the multi-GB PalServer-Win64-Shipping,
+    never the thin launcher that spawns it (watching the launcher means the leak
+    watchdog watches a process that never grows, so it never fires — the whole
+    point of this module).
+
+    Also handles the privilege split that silently blinds the watchdog: when the
+    server runs as a SYSTEM service and palctl runs as the login user, psutil can
+    fail to read the Shipping process's *name* during enumeration, so it never
+    shows up by name and we'd settle for the idle ~7 MB launcher. If all we can
+    see is a launcher, follow it to the real child it spawned instead.
     """
-    candidates: dict[str, psutil.Process] = {}
+    shipping: dict[str, psutil.Process] = {}
+    launchers: list[psutil.Process] = []
     for p in psutil.process_iter(["name"]):
         name = p.info.get("name") or ""
-        if name in PAL_PROCESS_NAMES:
-            candidates[name] = p
+        if name in SHIPPING_PROCESS_NAMES:
+            shipping[name] = p
+        elif name in LAUNCHER_PROCESS_NAMES:
+            launchers.append(p)
 
-    for name in PAL_PROCESS_NAMES:  # ordered: Shipping first
-        if name in candidates:
-            return candidates[name]
-    return None
+    for name in SHIPPING_PROCESS_NAMES:  # the real server, seen directly — best
+        if name in shipping:
+            return shipping[name]
+    for launcher in launchers:  # only a launcher visible — follow it to the server
+        child = _server_child_of(launcher)
+        if child is not None:
+            return child
+    # A launcher with no reachable child still beats returning nothing.
+    return launchers[0] if launchers else None
 
 
-# The actual server binaries (one live process per running instance). The thin
-# launchers in PAL_PROCESS_NAMES are deliberately excluded: a single healthy
-# server shows both a launcher and a Shipping process, so counting launchers
-# would double-count. Two Shipping processes == two real server instances.
-SHIPPING_PROCESS_NAMES = ("PalServer-Win64-Shipping.exe", "PalServer-Linux-Shipping")
-
-
+# A single healthy server shows both a launcher and a Shipping process, so
+# counting launchers would double-count — shipping_processes() looks only at the
+# real binaries (SHIPPING_PROCESS_NAMES). Two Shipping processes == two real
+# server instances, the classic leftover-second-service collision.
 def shipping_processes() -> list[psutil.Process]:
     """Every running Palworld server process. find_process() returns the single
     one the watchdog should watch; this returns them all, so preflight can flag
@@ -75,6 +116,50 @@ def shipping_processes() -> list[psutil.Process]:
         if (p.info.get("name") or "") in SHIPPING_PROCESS_NAMES:
             out.append(p)
     return out
+
+
+def process_owner(proc: psutil.Process) -> str | None:
+    """The account a process runs under (e.g. ``NT AUTHORITY\\SYSTEM``,
+    ``DESKTOP\\server sw``), or None if it can't be read. Used to catch the
+    watchdog-blinding split where the server runs under a different account than
+    the daemon."""
+    try:
+        return proc.username()
+    except psutil.Error:
+        return None
+
+
+def account_mismatch_warning(server_owner: str | None, daemon_user: str) -> str | None:
+    """Warn when the server process runs under a different account than the
+    daemon. palctl then can't reliably read the server's memory/CPU — it lands on
+    the idle launcher, so the leak watchdog is effectively off. Pure (compares on
+    the trailing account name, DOMAIN\\user or NT AUTHORITY\\SYSTEM), so it's
+    testable. None when they match or the owner is unknown."""
+    if not server_owner:
+        return None
+    server = server_owner.split("\\")[-1].strip().lower()
+    daemon = daemon_user.split("\\")[-1].strip().lower()
+    if not server or server == daemon:
+        return None
+    return (
+        f"the Palworld server runs as '{server_owner}' but palctl runs as "
+        f"'{daemon_user}'. palctl can't reliably read a server owned by another "
+        "account, so the memory-leak watchdog and the CPU/memory readings will be "
+        "wrong (they track the idle launcher, not the real server). Run both under "
+        "the SAME account — register palctl and PalServer as services under your "
+        "user: palctl-daemon install-service --as-user."
+    )
+
+
+def server_account_mismatch(daemon_user: str) -> str | None:
+    """Find the server process, read its owner, and return
+    account_mismatch_warning(...) or None. Blocking (psutil enumeration) — the
+    daemon calls this once via to_thread to warn if its account can't see the
+    server it's supposed to watch."""
+    proc = find_process()
+    if proc is None:
+        return None
+    return account_mismatch_warning(process_owner(proc), daemon_user)
 
 
 # How long proc_stats() samples CPU for. cpu_percent measures work done over a
@@ -174,6 +259,67 @@ def _action_command(action: str, name: str) -> list[str]:
 def service_state(service_name: str) -> str:
     out = _run_capture(_state_command(service_name))
     return _parse_sc_state(out) if IS_WINDOWS else _parse_systemctl_state(out)
+
+
+# Windows records the *result of the last start attempt* in a service's
+# WIN32_EXIT_CODE. `sc query` prints it, but _parse_sc_state reads only the
+# STATE token and throws the code away — so a service that registered fine yet
+# can't START (the classic post-install permission failure) otherwise looks like
+# a plain STOPPED with no reason, and the daemon appears down for no visible
+# cause. These map the common start-failure codes to a fix the user can act on.
+SERVICE_START_ERRORS = {
+    1069: (
+        "Error 1069: the service's logon account was rejected. A PIN-only or "
+        "passwordless Windows account can't host a service logon — re-enter the "
+        "account password, or switch to password-free login startup "
+        "(palctl-daemon install-startup)."
+    ),
+    1053: "Error 1053: the service didn't respond to the start request in time.",
+    5: "Error 5: access denied — starting the service needs an administrator.",
+}
+
+
+def _parse_sc_exit_code(out: str) -> int | None:
+    """The WIN32_EXIT_CODE from `sc query` output (0 = clean), or None when the
+    line is absent/unparseable. The line reads e.g.
+    ``WIN32_EXIT_CODE    : 1069  (0x42d)`` — take the first token after the colon
+    (SERVICE_EXIT_CODE is a different line and never matches this substring)."""
+    for line in out.splitlines():
+        if "WIN32_EXIT_CODE" in line:
+            tail = line.split(":", 1)[-1].split()
+            if tail:
+                try:
+                    return int(tail[0])
+                except ValueError:
+                    return None
+    return None
+
+
+def service_failure_reason(service_name: str) -> str | None:
+    """A plain-language reason a Windows service is registered but not running,
+    read from the SCM's recorded start result. ``None`` off Windows, or when the
+    code is 0/unknown — so a caller appends it only when there's something real
+    to say, and never fabricates a problem on a healthy service."""
+    if not IS_WINDOWS:
+        return None
+    code = _parse_sc_exit_code(_run_capture(_state_command(service_name)))
+    if not code:
+        return None
+    return SERVICE_START_ERRORS.get(code, f"the service reported start error {code}.")
+
+
+def service_diagnostics(service_name: str) -> str:
+    """Raw service-manager status for a diagnostics bundle: `sc query` + `sc qc`
+    on Windows (qc shows the logon account and binary path — the two things a
+    permission/1069 report needs, and neither is a secret), or `systemctl status`
+    on Linux. Bounded and non-raising, like every call in this module."""
+    if IS_WINDOWS:
+        blocks = []
+        for cmd in (["sc.exe", "query", service_name], ["sc.exe", "qc", service_name]):
+            blocks.append(f"$ {' '.join(cmd)}\n{_run_capture(cmd) or '(no output)'}")
+        return "\n\n".join(blocks)
+    cmd = ["systemctl", "status", "--no-pager", service_name]
+    return f"$ {' '.join(cmd)}\n{_run_capture(cmd) or '(systemctl unavailable / no output)'}"
 
 
 # The async wrappers run every blocking subprocess call in a worker thread:

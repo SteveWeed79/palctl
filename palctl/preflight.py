@@ -111,14 +111,24 @@ def check_port_free(port: int, host: str = "127.0.0.1") -> Check:
         s.close()
 
 
-def check_admin() -> Check:
+def is_elevated() -> bool | None:
+    """Whether this process has administrator rights. ``True``/``False`` on
+    Windows; ``None`` off Windows or when it genuinely can't be determined.
+    Callers must treat ``None`` as "can't tell", never as a hard block — so a
+    non-Windows box (or a mocked-platform test where ``ctypes.windll`` isn't
+    real) is never wrongly refused a service install."""
     try:
         import ctypes
 
-        is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
     except (ImportError, AttributeError, OSError):
-        return Check("Administrator", None, "not applicable on this OS")
+        return None
 
+
+def check_admin() -> Check:
+    is_admin = is_elevated()
+    if is_admin is None:
+        return Check("Administrator", None, "not applicable on this OS")
     if is_admin:
         return Check("Administrator", True, "running elevated")
     return Check(

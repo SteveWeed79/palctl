@@ -262,6 +262,158 @@ def test_install_service_linux_stops_a_stray_daemon_but_not_the_units_own(monkey
     assert calls == ["install"]
 
 
+# ---------------- Windows service install: honest permission failures ----------------
+
+
+def test_install_service_windows_refuses_when_not_elevated(monkeypatch, capsys):
+    # The regression this closes: a non-elevated install let sc.exe/WinSW fail
+    # silently, waited out the reachability probe, and blamed the daemon. It now
+    # refuses up front, touching nothing (no download, no registration).
+    import palctl.preflight as preflight
+    import palctl.winservice as winservice
+
+    touched: list[str] = []
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+    monkeypatch.setattr(preflight, "is_elevated", lambda: False)
+    monkeypatch.setattr(winservice, "ensure_winsw", lambda d: touched.append("winsw"))
+    monkeypatch.setattr(
+        winservice, "install_service", lambda *a, **k: touched.append("register")
+    )
+
+    assert daemon_mod.install_service() is False
+    assert touched == []
+    assert "administrator" in capsys.readouterr().out.lower()
+
+
+def test_install_service_windows_reports_blocked_wrapper_download(monkeypatch, capsys):
+    # A proxy/AV/offline box blocking the WinSW download must be reported
+    # plainly, not crash with a traceback — and nothing gets registered.
+    import palctl.preflight as preflight
+    import palctl.startup as startup_mod
+    import palctl.winservice as winservice
+
+    registered: list[str] = []
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+    monkeypatch.setattr(preflight, "is_elevated", lambda: True)
+    monkeypatch.setattr(startup_mod, "uninstall_startup", lambda: None)
+    monkeypatch.setattr(
+        winservice, "ensure_winsw",
+        lambda d: (_ for _ in ()).throw(OSError("proxy blocked github.com")),
+    )
+    monkeypatch.setattr(
+        winservice, "install_service", lambda *a, **k: registered.append("x")
+    )
+
+    assert daemon_mod.install_service() is False
+    assert registered == []
+    out = capsys.readouterr().out.lower()
+    assert "download" in out and "github" in out
+
+
+def test_install_service_windows_surfaces_logon_failure(monkeypatch, capsys):
+    # Registered but the SCM won't start it (Error 1069 &c.): surface the real
+    # reason read from WIN32_EXIT_CODE, not a generic "not answering".
+    import palctl.preflight as preflight
+    import palctl.startup as startup_mod
+    import palctl.winservice as winservice
+
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+    monkeypatch.setattr(preflight, "is_elevated", lambda: True)
+    monkeypatch.setattr(startup_mod, "uninstall_startup", lambda: None)
+    monkeypatch.setattr(winservice, "ensure_winsw", lambda d: "winsw.exe")
+    monkeypatch.setattr(winservice, "install_service", lambda *a, **k: None)
+    monkeypatch.setattr(winservice, "start_service", lambda name: None)
+    monkeypatch.setattr(winservice, "service_exists", lambda name: True)
+    monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: False)
+    monkeypatch.setattr(  # single-shot wait so the test doesn't sit out 30s
+        daemon_mod, "_wait_until", lambda pred, timeout, interval=1.0: pred()
+    )
+    monkeypatch.setattr(
+        "palctl.procs.service_failure_reason",
+        lambda name: "Error 1069: the service's logon account was rejected.",
+    )
+
+    assert daemon_mod.install_service() is False
+    assert "1069" in capsys.readouterr().out
+
+
+def test_install_service_windows_reports_registration_blocked(monkeypatch, capsys):
+    # The service never registered (WinSW install itself refused): say that,
+    # rather than "registered but not answering".
+    import palctl.preflight as preflight
+    import palctl.startup as startup_mod
+    import palctl.winservice as winservice
+
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+    monkeypatch.setattr(preflight, "is_elevated", lambda: True)
+    monkeypatch.setattr(startup_mod, "uninstall_startup", lambda: None)
+    monkeypatch.setattr(winservice, "ensure_winsw", lambda d: "winsw.exe")
+    monkeypatch.setattr(winservice, "install_service", lambda *a, **k: None)
+    monkeypatch.setattr(winservice, "start_service", lambda name: None)
+    monkeypatch.setattr(winservice, "service_exists", lambda name: False)
+    monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: False)
+    monkeypatch.setattr(
+        daemon_mod, "_wait_until", lambda pred, timeout, interval=1.0: pred()
+    )
+
+    assert daemon_mod.install_service() is False
+    assert "did not get registered" in capsys.readouterr().out
+
+
+def test_install_service_windows_as_user_uses_passed_password(monkeypatch):
+    # Path A: the setup flow / GUI pass the Windows password in a field, so a
+    # user-account service registers non-interactively — never blocking on a
+    # getpass prompt the GUI can't answer.
+    import getpass
+
+    import palctl.preflight as preflight
+    import palctl.startup as startup_mod
+    import palctl.winservice as winservice
+
+    registered: dict = {}
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+    monkeypatch.setattr(preflight, "is_elevated", lambda: True)
+    monkeypatch.setattr(startup_mod, "uninstall_startup", lambda: None)
+    monkeypatch.setattr(winservice, "ensure_winsw", lambda d: "winsw.exe")
+    monkeypatch.setattr(
+        getpass, "getpass",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("prompted for a password")),
+    )
+
+    def fake_install(winsw, name, exe, args, app_dir, **kw):
+        registered.update(kw)
+
+    monkeypatch.setattr(winservice, "install_service", fake_install)
+    monkeypatch.setattr(winservice, "start_service", lambda name: None)
+    # The --as-user path waits for the service to reach RUNNING (its Error 1069
+    # guard); make it so, so we exercise the happy path.
+    monkeypatch.setattr("palctl.procs.service_state", lambda name: "RUNNING")
+    monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: True)
+    monkeypatch.setattr(daemon_mod, "_stop_daemon_process", lambda: None)
+    monkeypatch.setenv("USERNAME", "server sw")
+
+    assert daemon_mod.install_service(as_user=True, password="hunter2") is True
+    assert registered["user"] == ".\\server sw"
+    assert registered["password"] == "hunter2"
+
+
+def test_uninstall_service_windows_refuses_when_not_elevated(monkeypatch, capsys):
+    # Removing a service needs admin too; a refused sc delete must not print
+    # "removed" and leave the old registration in place.
+    import palctl.preflight as preflight
+    import palctl.winservice as winservice
+
+    removed: list[str] = []
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+    monkeypatch.setattr(winservice, "service_exists", lambda name: True)
+    monkeypatch.setattr(preflight, "is_elevated", lambda: False)
+    monkeypatch.setattr(winservice, "remove_service", lambda name: removed.append(name))
+
+    daemon_mod.uninstall_service()
+    assert removed == []
+    assert "administrator" in capsys.readouterr().out.lower()
+
+
 def test_disable_background_startup_removes_both_and_stops_the_daemon(monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(daemon_mod, "uninstall_startup", lambda: calls.append("runkey"))

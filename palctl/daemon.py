@@ -298,6 +298,9 @@ class Daemon:
         # is wrong (rotated out from under us, say) — NOT an outage. Warn once,
         # not every poll, and never let it drive down-detection/auto-recovery.
         self._auth_warned = False
+        # One-shot: warn if the server process runs under a different account
+        # than the daemon (the watchdog-blinding split — see _maybe_warn_account_mismatch).
+        self._account_warned = False
         # Wall-clock of the last completed poll, for the /healthz liveness probe.
         self._last_poll_at = 0.0
         # Set by a SIGTERM/SIGINT handler to unblock run() into graceful shutdown.
@@ -556,6 +559,7 @@ class Daemon:
         self._down_polls = 0
         self._api_fail_streak = 0
         self._auth_warned = False  # a good poll re-arms the password warning
+        await self._maybe_warn_account_mismatch()
 
         await self.tracker.update(players)
 
@@ -582,6 +586,28 @@ class Daemon:
         self._history.append(sample)
         del self._history[:-720]  # ~2h at 10s polling
         await asyncio.to_thread(self.store.log_metrics, sample)
+
+    async def _maybe_warn_account_mismatch(self) -> None:
+        """Once per daemon run: if the server process runs under a different
+        account than the daemon, say so loudly. That split is what makes the
+        watchdog watch the idle ~7 MB launcher instead of the real multi-GB
+        server — memory/CPU read wrong and the leak watchdog can never fire. The
+        fix is to run both under the same account (Path A: services as-user).
+        psutil enumeration runs off the event loop."""
+        if self._account_warned:
+            return
+        self._account_warned = True
+        import getpass
+
+        try:
+            warning = await asyncio.to_thread(
+                procs.server_account_mismatch, getpass.getuser()
+            )
+        except Exception:
+            warning = None
+        if warning:
+            self.log.warning("%s", warning)
+            await self.bus.emit(Event("error", "⚠️ " + warning))
 
     # ---------- crash / hang auto-recovery ----------
 
@@ -1179,7 +1205,7 @@ def _wait_until(predicate, timeout: float, interval: float = 1.0) -> bool:
         time.sleep(interval)
 
 
-def install_service(as_user: bool = False) -> bool:
+def install_service(as_user: bool = False, password: str | None = None) -> bool:
     """Register (and start) the palctl daemon as a service — WinSW on Windows,
     systemd on Linux. Returns whether the daemon is confirmed up afterward
     (its control port answering) — success is verified, never assumed.
@@ -1194,22 +1220,63 @@ def install_service(as_user: bool = False) -> bool:
     if sys.platform.startswith("win"):
         import getpass
 
-        from . import startup, winservice
+        from . import preflight, startup, winservice
 
-        user = password = None
+        # Registering a Windows service needs elevation. Without this gate a
+        # non-elevated `install-service` let sc.exe/WinSW fail silently, then
+        # waited out the 30s reachability probe and reported the WRONG cause
+        # ("registered but not answering") — the real reason (no admin) never
+        # surfaced. Fail fast with the actual fix. Only a definite False blocks;
+        # None (can't tell / not really Windows, e.g. a mocked-platform test)
+        # proceeds, so nothing that isn't genuinely unelevated is refused.
+        if preflight.is_elevated() is False:
+            print(
+                "[daemon] Registering a Windows service needs administrator "
+                "rights, but palctl isn't elevated.\n"
+                "         Re-launch from an admin console (right-click → Run as "
+                "administrator),\n"
+                "         or use password-free login startup instead (no admin, "
+                "no service):\n"
+                "             palctl-daemon install-startup"
+            )
+            return False
+
+        user = None
         if as_user:
             username = os.environ.get("USERNAME", "")
             user = f".\\{username}"
-            print(
-                f"[daemon] The service will log on as {user} so it shares your\n"
-                "         config, token, and saved secrets. Windows needs your\n"
-                "         account password to register that (palctl does not\n"
-                "         store it — it goes straight to the service manager)."
-            )
-            password = getpass.getpass(f"Password for {user}: ")
+            # A password passed in (the setup flow / GUI, which collect it in a
+            # field) is used as-is; only an interactive CLI run prompts for it.
+            if password is None:
+                print(
+                    f"[daemon] The service will log on as {user} so it shares your\n"
+                    "         config, token, and saved secrets. Windows needs your\n"
+                    "         account password to register that (palctl does not\n"
+                    "         store it — it goes straight to the service manager)."
+                )
+                password = getpass.getpass(f"Password for {user}: ")
+        else:
+            password = None  # LocalSystem — no account password
 
-        # Wrapper first: if the download fails, nothing has been touched yet.
-        winsw = winservice.ensure_winsw(config_dir() / "bin")
+        # Wrapper first: if the download fails, nothing has been touched yet. A
+        # blocked download (corporate proxy, antivirus, offline box) or a
+        # tampered binary must say so plainly, not crash with a traceback or
+        # leave the user staring at a service that never registered.
+        try:
+            winsw = winservice.ensure_winsw(config_dir() / "bin")
+        except winservice.WrapperChecksumError as e:
+            print(f"[daemon] {e}")
+            return False
+        except OSError as e:
+            print(
+                "[daemon] couldn't download the WinSW service wrapper from "
+                f"GitHub ({e}). A proxy, firewall, or antivirus may be blocking "
+                "github.com, or the box is offline. Fix the network and retry, "
+                "or use password-free login startup instead (no download, no "
+                "service):\n"
+                "             palctl-daemon install-startup"
+            )
+            return False
         # Switching FROM login startup: drop the Run key, or the next login
         # spawns a second daemon that fights this service over the control port.
         startup.uninstall_startup()
@@ -1271,6 +1338,30 @@ def install_service(as_user: bool = False) -> bool:
     if _wait_until(_daemon_reachable, timeout=30.0):
         print(f"[daemon] service '{SERVICE_NAME}' installed and started.")
         return True
+
+    # It didn't come up. Say WHY as specifically as we can rather than one
+    # catch-all line: the registration was blocked (nothing to answer with), or
+    # the service exists but the SCM refused to start it (a logon failure —
+    # Error 1069 &c.), or a genuine daemon startup error the console/journal
+    # will show.
+    if sys.platform.startswith("win"):
+        from . import winservice
+
+        if not winservice.service_exists(SERVICE_NAME):
+            print(
+                f"[daemon] the '{SERVICE_NAME}' service did not get registered — "
+                "the registration was blocked. Run this from an administrator "
+                "console (right-click → Run as administrator), or use "
+                "`palctl-daemon install-startup`."
+            )
+            return False
+        reason = procs.service_failure_reason(SERVICE_NAME)
+        if reason:
+            print(
+                f"[daemon] service '{SERVICE_NAME}' is registered but won't "
+                f"start — {reason}"
+            )
+            return False
     hint = (
         "run `palctl-daemon run` in a console to see the startup error"
         if sys.platform.startswith("win")
@@ -1286,12 +1377,23 @@ def install_service(as_user: bool = False) -> bool:
 
 def uninstall_service() -> None:
     if sys.platform.startswith("win"):
-        from . import winservice
+        from . import preflight, winservice
 
         # Removal goes through plain sc.exe — no wrapper download needed, and
         # it works on services registered by the old NSSM builds too.
         if not winservice.service_exists(SERVICE_NAME):
             print(f"[daemon] service '{SERVICE_NAME}' is not registered; nothing to remove.")
+            return
+        # Removing a service needs elevation too. Without this, sc.exe fails
+        # access-denied and this used to print "removed" anyway — leaving the
+        # old daemon registered (and, on a mode switch, fighting the new one for
+        # the port). Say the truth instead. Only a definite False blocks.
+        if preflight.is_elevated() is False:
+            print(
+                f"[daemon] removing the '{SERVICE_NAME}' service needs "
+                "administrator rights. Re-run from an admin console "
+                "(right-click → Run as administrator)."
+            )
             return
         winservice.remove_service(SERVICE_NAME)
         # Best-effort: drop the per-service wrapper copy + config so nothing in

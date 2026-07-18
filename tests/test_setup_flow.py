@@ -36,7 +36,10 @@ def env(tmp_path, monkeypatch):
         admin_passwords=[],
         discord_tokens=[],
         services_registered=[],
+        server_service_kwargs=None,   # user=/password= the game service registered with
         daemon_service=0,
+        daemon_service_as_user=None,  # how the daemon service was registered
+        daemon_service_password=None,
         login_startup=0,
         startup_disabled=0,
         rest_api=[],
@@ -105,13 +108,17 @@ def env(tmp_path, monkeypatch):
 
     # Service registration.
     monkeypatch.setattr("palctl.winservice.ensure_winsw", lambda d: tmp_path / "winsw.exe")
-    monkeypatch.setattr(
-        "palctl.winservice.install_service",
-        lambda *a, **k: rec.services_registered.append(a),
-    )
 
-    def _daemon_install_service():
+    def _winservice_install(*a, **k):
+        rec.services_registered.append(a)
+        rec.server_service_kwargs = k  # capture user=/password= for Path A checks
+
+    monkeypatch.setattr("palctl.winservice.install_service", _winservice_install)
+
+    def _daemon_install_service(as_user=False, password=None):
         rec.daemon_service += 1
+        rec.daemon_service_as_user = as_user
+        rec.daemon_service_password = password
         return True  # verified-up, like the real one reports
 
     def _daemon_install_startup():
@@ -206,6 +213,49 @@ def test_daemon_startup_permutations(
     # The choice is persisted, so a wizard re-run defaults to what the user
     # actually picked instead of silently switching back to login startup.
     assert Config.load().daemon_startup == startup
+
+
+def test_service_mode_with_password_registers_both_under_the_user(env):
+    # Path A: "service" mode + a Windows password registers BOTH the daemon and
+    # the game server under the invoking user, so palctl can read the server it
+    # watches (and its DPAPI secrets) instead of the SYSTEM/user split that
+    # silently blinds the watchdog.
+    plan = _plan(
+        env.tmp_path,
+        daemon_startup="service",
+        register_server_service=True,
+        service_password="hunter2",
+    )
+    server_root = Path(plan.server_root)
+    server_root.mkdir(parents=True, exist_ok=True)
+    (server_root / "PalServer.exe").write_text("x", encoding="utf-8")
+
+    result, _ = env.run(plan)
+    assert result.ok is True
+    # Daemon: registered as the user, password passed straight through (no prompt).
+    assert env.daemon_service_as_user is True
+    assert env.daemon_service_password == "hunter2"
+    # Game service: registered under a user account too.
+    assert env.server_service_kwargs.get("user")  # .\<username>
+    assert env.server_service_kwargs.get("password") == "hunter2"
+
+
+def test_service_mode_without_password_stays_localsystem(env):
+    # No password → the old LocalSystem behaviour is preserved (the daemon's
+    # runtime account-mismatch warning then nudges the user toward Path A).
+    plan = _plan(
+        env.tmp_path,
+        daemon_startup="service",
+        register_server_service=True,
+    )
+    server_root = Path(plan.server_root)
+    server_root.mkdir(parents=True, exist_ok=True)
+    (server_root / "PalServer.exe").write_text("x", encoding="utf-8")
+
+    result, _ = env.run(plan)
+    assert result.ok is True
+    assert env.daemon_service_as_user is False
+    assert env.server_service_kwargs.get("user") is None
 
 
 # ---------------- elevation requirements ----------------

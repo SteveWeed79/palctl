@@ -125,6 +125,43 @@ Installers for every release are on the
   can assert the outcome.
 
 ### Fixed
+- **The memory-leak watchdog no longer goes blind when the server runs under a
+  different Windows account than palctl.** In the common setup — PalServer as a
+  LocalSystem service, the daemon under your login user — palctl couldn't read
+  the real multi-GB `PalServer-Win64-Shipping.exe` and silently fell back to the
+  ~7 MB bootstrap launcher: memory read near-zero, CPU read 0%, and the watchdog
+  could *never* fire (this is what three rounds of "CPU reads 0%" fixes were
+  really chasing). `find_process()` now follows the launcher to the real server
+  it spawned, even when the server's name can't be read across the privilege
+  boundary; and the daemon warns once — in the log and the event feed — when the
+  server and daemon run under different accounts, naming the fix.
+- **One clean install path: palctl *and* the game server under your user
+  account ("Path A").** The "Run as a Windows service" option now registers both
+  services under the invoking account (with a Windows-password field in the
+  setup wizard), so they share one account — the watchdog can read the server,
+  the Discord bot's DPAPI token stays readable, and both start at boot. This
+  replaces the old lose-lose choice between a login-startup daemon that can't
+  watch a SYSTEM server and a LocalSystem service that can't run the Discord bot.
+- **A failed Windows service install now says *why* instead of a misleading
+  catch-all.** `palctl-daemon install-service` used to let `sc.exe`/WinSW fail
+  silently when not elevated, wait out a 30-second probe, and then blame the
+  daemon ("registered, but not answering") for what was really a permissions
+  problem — so a service that never registered looked like a broken daemon. It
+  now checks for administrator rights up front and refuses fast with the fix
+  (run elevated, or use `palctl-daemon install-startup`); reports a blocked or
+  tampered WinSW download plainly instead of crashing with a traceback; and,
+  when the service registered but the SCM won't start it, surfaces the actual
+  reason — including **Error 1069** (a PIN-only/passwordless account can't host
+  a service logon), read from the `WIN32_EXIT_CODE` the status parser used to
+  discard. `uninstall-service` likewise no longer prints "removed" when a
+  non-elevated `sc delete` was refused.
+- **The diagnostics bundle now captures Windows service state.** A "daemon won't
+  start" report is only diagnosable off-box if it shows *why*: the bundle now
+  includes `sc query`/`sc qc` (the service's state, logon account, and binary
+  path — no secrets) and any start-failure reason, so a service stuck on a logon
+  failure or running under the wrong account is visible in the zip instead of
+  looking like an unexplained down daemon. On Linux it captures `systemctl
+  status`.
 - **The settings editor gives fixed-choice options real pickers instead of a
   text box.** Palworld writes its enum settings as bare words, so the editor
   couldn't tell them from free text and showed `Difficulty`, `DeathPenalty`,

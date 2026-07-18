@@ -26,6 +26,33 @@ def test_bundle_contains_logs_config_and_summary(tmp_path, monkeypatch):
     assert "palctl diagnostics" in summary
 
 
+def test_bundle_includes_service_state(tmp_path, monkeypatch):
+    # A "daemon won't start" report is only diagnosable off-box if the bundle
+    # shows the service state, its logon account, and any start-failure reason.
+    import palctl.procs as procs
+
+    cfgdir = tmp_path / "palctl"
+    (cfgdir / "logs").mkdir(parents=True)
+    monkeypatch.setattr(diag, "config_dir", lambda: cfgdir)
+    monkeypatch.setattr(diag, "CONFIG_PATH", cfgdir / "config.json")
+    monkeypatch.setattr(procs, "service_state", lambda n: "STOPPED")
+    monkeypatch.setattr(
+        procs, "service_failure_reason",
+        lambda n: "Error 1069: logon rejected" if n == "palctl-daemon" else None,
+    )
+    monkeypatch.setattr(
+        procs, "service_diagnostics", lambda n: "$ sc qc\nSERVICE_START_NAME : .\\steve",
+    )
+
+    out = diag.build_bundle(tmp_path / "d.zip")
+    with zipfile.ZipFile(out) as z:
+        assert "services.txt" in z.namelist()
+        txt = z.read("services.txt").decode("utf-8")
+    assert "palctl-daemon" in txt
+    assert "1069" in txt
+    assert "SERVICE_START_NAME" in txt
+
+
 def test_bundle_ok_with_nothing_to_include(tmp_path, monkeypatch):
     cfgdir = tmp_path / "empty"
     cfgdir.mkdir()
