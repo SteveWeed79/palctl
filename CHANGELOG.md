@@ -62,7 +62,35 @@ Installers for every release are on the
   anything past a trusted LAN, an SSH tunnel or Tailscale still authenticates
   and encrypts the connection.
 
+### Changed
+- **The Windows service wrapper is now WinSW instead of NSSM.** NSSM's last
+  release was 2014 and it is unmaintained; WinSW (the wrapper Jenkins ships) is
+  maintained and configured *declaratively* — the whole service definition
+  lives in one XML file that is rewritten on every install, so the bug class
+  where a re-install inherited stale per-setting state (an old service account,
+  old launch arguments) is structurally impossible. WinSW also grants the "Log
+  on as a service" right itself when registering under a user account, removing
+  one cause of Error 1069. The download stays SHA-256-pinned like NSSM's was;
+  service removal and start/stop now go through plain `sc.exe`, which also
+  means uninstalling no longer needs to download anything, and services
+  registered by older NSSM-based palctl versions are migrated cleanly on the
+  next install. The install CLI commands (`install-service`,
+  `install-startup`) now exit nonzero on a verified failure, so scripts and CI
+  can assert the outcome.
+
 ### Fixed
+- **The install verifies what it claims, instead of assuming.** "Installed and
+  started" used to print no matter what the service manager actually did (every
+  `systemctl`/`nssm` exit code was ignored), and login startup reported
+  "running now" the instant the process was spawned. Now the daemon install
+  only claims success once the daemon's own control port answers — on any
+  platform — and otherwise says exactly where to look (`palctl-daemon run` in a
+  console on Windows, `systemctl status`/`journalctl` on Linux). The re-install
+  also sequences the Windows service manager properly: wait for the old service
+  to actually stop before removing it, and for the removal to actually land
+  before re-registering the name — a service left "pending deletion" (something
+  holding a handle, e.g. an open services.msc) is now reported with its cause
+  instead of being silently configured as a zombie.
 - **Switching how palctl starts in the background now cleans up the old mode.**
   Re-running setup with a different background-startup choice used to leave the
   previous mechanism behind: picking the Windows service kept the login Run key

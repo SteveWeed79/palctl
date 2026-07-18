@@ -2,7 +2,7 @@
 Rotating file + console logging.
 
 Palworld's dedicated server ships no log file, and until now the daemon only
-printed to whatever NSSM happened to capture. When a server misbehaves at 2am —
+printed to whatever the service wrapper happened to capture. When a server misbehaves at 2am —
 a watchdog restart that didn't come back, a SteamCMD update that failed halfway —
 you want a trail to read the next morning. This writes one to
 ``%APPDATA%/palctl/logs/palctl.log`` and rotates it so it can't grow without

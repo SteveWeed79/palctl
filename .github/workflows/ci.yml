@@ -32,6 +32,78 @@ jobs:
         run: pip install audioop-lts
       - run: pytest -v
 
+  install-lifecycle:
+    # Exercises the REAL install state machine against a real Windows SCM — the
+    # one thing the unit tests cannot do (they fake WinSW/sc/systemd). Covers
+    # the transitions that historically broke: fresh install, reinstall over a
+    # RUNNING daemon (must replace it, not no-op), switching service → login
+    # startup (must remove the service and keep exactly one daemon), and full
+    # removal. Also re-downloads WinSW and checks it against the pinned SHA-256,
+    # so the pin is re-verified from independent infrastructure on every run.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: pip install httpx psutil keyring aiohttp discord.py
+      - name: Verify the pinned WinSW hash against the release bytes
+        shell: pwsh
+        run: |
+          $url = python -c "from palctl.winservice import WINSW_URL; print(WINSW_URL)"
+          $pinned = python -c "from palctl.winservice import WINSW_SHA256; print(WINSW_SHA256.lower())"
+          Invoke-WebRequest -Uri $url -OutFile winsw-pin-check.exe
+          $actual = (Get-FileHash winsw-pin-check.exe -Algorithm SHA256).Hash.ToLower()
+          Write-Host "downloaded: $actual"
+          Write-Host "pinned:     $pinned"
+          if ($actual -ne $pinned) { throw "WINSW_SHA256 pin does not match the release asset" }
+      - name: Fresh service install (must come up verified)
+        shell: pwsh
+        run: |
+          python -m palctl.daemon install-service
+          if ($LASTEXITCODE -ne 0) { throw "fresh install-service failed" }
+          sc.exe query palctl-daemon
+          if ($LASTEXITCODE -ne 0) { throw "service not registered after install" }
+          $daemonPid = @((Get-NetTCPConnection -LocalPort 8830 -State Listen).OwningProcess)[0]
+          "DAEMON_PID=$daemonPid" >> $env:GITHUB_ENV
+          exit 0
+      - name: Reinstall over the RUNNING daemon (must replace it)
+        shell: pwsh
+        run: |
+          python -m palctl.daemon install-service
+          if ($LASTEXITCODE -ne 0) { throw "reinstall over a running daemon failed" }
+          $newPid = @((Get-NetTCPConnection -LocalPort 8830 -State Listen).OwningProcess)[0]
+          if ("$newPid" -eq "$env:DAEMON_PID") {
+            throw "reinstall did NOT replace the running daemon (still PID $newPid)"
+          }
+          exit 0
+      - name: Switch to login startup (removes the service, replaces the daemon)
+        shell: pwsh
+        run: |
+          python -m palctl.daemon install-startup
+          if ($LASTEXITCODE -ne 0) { throw "install-startup failed" }
+          sc.exe query palctl-daemon
+          if ($LASTEXITCODE -eq 0) { throw "service registration survived the switch to login startup" }
+          reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v palctl-daemon
+          if ($LASTEXITCODE -ne 0) { throw "Run key missing after install-startup" }
+          if (-not (Get-NetTCPConnection -LocalPort 8830 -State Listen -ErrorAction SilentlyContinue)) {
+            throw "no daemon answering after the switch"
+          }
+          exit 0
+      - name: Full removal (nothing left registered or running)
+        shell: pwsh
+        run: |
+          python -m palctl.daemon uninstall-startup
+          reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v palctl-daemon
+          if ($LASTEXITCODE -eq 0) { throw "Run key survived uninstall-startup" }
+          python -c "from palctl import daemon; daemon._stop_daemon_process()"
+          Start-Sleep -Seconds 2
+          if (Get-NetTCPConnection -LocalPort 8830 -State Listen -ErrorAction SilentlyContinue) {
+            throw "daemon still listening after removal"
+          }
+          exit 0
+
   lint:
     runs-on: ubuntu-latest
     steps:

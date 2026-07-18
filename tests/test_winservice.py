@@ -1,156 +1,205 @@
-"""NSSM registration is Windows-only, but the command sequence and the archive
-layout logic are the parts that go wrong silently, so those are pinned here."""
+"""WinSW registration is Windows-only, but the config XML and the command
+sequencing are the parts that go wrong silently, so those are pinned here."""
 
 import hashlib
 import io
-import zipfile
 from pathlib import Path
 
 import pytest
 
 from palctl import winservice
 
+# ---------- the declarative service definition ----------
 
-def test_install_commands_full():
-    cmds = winservice.install_commands(
-        "nssm.exe", "palctl-daemon", r"C:\app\palctl-daemon.exe",
+
+def test_config_xml_full():
+    xml = winservice.winsw_config_xml(
+        "palctl-daemon", r"C:\app\palctl-daemon.exe",
         args="-m palctl.daemon", app_dir=r"C:\app",
     )
-    assert cmds[0] == ["nssm.exe", "install", "palctl-daemon", r"C:\app\palctl-daemon.exe"]
-    joined = [" ".join(c) for c in cmds]
-    # Application is set explicitly so a re-install can repair a wrong exe path.
-    assert ["nssm.exe", "set", "palctl-daemon", "Application", r"C:\app\palctl-daemon.exe"] in cmds
-    assert any("AppParameters" in j and "palctl.daemon" in j for j in joined)
-    assert any("AppDirectory" in j for j in joined)
-    # Auto-start is always configured, and last.
-    assert cmds[-1] == ["nssm.exe", "set", "palctl-daemon", "Start", "SERVICE_AUTO_START"]
+    assert "<id>palctl-daemon</id>" in xml
+    assert r"<executable>C:\app\palctl-daemon.exe</executable>" in xml
+    assert "<arguments>-m palctl.daemon</arguments>" in xml
+    assert r"<workingdirectory>C:\app</workingdirectory>" in xml
+    # Auto-start and keep-alive are always configured — the whole point of a
+    # service (parity with the systemd unit's Restart=on-failure).
+    assert "<startmode>Automatic</startmode>" in xml
+    assert '<onfailure action="restart"' in xml
 
 
-def test_install_commands_minimal_still_sets_autostart():
-    cmds = winservice.install_commands("nssm.exe", "svc", "svc.exe")
-    assert cmds[0] == ["nssm.exe", "install", "svc", "svc.exe"]
-    assert ["nssm.exe", "set", "svc", "Application", "svc.exe"] in cmds
-    assert ["nssm.exe", "set", "svc", "Start", "SERVICE_AUTO_START"] in cmds
-    # No args and no app_dir -> install + the Application set + the autostart set.
-    assert len(cmds) == 3
+def test_config_xml_minimal_omits_optional_fields():
+    xml = winservice.winsw_config_xml("svc", "svc.exe")
+    assert "<arguments>" not in xml
+    assert "<workingdirectory>" not in xml
+    assert "<serviceaccount>" not in xml
+    assert "APPDATA" not in xml
+    assert "<description>svc</description>" in xml  # falls back to the name
 
 
-def test_nssm_exe_in_prefers_arch(tmp_path: Path):
-    for arch in ("win32", "win64"):
-        d = tmp_path / "nssm-2.24" / arch
-        d.mkdir(parents=True)
-        (d / "nssm.exe").write_bytes(b"MZ")
-
-    got64 = winservice.nssm_exe_in(tmp_path, win64=True)
-    assert got64 is not None and got64.parent.name == "win64"
-    got32 = winservice.nssm_exe_in(tmp_path, win64=False)
-    assert got32 is not None and got32.parent.name == "win32"
-
-
-def test_nssm_exe_in_falls_back_to_any(tmp_path: Path):
-    d = tmp_path / "weird"
-    d.mkdir()
-    (d / "nssm.exe").write_bytes(b"MZ")
-    assert winservice.nssm_exe_in(tmp_path, win64=True) is not None
-
-
-def test_nssm_exe_in_none_when_absent(tmp_path: Path):
-    assert winservice.nssm_exe_in(tmp_path) is None
-
-
-def test_install_commands_as_user_sets_objectname():
-    cmds = winservice.install_commands(
-        "nssm.exe", "svc", "svc.exe", user=r".\steve", password="hunter2",
+def test_config_xml_as_user_sets_serviceaccount_and_logon_right():
+    xml = winservice.winsw_config_xml(
+        "svc", "svc.exe", user=r".\steve", password="hunter2",
     )
-    assert ["nssm.exe", "set", "svc", "ObjectName", r".\steve", "hunter2"] in cmds
+    assert r"<username>.\steve</username>" in xml
+    assert "<password>hunter2</password>" in xml
+    # WinSW grants "Log on as a service" itself — one less 1069 cause.
+    assert "<allowservicelogon>true</allowservicelogon>" in xml
 
 
-def test_install_commands_localsystem_redirects_appdata():
+def test_config_xml_localsystem_redirects_appdata():
     # Without a user account, the service stays LocalSystem — whose %APPDATA%
     # is NOT the installing user's. The redirect keeps daemon and GUI reading
     # the same config, token, and logs.
-    cmds = winservice.install_commands(
-        "nssm.exe", "svc", "svc.exe", appdata=r"C:\Users\steve\AppData\Roaming",
+    xml = winservice.winsw_config_xml(
+        "svc", "svc.exe", appdata=r"C:\Users\steve\AppData\Roaming",
     )
-    assert [
-        "nssm.exe", "set", "svc", "AppEnvironmentExtra",
-        r"APPDATA=C:\Users\steve\AppData\Roaming",
-    ] in cmds
+    assert r'<env name="APPDATA" value="C:\Users\steve\AppData\Roaming"/>' in xml
 
 
-def test_install_commands_user_wins_over_appdata_redirect():
+def test_config_xml_user_wins_over_appdata_redirect():
     # Running AS the user makes the redirect pointless — never set both.
-    cmds = winservice.install_commands(
-        "nssm.exe", "svc", "svc.exe",
+    xml = winservice.winsw_config_xml(
+        "svc", "svc.exe",
         user=r".\steve", password="pw", appdata=r"C:\Users\steve\AppData\Roaming",
     )
-    joined = [" ".join(c) for c in cmds]
-    assert any("ObjectName" in j for j in joined)
-    assert not any("AppEnvironmentExtra" in j for j in joined)
+    assert "<serviceaccount>" in xml
+    assert "APPDATA" not in xml
 
 
-def test_install_service_replaces_an_existing_registration(monkeypatch):
-    # A re-install must be stop → remove → register → start, not an in-place
-    # patch: `nssm install` no-ops on an existing service and the `set` calls
-    # only overwrite what THIS install specifies, so stale settings (old
-    # AppParameters, an old ObjectName account) would survive — and `nssm
-    # start` no-ops on a running service, leaving the OLD process up.
+def test_config_xml_escapes_markup_in_values():
+    # A password (or path) containing XML metacharacters must not corrupt the
+    # config — a service silently registered with the wrong password is the
+    # 1069 bug with extra steps.
+    xml = winservice.winsw_config_xml(
+        "svc", "svc.exe", user=r".\s", password='p<&>"w',
+    )
+    assert "<password>p&lt;&amp;&gt;\"w</password>" in xml
+
+
+def test_wrapper_paths_pair_by_basename(tmp_path: Path):
+    exe, xml = winservice.wrapper_paths(tmp_path, "palctl-daemon")
+    # WinSW v2 finds its config by the exe's basename — they must match.
+    assert exe.stem == xml.stem
+    assert exe.suffix == ".exe" and xml.suffix == ".xml"
+    assert exe.parent == tmp_path
+
+
+# ---------- install/remove sequencing ----------
+
+
+def _install_env(monkeypatch, tmp_path: Path, *, exists: bool):
+    """A fake SCM: records commands, flips service existence on `sc delete`."""
+    calls: list[list[str]] = []
+    state = {"exists": exists}
+
+    def run(cmd):
+        calls.append(cmd)
+        if cmd[:2] == ["sc.exe", "delete"]:
+            state["exists"] = False
+
+    monkeypatch.setattr(winservice, "_run", run)
+    monkeypatch.setattr(winservice, "service_exists", lambda name: state["exists"])
+    monkeypatch.setattr("palctl.procs.service_state", lambda name: "STOPPED")
+    winsw = tmp_path / "winsw.exe"
+    winsw.write_bytes(b"MZ-winsw")
+    return calls, winsw
+
+
+def test_install_service_replaces_an_existing_registration(monkeypatch, tmp_path):
+    # A re-install must be stop → delete → register → start, and the config is
+    # rewritten whole — so nothing stale (old args, old account) can survive
+    # from the previous registration, by construction.
+    calls, winsw = _install_env(monkeypatch, tmp_path, exists=True)
+
+    winservice.install_service(
+        winsw, "palctl-daemon", "svc.exe", args="-m palctl.daemon",
+    )
+
+    svc_exe, svc_xml = winservice.wrapper_paths(tmp_path, "palctl-daemon")
+    stop = ["sc.exe", "stop", "palctl-daemon"]
+    delete = ["sc.exe", "delete", "palctl-daemon"]
+    register = [str(svc_exe), "install"]
+    start = [str(svc_exe), "start"]
+    assert (
+        calls.index(stop)
+        < calls.index(delete)
+        < calls.index(register)
+        < calls.index(start)
+    )
+    # The wrapper copy and the whole-truth config were (re)written.
+    assert svc_exe.read_bytes() == b"MZ-winsw"
+    assert "<arguments>-m palctl.daemon</arguments>" in svc_xml.read_text()
+
+
+def test_install_service_raises_when_old_registration_wont_die(monkeypatch, tmp_path):
+    # The SCM keeps a removed service "pending deletion" while anything holds a
+    # handle to it, and re-creating the name then fails. Surface that with the
+    # cause instead of silently configuring a zombie registration.
     calls: list[list[str]] = []
     monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))
     monkeypatch.setattr(winservice, "service_exists", lambda name: True)
-
-    winservice.install_service("nssm.exe", "palctl-daemon", "svc.exe")
-
-    stop = ["nssm.exe", "stop", "palctl-daemon"]
-    remove = ["nssm.exe", "remove", "palctl-daemon", "confirm"]
-    install = ["nssm.exe", "install", "palctl-daemon", "svc.exe"]
-    start = ["nssm.exe", "start", "palctl-daemon"]
-    assert (
-        calls.index(stop)
-        < calls.index(remove)
-        < calls.index(install)
-        < calls.index(start)
+    monkeypatch.setattr("palctl.procs.service_state", lambda name: "STOPPED")
+    monkeypatch.setattr(  # single-shot wait so the test doesn't sit out the timeout
+        winservice, "_wait_for", lambda pred, timeout, interval=1.0: pred()
     )
+    winsw = tmp_path / "winsw.exe"
+    winsw.write_bytes(b"MZ-winsw")
+
+    with pytest.raises(RuntimeError, match="pending deletion"):
+        winservice.install_service(winsw, "svc", "svc.exe")
 
 
-def test_install_service_fresh_registration_skips_removal(monkeypatch):
-    calls: list[list[str]] = []
-    monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))
-    monkeypatch.setattr(winservice, "service_exists", lambda name: False)
+def test_install_service_fresh_registration_skips_removal(monkeypatch, tmp_path):
+    calls, winsw = _install_env(monkeypatch, tmp_path, exists=False)
 
-    winservice.install_service("nssm.exe", "svc", "svc.exe")
+    winservice.install_service(winsw, "svc", "svc.exe")
 
-    assert not any(c[1:2] == ["stop"] for c in calls)
-    assert not any(c[1:2] == ["remove"] for c in calls)
-    assert ["nssm.exe", "start", "svc"] in calls
-
-
-def test_start_service_runs_nssm_start(monkeypatch):
-    calls: list[list[str]] = []
-    monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))
-    winservice.start_service("nssm.exe", "svc")
-    assert calls == [["nssm.exe", "start", "svc"]]
+    assert not any(c[:2] == ["sc.exe", "stop"] for c in calls)
+    assert not any(c[:2] == ["sc.exe", "delete"] for c in calls)
+    svc_exe, _ = winservice.wrapper_paths(tmp_path, "svc")
+    assert [str(svc_exe), "start"] in calls
 
 
-def test_install_service_start_false_skips_start(monkeypatch):
-    calls: list[list[str]] = []
-    monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))
-    monkeypatch.setattr(winservice, "service_exists", lambda name: False)
+def test_install_service_start_false_skips_start(monkeypatch, tmp_path):
+    calls, winsw = _install_env(monkeypatch, tmp_path, exists=False)
 
-    winservice.install_service("nssm.exe", "svc", "svc.exe", start=False)
+    winservice.install_service(winsw, "svc", "svc.exe", start=False)
 
     assert not any(c[1:2] == ["start"] for c in calls)
 
 
-# ---------- NSSM download checksum pin ----------
+def test_start_service_uses_plain_scm(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))
+    winservice.start_service("svc")
+    assert calls == [["sc.exe", "start", "svc"]]
 
 
-def _nssm_zip_bytes() -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("nssm-2.24/win32/nssm.exe", b"MZ-fake-32")
-        z.writestr("nssm-2.24/win64/nssm.exe", b"MZ-fake-64")
-    return buf.getvalue()
+def test_remove_service_stops_waits_then_deletes(monkeypatch):
+    # sc.exe works on ANY service — including NSSM-era registrations — so
+    # upgrades migrate without the old wrapper. The wait between stop and
+    # delete is what prevents the "pending deletion" zombie.
+    calls: list[list[str]] = []
+    monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))
+    monkeypatch.setattr("palctl.procs.service_state", lambda name: "STOPPED")
+
+    winservice.remove_service("svc")
+
+    assert calls == [["sc.exe", "stop", "svc"], ["sc.exe", "delete", "svc"]]
+
+
+def test_wait_for_polls_until_true(monkeypatch):
+    monkeypatch.setattr(winservice.time, "sleep", lambda s: None)
+    vals = iter([False, False, True])
+    assert winservice._wait_for(lambda: next(vals), timeout=60.0) is True
+
+
+def test_wait_for_times_out(monkeypatch):
+    monkeypatch.setattr(winservice.time, "sleep", lambda s: None)
+    assert winservice._wait_for(lambda: False, timeout=0.0) is False
+
+
+# ---------- WinSW download checksum pin ----------
 
 
 def _fake_download(monkeypatch, data: bytes):
@@ -160,25 +209,31 @@ def _fake_download(monkeypatch, data: bytes):
     )
 
 
-def test_pinned_nssm_sha256_is_well_formed():
+def test_pinned_winsw_sha256_is_well_formed():
     # A typo in the pin would refuse every real download — guard the literal.
-    assert len(winservice.NSSM_SHA256) == 64
-    int(winservice.NSSM_SHA256, 16)  # all hex
+    assert len(winservice.WINSW_SHA256) == 64
+    int(winservice.WINSW_SHA256, 16)  # all hex
 
 
-def test_ensure_nssm_unpacks_a_matching_download(tmp_path: Path, monkeypatch):
-    data = _nssm_zip_bytes()
+def test_ensure_winsw_caches_a_matching_download(tmp_path: Path, monkeypatch):
+    data = b"MZ-fake-winsw"
     _fake_download(monkeypatch, data)
     good = hashlib.sha256(data).hexdigest()
-    out = winservice.ensure_nssm(tmp_path / "cache", sha256=good)
-    assert out.exists() and out.name == "nssm.exe"
-    assert out.read_bytes() == b"MZ-fake-64"  # win64 preferred
+    out = winservice.ensure_winsw(tmp_path / "cache", sha256=good)
+    assert out.exists() and out.name == "winsw.exe"
+    assert out.read_bytes() == data
+    # Second call reuses the cache — no download.
+    monkeypatch.setattr(
+        winservice.urllib.request, "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-downloaded")),
+    )
+    assert winservice.ensure_winsw(tmp_path / "cache", sha256=good) == out
 
 
-def test_ensure_nssm_refuses_a_tampered_download(tmp_path: Path, monkeypatch):
-    _fake_download(monkeypatch, _nssm_zip_bytes())
+def test_ensure_winsw_refuses_a_tampered_download(tmp_path: Path, monkeypatch):
+    _fake_download(monkeypatch, b"MZ-fake-winsw")
     cache = tmp_path / "cache"
-    with pytest.raises(winservice.NssmChecksumError):
-        winservice.ensure_nssm(cache, sha256="0" * 64)
+    with pytest.raises(winservice.WrapperChecksumError):
+        winservice.ensure_winsw(cache, sha256="f" * 64)
     # Nothing unverified was left on disk as the usable binary.
-    assert not (cache / "nssm.exe").exists()
+    assert not (cache / "winsw.exe").exists()

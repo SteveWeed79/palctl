@@ -34,7 +34,7 @@ ruff check palctl tests
 
 The test suite covers the **platform-neutral core** — the ini parser, backups,
 sessions, config, scheduler, path detection, the SteamCMD argv/ini-guard, the
-NSSM command builders, and the REST-API bootstrap — and runs on any OS. The
+service config builder, and the REST-API bootstrap — and runs on any OS. The
 daemon's actual service control, the real network downloads, and the PySide6 GUI
 need Windows and aren't in CI, so exercise those by hand on a Windows box when
 you touch them.
@@ -59,7 +59,7 @@ elsewhere.
 - Fleet / multi-server management built on the `profiles` module groundwork
   (named Config snapshots and an active-profile pointer already exist).
 - Integrity verification for the downloaded binaries — a pinned checksum or
-  Authenticode check for SteamCMD, NSSM, and the VC++ redistributable (today
+  Authenticode check for SteamCMD, WinSW, and the VC++ redistributable (today
   they're fetched over TLS with no post-download verification).
 - Broader tests around the daemon's leak-forecaster and crash-auto-recovery
   decision helpers (`autorecover_phase` / `should_recover_now` are pure).

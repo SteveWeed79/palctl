@@ -104,7 +104,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr("palctl.backups.create", _backup)
 
     # Service registration.
-    monkeypatch.setattr("palctl.winservice.ensure_nssm", lambda d: tmp_path / "nssm.exe")
+    monkeypatch.setattr("palctl.winservice.ensure_winsw", lambda d: tmp_path / "winsw.exe")
     monkeypatch.setattr(
         "palctl.winservice.install_service",
         lambda *a, **k: rec.services_registered.append(a),
@@ -112,6 +112,7 @@ def env(tmp_path, monkeypatch):
 
     def _daemon_install_service():
         rec.daemon_service += 1
+        return True  # verified-up, like the real one reports
 
     def _daemon_install_startup():
         rec.login_startup += 1

@@ -208,8 +208,8 @@ def test_install_service_windows_clears_login_startup_and_stray_daemon(monkeypat
     # Switching login startup → service: the Run key must go (or the next
     # login spawns a rival daemon), and a surviving login-startup daemon must
     # be stopped BETWEEN registration and start — otherwise the service daemon
-    # can't bind the control port and NSSM restart-loops it while the old
-    # daemon keeps serving.
+    # can't bind the control port and the wrapper restart-loops it while the
+    # old daemon keeps serving.
     import palctl.startup as startup_mod
     import palctl.winservice as winservice
 
@@ -217,20 +217,18 @@ def test_install_service_windows_clears_login_startup_and_stray_daemon(monkeypat
     registered_kwargs: dict = {}
     monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
     monkeypatch.setattr(startup_mod, "uninstall_startup", lambda: calls.append("runkey"))
-    monkeypatch.setattr(winservice, "ensure_nssm", lambda d: "nssm.exe")
+    monkeypatch.setattr(winservice, "ensure_winsw", lambda d: "winsw.exe")
 
-    def fake_install(nssm, name, exe, args, app_dir, **kw):
+    def fake_install(winsw, name, exe, args, app_dir, **kw):
         registered_kwargs.update(kw)
         calls.append("register")
 
     monkeypatch.setattr(winservice, "install_service", fake_install)
-    monkeypatch.setattr(
-        winservice, "start_service", lambda nssm, name: calls.append("start")
-    )
+    monkeypatch.setattr(winservice, "start_service", lambda name: calls.append("start"))
     monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: True)
     monkeypatch.setattr(daemon_mod, "_stop_daemon_process", lambda: calls.append("stop"))
 
-    daemon_mod.install_service()
+    assert daemon_mod.install_service() is True  # verified: the port answers
 
     assert calls == ["runkey", "register", "stop", "start"]
     assert registered_kwargs["start"] is False  # nothing starts before the port is clear
@@ -252,12 +250,12 @@ def test_install_service_linux_stops_a_stray_daemon_but_not_the_units_own(monkey
     monkeypatch.setattr(daemon_mod, "_stop_daemon_process", lambda: calls.append("stop"))
 
     monkeypatch.setattr(systemd, "is_active", lambda name: False)  # a stray
-    daemon_mod.install_service()
+    assert daemon_mod.install_service() is True
     assert calls == ["stop", "install"]
 
     calls.clear()
     monkeypatch.setattr(systemd, "is_active", lambda name: True)  # the unit's own
-    daemon_mod.install_service()
+    assert daemon_mod.install_service() is True
     assert calls == ["install"]
 
 
@@ -296,7 +294,12 @@ def _startup_env(monkeypatch, *, service: bool, reachable: bool) -> list[str]:
         state["service"] = False
 
     monkeypatch.setattr(daemon_mod, "uninstall_service", _uninstall)
-    monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: reachable)
+    # Before the spawn the port answers (or not) per the scenario; after the
+    # spawn the new daemon comes up, so start_detached's verification sees it.
+    monkeypatch.setattr(
+        daemon_mod, "_daemon_reachable",
+        lambda: True if "spawn" in calls else reachable,
+    )
     monkeypatch.setattr(daemon_mod, "_stop_daemon_process", lambda: calls.append("stop"))
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: calls.append("spawn"))
     return calls
@@ -317,7 +320,7 @@ def test_start_detached_fresh_spawn_touches_nothing(monkeypatch):
 
 
 def test_start_detached_aborts_when_service_removal_fails(monkeypatch):
-    # Unelevated: nssm remove fails and the service stays registered. Killing
+    # Unelevated: the service removal fails and it stays registered. Killing
     # the daemon would just get it resurrected by the service manager, and a
     # fresh spawn would lose the port fight to it — report failure (with the
     # admin-prompt fix printed) instead of pretending it worked.
@@ -334,6 +337,18 @@ def test_start_detached_noop_off_windows(monkeypatch):
     monkeypatch.setattr(daemon_mod.sys, "platform", "linux")
     assert daemon_mod.start_detached() is False
     assert calls == []
+
+
+def test_start_detached_reports_failure_when_daemon_never_answers(monkeypatch):
+    # The spawn is not the success — the control port answering is. A daemon
+    # that dies on startup must yield False, not a cheerful "running now".
+    calls = _startup_env(monkeypatch, service=False, reachable=False)
+    monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: False)  # never up
+    monkeypatch.setattr(  # single-shot wait so the test doesn't sit out the timeout
+        daemon_mod, "_wait_until", lambda pred, timeout, interval=1.0: pred()
+    )
+    assert daemon_mod.start_detached() is False
+    assert calls == ["spawn"]
 
 
 def _fake_conn(pid, port, status):

@@ -3,7 +3,7 @@ Password-free background startup via the current user's Run key.
 
 Running the daemon as a Windows *service under a user account* needs that account
 to have a real password and the "log on as a service" right. PIN-only /
-Microsoft-account / passwordless home users have neither, so `sc`/NSSM refuses
+Microsoft-account / passwordless home users have neither, so the service manager refuses
 with **Error 1069 (logon failure)** — which would break palctl out of the box for
 a large share of the target audience.
 
@@ -50,7 +50,10 @@ def install_startup(exe: str, args: str = "") -> str:
     import winreg
 
     cmd = startup_command(exe, args)
-    with winreg.OpenKey(
+    # CreateKeyEx, not OpenKey: the Run key exists on any lived-in profile,
+    # but a pristine one (a brand-new Windows account, a CI runner) may not
+    # have it yet — OpenKey then raises FileNotFoundError. Open-or-create.
+    with winreg.CreateKeyEx(
         winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE
     ) as key:
         winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, cmd)
