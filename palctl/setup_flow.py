@@ -79,6 +79,25 @@ def run_setup(cfg: Config, plan: SetupPlan, log: Log) -> SetupResult:
         if not _preflight(plan, log):
             return SetupResult(False)
 
+        # Refuse — don't just warn — any combo that would run palctl and the
+        # server on different accounts. That split is what silently blinds the
+        # memory watchdog, so it must be impossible to install, not merely
+        # detectable afterward.
+        if would_split_accounts(
+            daemon_startup=plan.daemon_startup,
+            service_password=plan.service_password,
+            register_server_service=plan.register_server_service,
+        ):
+            log(
+                "\n❌ This setup would run palctl as your user but the Palworld "
+                "server as SYSTEM — two different Windows accounts. palctl can't "
+                "read a server owned by another account, so the memory-leak "
+                "watchdog would be blind. Enter your Windows password so the "
+                "server runs under your account too, or untick “Register the "
+                "Palworld server as a Windows service.”"
+            )
+            return SetupResult(False)
+
         log("Saving configuration…")
         cfg.server_root = plan.server_root
         cfg.steamcmd_path = plan.steamcmd_path
@@ -156,6 +175,29 @@ def needs_admin(*, register_server_service: bool, daemon_startup: str) -> bool:
     from . import daemon, winservice
 
     return winservice.service_exists(daemon.SERVICE_NAME)
+
+
+def would_split_accounts(
+    *, daemon_startup: str, service_password: str, register_server_service: bool
+) -> bool:
+    """True if this plan would put the daemon and the game server on DIFFERENT
+    Windows accounts — the split that blinds the memory watchdog (palctl can't
+    read a server owned by another account). Pure, so setup and the wizard share
+    one rule and can't disagree.
+
+    The daemon runs as the invoking user in login mode, and in service mode when
+    a Windows password is supplied; the game server runs as the user only when a
+    password is supplied. So the mismatch is exactly: palctl registers the
+    server, the daemon is the user, and no password was given to put the server
+    on that same account. (No server service, or no daemon, means nothing to
+    split; a passwordless service leaves both on LocalSystem — same account.)"""
+    if not register_server_service or daemon_startup == "none":
+        return False
+    daemon_is_user = daemon_startup == "login" or (
+        daemon_startup == "service" and bool(service_password)
+    )
+    game_is_user = bool(service_password)
+    return daemon_is_user and not game_is_user
 
 
 def _preflight(plan: SetupPlan, log: Log) -> bool:

@@ -142,6 +142,10 @@ Installers for every release are on the
   the Discord bot's DPAPI token stays readable, and both start at boot. This
   replaces the old lose-lose choice between a login-startup daemon that can't
   watch a SYSTEM server and a LocalSystem service that can't run the Discord bot.
+  Setup now **refuses** — not merely warns — any combination that would land
+  palctl and the server on different accounts (the classic default: login
+  startup + a SYSTEM server service), so the watchdog-blinding split can't be
+  installed in the first place.
 - **A failed Windows service install now says *why* instead of a misleading
   catch-all.** `palctl-daemon install-service` used to let `sc.exe`/WinSW fail
   silently when not elevated, wait out a 30-second probe, and then blame the
