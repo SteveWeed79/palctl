@@ -47,7 +47,7 @@ WINSW_URL = "https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.
 # release asset (checked from CI infrastructure independent of any one
 # developer machine; see the install-lifecycle CI job, which re-downloads and
 # re-hashes it on every run).
-WINSW_SHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
+WINSW_SHA256 = "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da"
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
