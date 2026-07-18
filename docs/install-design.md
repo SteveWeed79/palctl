@@ -36,8 +36,13 @@ packaging) solved decades ago. Four structural traps come with that choice:
 ## The rules
 
 These are enforced by unit tests (`test_winservice.py`, `test_systemd.py`,
-`test_daemon_helpers.py`, `test_setup_flow.py`) and by the `install-lifecycle`
-CI job, which exercises the real state machine against a real Windows SCM.
+`test_daemon_helpers.py`, `test_setup_flow.py`) and by two real-Windows CI
+jobs: `install-lifecycle` exercises the runtime install commands (fresh →
+reinstall-over-running → mode switch → removal) against a real SCM, and
+`installer-upgrade` builds the actual packaged installer and upgrades it over
+the corrupted state field reports hit — a stale, unstartable service
+registration plus a login-startup daemon actually running — asserting a
+daemon is listening again afterward.
 
 ### 1. Reinstall replaces; it never patches
 

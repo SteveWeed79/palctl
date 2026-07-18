@@ -104,24 +104,76 @@ jobs:
           }
           exit 0
 
-  installer-syntax:
-    # Compile installer.iss against stub build output so script errors surface
-    # on every push instead of at tag time — a malformed Code comment already
-    # broke the 1.0.0 release build once.
+  installer-upgrade:
+    # Compiles installer.iss (a malformed Code comment already broke the 1.0.0
+    # release build once), then runs the REAL packaged upgrade end-to-end
+    # against the corrupted machine state field reports actually hit: a stale,
+    # unstartable service registration left by an old install PLUS login
+    # startup genuinely running the daemon. The upgrade must end with a daemon
+    # listening again — the blind pre-fix restart ended with nothing running.
+    # The stub daemon really listens on the control port, so the installer's
+    # restart verification and fallback are exercised for real.
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
-      - name: Compile installer.iss with ISCC
+      - name: Build a listening stub daemon and compile the installer
         shell: pwsh
         run: |
           choco install innosetup --no-progress -y
           New-Item -ItemType Directory -Force dist\palctl | Out-Null
-          "MZ" | Set-Content dist\palctl\palctl-gui.exe
-          "MZ" | Set-Content dist\palctl\palctl-daemon.exe
-          "MZ" | Set-Content dist\palctl\palctl.exe
+          @'
+          using System;
+          using System.Net;
+          using System.Net.Sockets;
+          using System.Threading;
+          class Stub {
+            static void Main(string[] args) {
+              // Only `run` serves; install/uninstall subcommands no-op cleanly.
+              if (Array.IndexOf(args, "run") < 0) return;
+              var l = new TcpListener(IPAddress.Loopback, 8830);
+              l.Start();
+              while (true) Thread.Sleep(1000);
+            }
+          }
+          '@ | Set-Content stub.cs
+          & "$env:windir\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /out:dist\palctl\palctl-daemon.exe stub.cs
+          if ($LASTEXITCODE -ne 0) { throw "csc failed" }
+          Copy-Item dist\palctl\palctl-daemon.exe dist\palctl\palctl-gui.exe
+          Copy-Item dist\palctl\palctl-daemon.exe dist\palctl\palctl.exe
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=0.0.0 packaging\installer.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+      - name: First install (clean box)
+        shell: pwsh
+        run: |
+          Start-Process -Wait packaging\Output\palctl-setup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+      - name: Corrupt the box the way old palctl versions left it
+        shell: pwsh
+        run: |
+          sc.exe create palctl-daemon binPath= '"C:\old-palctl\palctl-daemon.exe" run' start= demand
+          if ($LASTEXITCODE -ne 0) { throw "sc create failed" }
+          $app = "${env:ProgramFiles}\palctl"
+          reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v palctl-daemon /t REG_SZ /d "`"$app\palctl-daemon.exe`" run --headless" /f
+          Start-Process -FilePath "$app\palctl-daemon.exe" -ArgumentList 'run','--headless' -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+          if (-not (Get-NetTCPConnection -LocalPort 8830 -State Listen -ErrorAction SilentlyContinue)) { throw "stub daemon did not start" }
+          exit 0
+      - name: Upgrade over the corrupted state
+        shell: pwsh
+        run: |
+          Start-Process -Wait packaging\Output\palctl-setup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+      - name: A daemon must be running again after the upgrade
+        shell: pwsh
+        run: |
+          $deadline = (Get-Date).AddSeconds(45)
+          while ((Get-Date) -lt $deadline) {
+            if (Get-NetTCPConnection -LocalPort 8830 -State Listen -ErrorAction SilentlyContinue) {
+              Write-Host "daemon is back — upgrade restart verified"
+              exit 0
+            }
+            Start-Sleep -Seconds 2
+          }
+          throw "upgrade finished with NO daemon running — the field bug regressed"
 
   lint:
     runs-on: ubuntu-latest

@@ -91,7 +91,10 @@ Installers for every release are on the
   probe also now reads the *original* user's registry hive — under elevation
   with a separate admin account it used to read the admin's hive, miss the Run
   key, and kill the daemon without ever bringing it back. CI now compiles the
-  installer script on every push, so .iss errors can't hide until release day.
+  installer AND runs the packaged upgrade end-to-end against exactly that
+  corrupted state (stale service + login startup running) on every push,
+  asserting a daemon is listening again afterward — so neither .iss errors nor
+  this bug class can hide until release day.
 - **The install verifies what it claims, instead of assuming.** "Installed and
   started" used to print no matter what the service manager actually did (every
   `systemctl`/`nssm` exit code was ignored), and login startup reported
