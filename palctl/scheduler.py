@@ -19,6 +19,31 @@ from .inifile import is_blank
 COUNTDOWN_MARKS = (600, 300, 60, 30, 10)
 
 
+def _dir_size_bytes(path: Path | str) -> int:
+    """Total size of a directory tree. Blocking — call via to_thread. Best-effort:
+    unreadable entries are skipped, a missing dir is 0."""
+    total = 0
+    try:
+        for p in Path(path).rglob("*"):
+            try:
+                if p.is_file():
+                    total += p.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return total
+
+
+def _free_bytes(path: Path | str) -> int | None:
+    """Free bytes on the volume holding `path`, or None if unreadable.
+    Blocking — call via to_thread."""
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return None
+
+
 def backup_interval_hours(raw: int) -> int:
     """Effective hours between local backups. Capped at 24 so local backups —
     the safety net — always happen at least once a day, even if a stale or
@@ -125,6 +150,24 @@ class Scheduler:
         try:
             # Flush the world to disk first, or the backup is a few minutes stale.
             await self._control.save_best_effort(settle=3)
+
+            # Don't start a backup the disk can't hold. A copy that fills the
+            # volume mid-write leaves a corrupt backup AND breaks the live world's
+            # next save. Skip loudly instead — the whole point of backups is to be
+            # there when needed, so a silent out-of-space failure is the worst case.
+            need = await asyncio.to_thread(_dir_size_bytes, self._cfg.savegames_dir)
+            free = await asyncio.to_thread(_free_bytes, self._cfg.backup_root)
+            if need and free is not None and free < need * 1.2:
+                await self._bus.emit(
+                    Event(
+                        "error",
+                        f"Backup skipped: only {free / 1e9:.1f} GB free on the "
+                        f"backup volume but the world is ~{need / 1e9:.1f} GB. Free "
+                        "some space — backups are failing.",
+                        {"free_gb": round(free / 1e9, 1), "need_gb": round(need / 1e9, 1)},
+                    )
+                )
+                return None
 
             b = await asyncio.to_thread(
                 backups.create,

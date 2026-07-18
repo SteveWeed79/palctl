@@ -49,6 +49,9 @@ class Watchdog:
         self._last_restart: datetime | None = None
         self._restarting = False
         self._hold_notified = False
+        # Frame-time/FPS watchdog state, independent of the memory counters.
+        self._fps_low = 0
+        self._fps_hold_notified = False
 
     @property
     def is_restarting(self) -> bool:
@@ -72,6 +75,13 @@ class Watchdog:
 
     async def _tick(self) -> None:
         wd = self._cfg.watchdog
+
+        # Frame-rate collapse can make a server unplayable while memory is still
+        # under the limit, so the memory watchdog never fires. Checked first and
+        # only when opted in (default off), so the memory path — and its tests,
+        # whose fake API has no metrics() — is untouched.
+        if wd.fps_restart and wd.min_server_fps > 0 and await self._fps_tick():
+            return
 
         stats = await asyncio.to_thread(procs.proc_stats)  # psutil off the event loop
         if stats is None:
@@ -204,3 +214,100 @@ class Watchdog:
                     {"recovered": came_back, "action": "restarted"},
                 )
             )
+
+    # ---------- frame-time / FPS watchdog ----------
+
+    async def _fps_tick(self) -> bool:
+        """Restart on a sustained frame-rate collapse. Mirrors the memory logic's
+        guard rails — N consecutive bad samples, the shared cooldown, and the same
+        hold-off-if-players-online courtesy (no hard-limit override: unlike memory
+        there's no 'the server is going to die anyway' threshold, so a slideshow
+        with players waits for the server to empty rather than kicking everyone).
+        Returns True only when it actually restarts."""
+        wd = self._cfg.watchdog
+        try:
+            m = await self._api.metrics()
+        except Exception:
+            # Can't read FPS (API down). That's the crash/hang path's job, not
+            # this one — don't count it as a low-FPS sample.
+            self._fps_low = 0
+            return False
+
+        fps = m.server_fps
+        # A reported 0 means booting / an API blip, not a real reading.
+        if fps <= 0 or fps >= wd.min_server_fps:
+            self._fps_low = 0
+            self._fps_hold_notified = False
+            return False
+
+        self._fps_low += 1
+        if self._fps_low < max(1, wd.fps_consecutive_samples):
+            return False
+        if self._last_restart and datetime.now(UTC) - self._last_restart < COOLDOWN:
+            return False
+
+        players = m.current_players
+        if players and wd.skip_if_players_online:
+            if not self._fps_hold_notified:
+                self._fps_hold_notified = True
+                await self._bus.emit(
+                    Event(
+                        "watchdog",
+                        f"🐌 Server FPS at **{fps}** (below {wd.min_server_fps}) but "
+                        f"{players} player(s) online — holding off the restart until "
+                        "the server empties.",
+                        {"server_fps": fps, "players": players,
+                         "action": "deferred", "trigger": "fps"},
+                    )
+                )
+            return False
+
+        await self._fps_restart(fps, players)
+        return True
+
+    async def _fps_restart(self, fps: int, player_count: int) -> None:
+        op = self._control.try_operation("watchdog-restart")
+        if op is None:
+            return
+        self._restarting = True
+        wd = self._cfg.watchdog
+        warn = wd.warn_seconds if player_count else 5
+        try:
+            async with op:
+                await self._bus.emit(
+                    Event(
+                        "watchdog",
+                        f"🐌 Server FPS collapsed to **{fps}** (below "
+                        f"{wd.min_server_fps}) — restarting in {warn}s. "
+                        f"{player_count} player(s) online.",
+                        {"server_fps": fps, "players": player_count,
+                         "action": "restarting", "trigger": "fps"},
+                    )
+                )
+                await self._control.save_best_effort()
+                try:
+                    await self._api.shutdown(warn, f"Automatic restart (low FPS: {fps})")
+                except Exception:
+                    pass
+                await asyncio.sleep(warn + 15)
+                came_back = await self._control.restart_cycle(
+                    escalate=True,
+                    on_escalate=lambda msg: self._bus.emit(
+                        Event("watchdog", f"🔨 {msg}", {"action": "force_stop"})
+                    ),
+                )
+                self._last_restart = datetime.now(UTC)
+                self._fps_low = 0
+                self._fps_hold_notified = False
+                await self._bus.emit(
+                    Event(
+                        "watchdog",
+                        "✅ Server back up after FPS restart."
+                        if came_back
+                        else "❌ Server did **not** come back after the FPS restart. "
+                             "Needs a look.",
+                        {"recovered": came_back, "action": "restarted", "trigger": "fps"},
+                    )
+                )
+        finally:
+            self._restarting = False
