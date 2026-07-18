@@ -77,45 +77,45 @@ def shipping_processes() -> list[psutil.Process]:
     return out
 
 
-# psutil.Process.cpu_percent(interval=None) is a delta against the *same object's*
-# previous call, so the first call on any given Process returns a meaningless 0.0.
-# proc_stats() is polled repeatedly (daemon loop, /state), and a fresh
-# find_process() each time hands cpu_percent a brand-new object every call — it
-# never gets a prior sample, so CPU reads 0.0 forever. We cache the Process by pid
-# and reuse it, letting cpu_percent measure across our own poll interval instead.
-_tracked: psutil.Process | None = None
-
-
-def _tracked_process() -> psutil.Process | None:
-    """find_process(), but return the *same* psutil.Process object across calls
-    for a given pid so cpu_percent(interval=None) has a baseline to diff against.
-    A restarted server (new pid) or a stopped one transparently rebinds/clears."""
-    global _tracked
-    found = find_process()
-    if found is None:
-        _tracked = None
-        return None
-    if _tracked is not None and _tracked.pid == found.pid:
-        return _tracked
-    _tracked = found
-    return found
+# How long proc_stats() samples CPU for. cpu_percent measures work done over a
+# window, so it needs a real window — see the comment in proc_stats().
+_CPU_SAMPLE_SECONDS = 0.3
 
 
 def proc_stats() -> ProcStats | None:
-    p = _tracked_process()
+    p = find_process()
     if p is None:
         return None
     try:
+        # CPU has to be measured over a real interval, and it must be measured
+        # BEFORE (and outside) the oneshot() block below.
+        #
+        # The obvious call, cpu_percent(interval=None), is a delta against the
+        # *same Process object's* previous call — so the first call on any object
+        # returns 0.0, and a caller that only reads once (the bot's /status, a
+        # `palctl status` right after start) gets 0.0 every time. A shared "prime
+        # the object once and reuse it" cache tried to paper over this, but it
+        # still reads 0.0 on the first sample and whenever two of our callers
+        # (poll loop, /state, the bot) land back-to-back, and it goes stale the
+        # moment the poll loop that primed it stops running (e.g. the REST API is
+        # unreachable). So we take a real measurement over a fixed window on every
+        # call: cpu_percent(interval>0) snapshots CPU time, sleeps, snapshots
+        # again, and returns a meaningful number the first time and every time.
+        # The sleep is fine because every caller runs proc_stats in a worker
+        # thread (asyncio.to_thread), off the daemon's event loop.
+        #
+        # It must stay outside oneshot(): oneshot() caches cpu_times(), so an
+        # interval sample taken inside it diffs a value against itself and reads
+        # 0.0 — exactly the bug we're fixing.
+        cpu_raw = p.cpu_percent(interval=_CPU_SAMPLE_SECONDS)
+        # Raw psutil cpu_percent sums across cores (can exceed 100% on an N-core
+        # box). Normalize to 0-100% of the whole machine — that's what a "CPU"
+        # status tile reads as.
+        cpu = cpu_raw / (psutil.cpu_count() or 1)
         with p.oneshot():
-            mem = p.memory_info().rss / 1_048_576
-            # Raw psutil cpu_percent sums across cores (can exceed 100% on an
-            # N-core box). Normalize to 0-100% of the whole machine — that's what
-            # a "CPU" status tile reads as.
-            cores = psutil.cpu_count() or 1
-            cpu = p.cpu_percent(interval=None) / cores
             return ProcStats(
                 pid=p.pid,
-                memory_mb=mem,
+                memory_mb=p.memory_info().rss / 1_048_576,
                 cpu_percent=cpu,
                 threads=p.num_threads(),
                 uptime_seconds=max(0.0, time.time() - p.create_time()),

@@ -128,14 +128,21 @@ Installers for every release are on the
   a daemon was already answering — and now replaces the running daemon instead,
   removing any leftover daemon *service* registration first so the service
   manager can't resurrect the old process (or double-start it at the next boot).
-- **CPU in `palctl status` (and the dashboard/bot) is no longer stuck at 0%.**
-  Process metrics are sampled by re-finding PalServer on every poll, which handed
-  psutil a brand-new `Process` object each time — and `cpu_percent(interval=None)`
-  always returns `0.0` on the first call for a given object, since it has no prior
-  sample to diff against. We now keep the same `Process` across polls (rebinding
-  when the server restarts), so CPU measures across the poll interval. The value
-  is also normalized to 0–100% of the whole machine instead of psutil's raw
-  per-core sum, so an N-core box no longer reads e.g. "750%".
+- **CPU in `palctl status` (and the dashboard/bot) is no longer stuck at 0%
+  — for real this time.** `cpu_percent(interval=None)` measures the work a
+  process did *between two calls on the same object*, so it returns `0.0` the
+  first time and needs a steady stream of prior samples to mean anything. An
+  earlier fix cached one `Process` and reused it, but that still read `0.0` on
+  the first sample, whenever two callers (poll loop, `/state`, the bot) landed
+  back-to-back, and any time the poll loop that primed it stopped running (e.g.
+  the REST API was briefly unreachable — that poll returns early and never
+  samples). `proc_stats()` now measures CPU over a real fixed window on every
+  call instead of relying on cross-call priming, so a single isolated read
+  (the bot's `/status`, a `palctl status` right after start) reports a real
+  number the first time and every time. The sample runs off the event loop, so
+  it doesn't stall the daemon. The value is still normalized to 0–100% of the
+  whole machine instead of psutil's raw per-core sum, so an N-core box doesn't
+  read e.g. "750%".
 - **A Stop that doesn't actually stop is no longer reported as success.** The
   daemon's HTTP `/action/stop` (used by the web dashboard and the `palctl stop`
   CLI) discarded the result of the service stop and always answered `ok`, so a
