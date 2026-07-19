@@ -74,7 +74,20 @@ jobs:
           $url = python -c "from palctl.winservice import WINSW_URL; print(WINSW_URL)"
           $sha = python -c "from palctl.winservice import WINSW_SHA256; print(WINSW_SHA256)"
           $dest = "dist\palctl\winsw.exe"
-          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+          # Retry TRANSPORT failures (the 1.2.5.2 build died to one truncated
+          # response); verification below still fails hard - a bad hash is
+          # never retried into acceptance.
+          $ok = $false
+          for ($i = 1; $i -le 4; $i++) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+              $ok = $true; break
+            } catch {
+              Write-Host "download attempt ${i}: $($_.Exception.Message)"
+              Start-Sleep -Seconds (5 * $i)
+            }
+          }
+          if (-not $ok) { throw "WinSW download failed after 4 attempts: $url" }
           $actual = (Get-FileHash -Algorithm SHA256 $dest).Hash.ToLower()
           if ($actual -ne $sha.ToLower()) {
             Remove-Item $dest
@@ -91,7 +104,20 @@ jobs:
         run: |
           $url = python -c "from palctl.preflight import VCREDIST_URL; print(VCREDIST_URL)"
           $dest = "dist\vc_redist.x64.exe"
-          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+          # Retry TRANSPORT failures (this exact download killed the 1.2.5.2
+          # build with "The response ended prematurely"); the Authenticode
+          # check below still fails hard on anything but Valid.
+          $ok = $false
+          for ($i = 1; $i -le 4; $i++) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+              $ok = $true; break
+            } catch {
+              Write-Host "download attempt ${i}: $($_.Exception.Message)"
+              Start-Sleep -Seconds (5 * $i)
+            }
+          }
+          if (-not $ok) { throw "vc_redist download failed after 4 attempts: $url" }
           $sig = Get-AuthenticodeSignature -LiteralPath $dest
           if ($sig.Status -ne "Valid") {
             Remove-Item $dest
