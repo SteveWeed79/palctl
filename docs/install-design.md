@@ -51,6 +51,20 @@ CI job, which exercises the real state machine against a real Windows SCM.
   on an active unit). This mirrors Debian's own packaging convention:
   `dh_installsystemd` generates `restart` on upgrade, `start` on fresh install.
 
+**Exception — never bounce a healthy game server.** Replacing a registration
+restarts the service, which is fine for palctl's own daemon but *not* for the
+Palworld server: a host who re-opens the wizard to change an unrelated setting
+must not have their live server stopped and their players disconnected.
+`_register_server_service` therefore consults `winservice.config_is_current`
+first and **skips re-registration entirely** when the PalServer service is
+already registered with byte-for-byte the config it would write (password
+excluded — it's scrubbed post-install). A genuine change (account, path, args)
+still replaces-and-restarts; an unchanged re-run leaves the server running. The
+downstream verify step never restarts either — `procs.start_service` no-ops on
+an already-`RUNNING` service and never issues a stop. This is the one place the
+"reinstall replaces" rule is deliberately softened, and it is softened toward
+*not touching a running server*.
+
 ### 2. Exactly one startup mechanism owns the daemon
 
 Three modes exist: **service** (WinSW / systemd), **login startup** (HKCU Run

@@ -222,6 +222,59 @@ def test_install_service_start_false_skips_start(monkeypatch, tmp_path):
     assert not any(c[1:2] == ["start"] for c in calls)
 
 
+def _write_service_config(tmp_path: Path, name: str, **kwargs) -> None:
+    """Materialise the on-disk WinSW config the way a real registration leaves
+    it: the password scrubbed out (password=None)."""
+    _, svc_xml = winservice.wrapper_paths(tmp_path, name)
+    svc_xml.write_text(
+        winservice.winsw_config_xml(name, password=None, **kwargs),
+        encoding="utf-8",
+    )
+
+
+def test_config_is_current_true_when_registered_and_unchanged(monkeypatch, tmp_path):
+    # The re-run "don't bounce a healthy server" guard: an already-registered
+    # service whose on-disk config is exactly what we'd write again → skip.
+    monkeypatch.setattr(winservice, "service_exists", lambda name: True)
+    _write_service_config(
+        tmp_path, "PalServer", exe="PalServer.exe", args="-x", app_dir=r"C:\srv",
+        user=r".\steve", stop_timeout="90 sec",
+    )
+    assert winservice.config_is_current(
+        tmp_path, "PalServer", "PalServer.exe", "-x", r"C:\srv",
+        user=r".\steve", stop_timeout="90 sec",
+    ) is True
+
+
+def test_config_is_current_false_when_a_field_differs(monkeypatch, tmp_path):
+    # Any real change (here, the account) must re-register — so a genuine config
+    # change still replaces the service even though that restarts it.
+    monkeypatch.setattr(winservice, "service_exists", lambda name: True)
+    _write_service_config(
+        tmp_path, "PalServer", exe="PalServer.exe", args="-x", app_dir=r"C:\srv",
+        user=r".\steve", stop_timeout="90 sec",
+    )
+    assert winservice.config_is_current(
+        tmp_path, "PalServer", "PalServer.exe", "-x", r"C:\srv",
+        user=r".\bob", stop_timeout="90 sec",
+    ) is False
+
+
+def test_config_is_current_false_when_not_registered(monkeypatch, tmp_path):
+    # A matching file left over from a previous install is NOT enough — the
+    # service must actually exist, or there's nothing to skip re-registering.
+    monkeypatch.setattr(winservice, "service_exists", lambda name: False)
+    _write_service_config(tmp_path, "PalServer", exe="PalServer.exe")
+    assert winservice.config_is_current(tmp_path, "PalServer", "PalServer.exe") is False
+
+
+def test_config_is_current_false_when_config_file_missing(monkeypatch, tmp_path):
+    # Service registered but its config file is gone/unreadable: fail closed
+    # (re-register) rather than assume it matches.
+    monkeypatch.setattr(winservice, "service_exists", lambda name: True)
+    assert winservice.config_is_current(tmp_path, "PalServer", "PalServer.exe") is False
+
+
 def test_start_service_uses_plain_scm(monkeypatch):
     calls: list[list[str]] = []
     monkeypatch.setattr(winservice, "_run", lambda cmd: calls.append(cmd))

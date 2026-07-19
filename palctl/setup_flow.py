@@ -476,15 +476,36 @@ def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
             )
         user = f".\\{username}"
         password = plan.service_password
+
+    bin_dir = config_dir() / "bin"
+    # PalServer flushes the world on the way down; a wrapper that kills it at the
+    # default 30s on a plain `net stop` or system shutdown risks the save. 90s
+    # matches how long palctl itself waits for a stopping server.
+    stop_timeout = "90 sec"
+
+    # Never bounce a healthy, already-correct server on a wizard re-run. If the
+    # service is already registered with exactly the config we'd write,
+    # re-registering (stop → delete → register → start) would only restart a
+    # running server — disconnecting players — for no change at all. Leave it be.
+    # Both the start=False registration below and _verify_and_report's
+    # start_service are no-ops on an already-running service, so skipping here
+    # means the whole re-run never touches the server.
+    if winservice.config_is_current(
+        bin_dir, plan.service_name, exe, PALSERVER_ARGS, plan.server_root,
+        user=user, stop_timeout=stop_timeout,
+    ):
+        log(
+            f"  Service '{plan.service_name}' is already registered and unchanged "
+            "— leaving it, and your running server, exactly as they are."
+        )
+        return True
+
     log(f"Registering the '{plan.service_name}' Windows service…")
-    winsw = winservice.ensure_winsw(config_dir() / "bin")
+    winsw = winservice.ensure_winsw(bin_dir)
     winservice.install_service(
         winsw, plan.service_name, exe, PALSERVER_ARGS, plan.server_root,
         user=user, password=password, start=False,
-        # PalServer flushes the world on the way down; a wrapper that kills it
-        # at the default 30s on a plain `net stop` or system shutdown risks the
-        # save. 90s matches how long palctl itself waits for a stopping server.
-        stop_timeout="90 sec",
+        stop_timeout=stop_timeout,
     )
     log(
         f"  Service '{plan.service_name}' registered"

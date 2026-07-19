@@ -192,6 +192,47 @@ def _wait_for(predicate, timeout: float, interval: float = 1.0) -> bool:
         time.sleep(interval)
 
 
+def config_is_current(
+    cache_dir: Path,
+    name: str,
+    exe: str | Path,
+    args: str = "",
+    app_dir: str | Path | None = None,
+    *,
+    user: str | None = None,
+    appdata: str | None = None,
+    stop_timeout: str = "30 sec",
+) -> bool:
+    """True when service ``name`` is already registered AND its on-disk WinSW
+    config is byte-for-byte what we would write now — so a re-install would only
+    replace it with an identical registration.
+
+    Its purpose is to let a caller SKIP the stop → delete → re-register cycle
+    when nothing has changed, so re-running setup never needlessly bounces a
+    healthy, running service. That matters most for the game server (PalServer):
+    a host who re-opens the wizard to change an unrelated setting should not have
+    their live server stopped and restarted underneath their players.
+
+    The password is deliberately excluded from the comparison — it is scrubbed
+    from the file immediately after ``install`` (the SCM holds it from then on),
+    so the stored config never has one to compare against. Conservative by
+    construction: a missing service, an unreadable/absent config file, or the
+    smallest difference all return False, and the caller re-registers exactly as
+    before. Only reads a file, so it's unit-testable off Windows."""
+    if not service_exists(name):
+        return False
+    _, svc_xml = wrapper_paths(cache_dir, name)
+    try:
+        existing = svc_xml.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    desired = winsw_config_xml(
+        name, exe, args, app_dir,
+        user=user, password=None, appdata=appdata, stop_timeout=stop_timeout,
+    )
+    return existing == desired
+
+
 def install_service(
     winsw: str | Path,
     name: str,
