@@ -142,10 +142,14 @@ begin
   ServiceWasRegistered := ServiceExists('palctl-daemon');
   Exec(ExpandConstant('{sys}\net.exe'), 'stop palctl-daemon', '',
     SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  { The wizard's DEFAULT background mode is login startup: a plain
-    palctl-daemon.exe process in the user's session, invisible to the service
-    manager but holding the exe open just the same. Record its Run key (so
-    the [Run] section can bring the daemon back), then kill the process.
+  { Login startup is the CLI/legacy background mode (palctl-daemon
+    install-startup, or a config from before the wizard defaulted to a
+    service): a plain palctl-daemon.exe process in the user's session,
+    invisible to the service manager but holding the exe open just the same.
+    The wizard's own default is now a service, handled above — but this path
+    must stay, because login-mode daemons still exist in the wild. Record its
+    Run key (so the [Run] section can bring the daemon back), then kill the
+    process.
     taskkill exits nonzero when there is no such process; that's fine.
     NB: no comment line may BEGIN with a bracket — ISCC reads a line-leading
     bracket as a section tag even inside a Code comment, and exactly that
@@ -181,15 +185,24 @@ Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; C
 ; stopped it to free the exe; start it back so the watchdog/scheduler/bot don't
 ; stay dead until reboot.
 Filename: "{sys}\net.exe"; Parameters: "start palctl-daemon"; Check: NeedsServiceRestart; Flags: runhidden waituntilterminated; StatusMsg: "Restarting the palctl background service..."
-; Same for the login-startup mode (the wizard's DEFAULT): PrepareToInstall
-; killed the running daemon to free the exe; relaunch it the way the Run key
-; would at login — as the original, non-elevated user, so it reads that user's
-; config and DPAPI secrets (the Discord token).
+; Same for the login-startup mode (the CLI/legacy path, not the wizard's
+; service default): PrepareToInstall killed the running daemon to free the exe;
+; relaunch it the way the Run key would at login — as the original,
+; non-elevated user, so it reads that user's config and DPAPI secrets (the
+; Discord token).
 Filename: "{app}\palctl-daemon.exe"; Parameters: "run --headless"; Check: NeedsLoginDaemonRestart; Flags: runhidden nowait runasoriginaluser; StatusMsg: "Restarting palctl in the background..."
 ; Offer to launch the GUI (which runs the first-run wizard) at the end.
 Filename: "{app}\palctl-gui.exe"; Description: "Launch palctl"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
+; Scope note: this removes everything palctl owns of ITSELF (the daemon service,
+; login Run key, running daemon/GUI, firewall rule, health task). It deliberately
+; leaves the separate PalServer game-server service and the %APPDATA%\palctl
+; config dir alone — uninstalling palctl must not silently stop someone's live
+; world, and config is kept so a reinstall resumes. See docs/install-design.md
+; ("What uninstall removes") for the rationale and the manual `sc delete
+; PalServer` a full cleanup needs.
+;
 ; Remove the service before the files go, so nothing is left pointing at a
 ; deleted exe. runhidden so an already-absent service fails quietly.
 Filename: "{app}\palctl-daemon.exe"; Parameters: "uninstall-service"; Flags: runhidden waituntilterminated; RunOnceId: "RemovePalctlService"

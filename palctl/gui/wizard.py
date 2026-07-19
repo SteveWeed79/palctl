@@ -457,8 +457,12 @@ class SetupWizard(QDialog):
                 "Running palctl as a Windows service registers it (and the game "
                 "server) under your account, so the memory watchdog can read the "
                 "server and the Discord bot keeps working. Windows needs your "
-                "account password to create that service — enter it above, or "
-                "switch to “Start when I log in”.",
+                "account password to create that service — enter it above.\n\n"
+                "No account password (a PIN-only or Microsoft-account sign-in)? "
+                "Untick the background box to finish the rest of setup now, then "
+                "run palctl in the background without a service or a password by "
+                "opening a console and running:\n"
+                "    palctl-daemon install-startup",
             )
             return
 
