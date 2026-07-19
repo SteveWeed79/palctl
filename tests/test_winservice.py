@@ -36,6 +36,34 @@ def test_config_xml_minimal_omits_optional_fields():
     assert "<description>svc</description>" in xml  # falls back to the name
 
 
+def test_config_xml_stop_timeout_default_and_override():
+    assert "<stoptimeout>30 sec</stoptimeout>" in winservice.winsw_config_xml("s", "s.exe")
+    assert "<stoptimeout>90 sec</stoptimeout>" in winservice.winsw_config_xml(
+        "s", "s.exe", stop_timeout="90 sec"
+    )
+
+
+def test_install_service_scrubs_the_password_after_registration(monkeypatch, tmp_path):
+    # The SCM stores the account password itself (encrypted) once `install`
+    # runs — the XML copy must not outlive that moment. Leaving it would keep a
+    # Windows password in a plaintext file for the service's lifetime (NSSM
+    # never had this trap; it stored nothing).
+    calls, winsw = _install_env(monkeypatch, tmp_path, exists=False)
+
+    winservice.install_service(
+        winsw, "palctl-daemon", "svc.exe", user=r".\steve", password="hunter2",
+    )
+
+    _, svc_xml = winservice.wrapper_paths(tmp_path, "palctl-daemon")
+    text = svc_xml.read_text(encoding="utf-8")
+    assert "hunter2" not in text                      # the secret is gone
+    assert r"<username>.\steve</username>" in text    # the account remains
+    assert "<allowservicelogon>true</allowservicelogon>" in text
+    # And registration really happened before the scrub (install was issued).
+    svc_exe, _ = winservice.wrapper_paths(tmp_path, "palctl-daemon")
+    assert [str(svc_exe), "install"] in calls
+
+
 def test_config_xml_as_user_sets_serviceaccount_and_logon_right():
     xml = winservice.winsw_config_xml(
         "svc", "svc.exe", user=r".\steve", password="hunter2",
@@ -235,6 +263,21 @@ def _fake_frozen(monkeypatch, exe_dir: Path):
     """Pretend we're the frozen build, with palctl's exe living in exe_dir."""
     monkeypatch.setattr(winservice.sys, "frozen", True, raising=False)
     monkeypatch.setattr(winservice.sys, "executable", str(exe_dir / "palctl-gui.exe"))
+
+
+def test_ensure_winsw_discards_a_tampered_cache(tmp_path: Path, monkeypatch):
+    # The cache becomes a SYSTEM service binary — it is verified on every use,
+    # not just at download time. Tampered bytes are discarded and replaced via
+    # the verified paths; a manual drop that MATCHES the pin still works.
+    data = b"MZ-good-winsw"
+    good = hashlib.sha256(data).hexdigest()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "winsw.exe").write_bytes(b"MZ-tampered")
+    _fake_download(monkeypatch, data)
+
+    out = winservice.ensure_winsw(cache, sha256=good)
+    assert out.read_bytes() == data  # replaced, not trusted
 
 
 def test_ensure_winsw_prefers_the_bundled_copy_over_downloading(

@@ -78,6 +78,7 @@ def winsw_config_xml(
     password: str | None = None,
     appdata: str | None = None,
     description: str | None = None,
+    stop_timeout: str = "30 sec",
 ) -> str:
     """
     The complete WinSW service definition. Pure — install just writes this file
@@ -123,7 +124,13 @@ def winsw_config_xml(
     lines += [
         "  <startmode>Automatic</startmode>",
         '  <onfailure action="restart" delay="5 sec"/>',
-        "  <stoptimeout>30 sec</stoptimeout>",
+        # How long the wrapper waits on stop before killing the process. The
+        # default suits the daemon; the GAME service gets longer (see
+        # install_service callers) — PalServer flushes the world on the way
+        # down, and a wrapper that kills it at 30s on a plain `net stop` or a
+        # system shutdown is a world-corruption risk NSSM's kill ladder never
+        # had this sharply.
+        f"  <stoptimeout>{escape(stop_timeout)}</stoptimeout>",
         # The daemon and PalServer both do their own logging; the wrapper
         # capturing stdout too would just duplicate it into the config dir.
         '  <log mode="none"/>',
@@ -179,6 +186,7 @@ def install_service(
     password: str | None = None,
     appdata: str | None = None,
     start: bool = True,
+    stop_timeout: str = "30 sec",
 ) -> None:
     """Register the service from a freshly written config, then optionally
     start it.
@@ -186,7 +194,14 @@ def install_service(
     A re-install replaces the whole registration: any existing service (this
     module's, or one left by the old NSSM builds) is stopped and removed first,
     and the config XML is rewritten whole — so nothing stale can survive from a
-    previous install, by construction."""
+    previous install, by construction.
+
+    The account password is needed only AT registration (the SCM stores it
+    itself, encrypted, once `install` runs) — so it is scrubbed from the XML
+    immediately afterward. Leaving it there would keep a Windows account
+    password in a plaintext file for the lifetime of the service, which
+    violates palctl's no-secrets-on-disk rule (NSSM never had this trap: it
+    passed the password straight to the SCM and stored nothing)."""
     winsw = Path(winsw)
     if service_exists(name):
         remove_service(name)
@@ -210,10 +225,24 @@ def install_service(
         winsw_config_xml(
             name, exe, args, app_dir,
             user=user, password=password, appdata=appdata,
+            stop_timeout=stop_timeout,
         ),
         encoding="utf-8",
     )
     _run([str(svc_exe), "install"])
+    if user and password:
+        # Registration is done; the SCM now holds the password (encrypted, in
+        # LSA). Rewrite the config without it so no plaintext account password
+        # outlives the one command that needed it. WinSW reads <serviceaccount>
+        # only at install, so the scrubbed file stays fully functional.
+        svc_xml.write_text(
+            winsw_config_xml(
+                name, exe, args, app_dir,
+                user=user, password=None, appdata=appdata,
+                stop_timeout=stop_timeout,
+            ),
+            encoding="utf-8",
+        )
     if start:
         _run([str(svc_exe), "start"])
 
@@ -275,7 +304,16 @@ def ensure_winsw(
     """
     cached = cache_dir / "winsw.exe"
     if cached.exists():
-        return cached
+        # The cache is not trusted on sight: this binary becomes a SYSTEM
+        # service, so anything sitting there — including a manually dropped
+        # copy (the documented offline workaround) — must still match the pin.
+        # A mismatch is discarded and replaced through the verified paths.
+        try:
+            if not sha256 or _sha256_of(cached).lower() == sha256.lower():
+                return cached
+            cached.unlink()
+        except OSError:
+            pass
 
     bundled = bundled_winsw(sha256=sha256)
     if bundled is not None:

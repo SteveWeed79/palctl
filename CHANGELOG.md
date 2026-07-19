@@ -125,6 +125,29 @@ Installers for every release are on the
   can assert the outcome.
 
 ### Fixed
+- **Audit of the NSSM→WinSW conversion — four gaps closed.** The wrapper swap
+  (1.2.3) kept NSSM's runtime-download pattern and picked up WinSW's config
+  model without re-examining what NSSM had been providing implicitly:
+  - *A service-account password no longer outlives its one moment of use.*
+    WinSW takes the account password via its XML config file, and palctl left
+    it there — a Windows account password in a plaintext file for the lifetime
+    of the service (NSSM passed it straight to Windows, which stores it
+    encrypted, and kept nothing). The password is now scrubbed from the XML
+    immediately after registration; the service keeps working (Windows itself
+    holds the credential from that point).
+  - *The cached wrapper binary is verified on every use, not just at download.*
+    Anything sitting in palctl's cache becomes a SYSTEM service binary; a
+    tampered copy is now discarded and replaced through the verified paths. A
+    manually dropped copy that matches the pin still works.
+  - *The game service gets 90 seconds to stop, not WinSW's 30.* PalServer
+    flushes the world on the way down; on a plain `net stop` or system
+    shutdown the wrapper would have killed it at 30s — a world-corruption risk
+    NSSM's escalation ladder never had this sharply. 90s matches how long
+    palctl itself waits for a stopping server.
+  - *A game service the SCM refuses to start is reported with the actual
+    reason* (Error 1069 & co., read from the service's recorded exit code)
+    instead of setup waiting four minutes for a server that never launched and
+    then blaming the REST API.
 - **The memory-leak watchdog no longer goes blind when the server runs under a
   different Windows account than palctl.** In the common setup — PalServer as a
   LocalSystem service, the daemon under your login user — palctl couldn't read

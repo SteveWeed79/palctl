@@ -352,10 +352,22 @@ def _verify_and_report(plan: SetupPlan, server_registered: bool, log: Log) -> No
 
     if server_registered:
         log("Starting the server to check it actually works…")
+        started = False
         try:
-            asyncio.run(procs.start_service(plan.service_name))
+            started = asyncio.run(procs.start_service(plan.service_name))
         except Exception as e:
             log(f"  couldn't start the service: {e}")
+        if not started:
+            # The SCM refused or the service died — say WHY (Error 1069 & co.,
+            # read from the service's recorded exit code) instead of sitting
+            # out a four-minute REST wait for a server that never launched.
+            reason = procs.service_failure_reason(plan.service_name)
+            log(
+                f"  ❌ The '{plan.service_name}' service did not start"
+                + (f" — {reason}" if reason else "")
+                + " Check services.msc, then run setup again."
+            )
+            return
 
         log("  waiting for the server to answer (this can take a minute)…")
         api = PalApi("127.0.0.1", plan.api_port, plan.password)
@@ -417,6 +429,10 @@ def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
     winservice.install_service(
         winsw, plan.service_name, exe, PALSERVER_ARGS, plan.server_root,
         user=user, password=password, start=False,
+        # PalServer flushes the world on the way down; a wrapper that kills it
+        # at the default 30s on a plain `net stop` or system shutdown risks the
+        # save. 90s matches how long palctl itself waits for a stopping server.
+        stop_timeout="90 sec",
     )
     log(
         f"  Service '{plan.service_name}' registered"
