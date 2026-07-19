@@ -15,6 +15,7 @@ this module (e.g. from a test) stays cheap and side-effect free.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,6 +98,19 @@ def run_setup(cfg: Config, plan: SetupPlan, log: Log) -> SetupResult:
                 "Palworld server as a Windows service.”"
             )
             return SetupResult(False)
+
+        # Anything that has to be downloaded comes FIRST, before a single byte
+        # of config/ini is touched: a blocked download (AV HTTPS-scanning, no
+        # network) then aborts a setup that hasn't changed anything, instead of
+        # dying halfway with the config saved, the ini edited, and no services.
+        if sys.platform.startswith("win") and (
+            plan.register_server_service or plan.daemon_startup == "service"
+        ):
+            from . import winservice
+
+            log("Fetching the service wrapper…")
+            winservice.ensure_winsw(config_dir() / "bin")
+            log("  Service wrapper ready.")
 
         log("Saving configuration…")
         cfg.server_root = plan.server_root

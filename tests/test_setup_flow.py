@@ -258,6 +258,31 @@ def test_service_mode_without_password_stays_localsystem(env):
     assert env.server_service_kwargs.get("user") is None
 
 
+def test_blocked_wrapper_download_aborts_before_touching_anything(env, monkeypatch):
+    # The user-visible failure this pins: setup used to save the config, edit
+    # the ini, and THEN die on the WinSW download (e.g. CERTIFICATE_VERIFY_FAILED
+    # from AV https-scanning) — a half-finished setup. Downloads now come first:
+    # a blocked download aborts a setup that has changed nothing.
+    monkeypatch.setattr("palctl.setup_flow.sys.platform", "win32")
+    monkeypatch.setattr(
+        "palctl.winservice.ensure_winsw",
+        lambda d: (_ for _ in ()).throw(OSError("could not verify the HTTPS connection")),
+    )
+    plan = _plan(
+        env.tmp_path,
+        daemon_startup="service",
+        register_server_service=True,
+        service_password="pw",
+    )
+    result, lines = env.run(plan)
+    assert result.ok is False
+    assert any("could not verify" in ln for ln in lines)
+    # Nothing was touched: no config written, no secrets stored, no ini edit.
+    assert not (env.tmp_path / "config.json").exists()
+    assert env.admin_passwords == []
+    assert env.rest_api == []
+
+
 def test_would_split_accounts_rule():
     from palctl.setup_flow import would_split_accounts
 

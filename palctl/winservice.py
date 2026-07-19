@@ -31,7 +31,6 @@ import shutil
 import subprocess
 import tempfile
 import time
-import urllib.request
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -261,8 +260,25 @@ def ensure_winsw(
     with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as tmp:
         tmp_path = Path(tmp.name)
     try:
-        # Timeout so a hung/blocked CDN can't stall setup indefinitely.
-        with urllib.request.urlopen(url, timeout=60) as resp, tmp_path.open("wb") as f:
+        from . import fetch
+
+        # Timeout so a hung/blocked CDN can't stall setup indefinitely. fetch
+        # retries certificate verification against certifi's CAs, because on
+        # real boxes (AV HTTPS-scanning, broken cert stores) the system trust
+        # fails and the raw _ssl.c error used to stop setup dead. If even that
+        # fails, name the escape hatch: this download is only a cache fill, so
+        # the user can fetch the exact release asset in a browser and drop it
+        # in place themselves.
+        try:
+            resp = fetch.open_url(url, timeout=60)
+        except OSError as e:
+            raise OSError(
+                f"{e}\nWorkaround: download {url} with your browser, save it "
+                f"as {cached}, and run setup again — palctl will use that copy "
+                f"(you can check it yourself: certutil -hashfile file SHA256 "
+                f"should print {sha256 or WINSW_SHA256})."
+            ) from e
+        with resp, tmp_path.open("wb") as f:
             shutil.copyfileobj(resp, f)
         # Verify BEFORE it can be used — this binary ends up running as SYSTEM,
         # so a tampered or corrupted download must never become winsw.exe.

@@ -203,8 +203,9 @@ def test_wait_for_times_out(monkeypatch):
 
 
 def _fake_download(monkeypatch, data: bytes):
+    # ensure_winsw downloads via fetch.open_url (system trust + certifi retry).
     monkeypatch.setattr(
-        winservice.urllib.request, "urlopen",
+        "palctl.fetch.open_url",
         lambda url, timeout=None: io.BytesIO(data),
     )
 
@@ -224,10 +225,27 @@ def test_ensure_winsw_caches_a_matching_download(tmp_path: Path, monkeypatch):
     assert out.read_bytes() == data
     # Second call reuses the cache — no download.
     monkeypatch.setattr(
-        winservice.urllib.request, "urlopen",
+        "palctl.fetch.open_url",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-downloaded")),
     )
     assert winservice.ensure_winsw(tmp_path / "cache", sha256=good) == out
+
+
+def test_ensure_winsw_blocked_download_names_the_manual_workaround(
+    tmp_path: Path, monkeypatch
+):
+    # A box where HTTPS verification fails (AV scanning, broken cert store)
+    # must get an actionable escape hatch — the exact file to download and
+    # where to put it — not a bare _ssl.c error that stops setup dead.
+    monkeypatch.setattr(
+        "palctl.fetch.open_url",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("could not verify the HTTPS")),
+    )
+    cache = tmp_path / "cache"
+    with pytest.raises(OSError, match="Workaround") as ei:
+        winservice.ensure_winsw(cache)
+    assert str(cache / "winsw.exe") in str(ei.value)  # tells them where to put it
+    assert winservice.WINSW_SHA256 in str(ei.value)   # and how to check it
 
 
 def test_ensure_winsw_refuses_a_tampered_download(tmp_path: Path, monkeypatch):

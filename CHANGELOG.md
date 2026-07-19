@@ -146,6 +146,26 @@ Installers for every release are on the
   palctl and the server on different accounts (the classic default: login
   startup + a SYSTEM server service), so the watchdog-blinding split can't be
   installed in the first place.
+- **Setup no longer dies on `CERTIFICATE_VERIFY_FAILED` — and no longer dies
+  halfway.** On a machine where Python can't verify HTTPS against the system
+  certificate store (an antivirus doing HTTPS scanning, a broken store), the
+  WinSW / VC++ / SteamCMD downloads failed with a bare `_ssl.c:1010` — after
+  setup had already saved the config and edited the server ini. Downloads now
+  retry verification against the CA bundle `certifi` ships (verification is
+  never disabled — both failing still fails closed, with a message that names
+  the antivirus/proxy cause), the WinSW failure spells out the manual escape
+  hatch (download the exact release asset in a browser, drop it in palctl's
+  `bin` folder, re-run setup — with the SHA-256 to check it against), and setup
+  fetches everything it needs to download *before* touching a single byte of
+  config, so a blocked download aborts a setup that changed nothing.
+- **The wizard defaults to the one correct install path and removes the wrong
+  one from the menu.** "Run as a Windows service under your account" is now the
+  pre-selected default, and while "Register the Palworld server as a Windows
+  service" is ticked the login-startup option is greyed out with the reason —
+  the server service and palctl must share one account, so the split that
+  blinds the watchdog can no longer even be selected. Login startup remains
+  available when palctl doesn't manage the server as a service (no split
+  possible) — the setups, like PIN-only accounts, that genuinely need it.
 - **A failed Windows service install now says *why* instead of a misleading
   catch-all.** `palctl-daemon install-service` used to let `sc.exe`/WinSW fail
   silently when not elevated, wait out a 30-second probe, and then blame the
