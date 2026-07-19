@@ -44,6 +44,19 @@ Write-Host "==> Binaries are in dist\palctl\"
 
 $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 if (Test-Path $iscc) {
+    # The installer carries the VC++ runtime (fresh boxes lack it and can't
+    # reliably download it). Evergreen URL — Authenticode, not a hash pin, is
+    # the integrity anchor; anything but Valid fails the build.
+    Write-Host "==> Bundling the VC++ runtime (Authenticode-verified)"
+    $vcUrl = & $py -c "from palctl.preflight import VCREDIST_URL; print(VCREDIST_URL)"
+    $vcDest = "dist\vc_redist.x64.exe"
+    Invoke-WebRequest -Uri $vcUrl -OutFile $vcDest -UseBasicParsing
+    $sig = Get-AuthenticodeSignature -LiteralPath $vcDest
+    if ($sig.Status -ne "Valid") {
+        Remove-Item $vcDest
+        throw "vc_redist.x64.exe signature status is '$($sig.Status)' — refusing to bundle."
+    }
+
     Write-Host "==> Compiling installer with Inno Setup"
     # Same version injection as the release workflow: palctl/__init__.py is
     # the single source, so local builds report the right version too.

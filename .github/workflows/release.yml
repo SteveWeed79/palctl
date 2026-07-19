@@ -81,6 +81,23 @@ jobs:
             throw "WinSW hash mismatch: expected $sha, got $actual - refusing to bundle."
           }
 
+      - name: Bundle the VC++ runtime (Authenticode-verified) for the installer
+        # Fresh Windows boxes lack the VC++ runtime AND can't reliably download
+        # it (sparse root-cert store), so the installer carries it. The evergreen
+        # aka.ms URL can't be hash-pinned — Microsoft reissues the exe — so its
+        # Authenticode signature is the integrity anchor, verified here at build
+        # time; anything but a Valid signature fails the build.
+        shell: pwsh
+        run: |
+          $url = python -c "from palctl.preflight import VCREDIST_URL; print(VCREDIST_URL)"
+          $dest = "dist\vc_redist.x64.exe"
+          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+          $sig = Get-AuthenticodeSignature -LiteralPath $dest
+          if ($sig.Status -ne "Valid") {
+            Remove-Item $dest
+            throw "vc_redist.x64.exe signature status is '$($sig.Status)' - refusing to bundle."
+          }
+
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
 

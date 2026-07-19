@@ -168,6 +168,14 @@ Installers for every release are on the
   the browser works — is gone entirely. The bundling step also re-verifies the
   pin on every release, so a wrong pin fails the build instead of a user's
   setup. (pip/source installs keep the verified download as the fallback.)
+- **The installer also carries the Visual C++ runtime.** The other install-time
+  download a fresh box needs — and the same class of machine that lacks the
+  runtime is the one whose sparse certificate store can't download it. The
+  installer now bundles `vc_redist.x64.exe` (Authenticode-verified at build
+  time; the evergreen URL can't be hash-pinned) and runs it silently only when
+  the runtime is actually missing. A brand-new Windows box now goes from
+  `palctl-setup.exe` to a working server with zero downloads during install;
+  the wizard's download path remains for portable/pip users.
 - **The wizard defaults to the one correct install path and removes the wrong
   one from the menu.** "Run as a Windows service under your account" is now the
   pre-selected default, and while "Register the Palworld server as a Windows

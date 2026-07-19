@@ -53,6 +53,12 @@ ChangesEnvironment=yes
 [Files]
 ; The whole PyInstaller onedir output.
 Source: "..\dist\palctl\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+; The VC++ x64 runtime installer, Authenticode-verified at build time (see
+; release.yml / build.ps1). Bundled so a fresh Windows box — which doesn't
+; have the runtime and whose sparse root-cert store makes runtime HTTPS
+; downloads fail — never needs to download it during setup. Extracted to
+; {tmp}, run only when the runtime is actually missing, deleted afterward.
+Source: "..\dist\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 [Icons]
 Name: "{group}\palctl"; Filename: "{app}\palctl-gui.exe"
@@ -95,6 +101,20 @@ begin
   end;
   { Look for the dir bracketed by semicolons, case-insensitively. }
   Result := Pos(';' + Uppercase(Param) + ';', ';' + Uppercase(OrigPath) + ';') = 0;
+end;
+
+function VCRedistNeeded: Boolean;
+var
+  Installed: Cardinal;
+begin
+  { Same key palctl's own preflight reads. 64-bit install mode, so this sees
+    the 64-bit registry view — where the x64 runtime registers. Missing key or
+    Installed<>1 means the Palworld server would fail to launch: install it. }
+  Result := True;
+  if RegQueryDWordValue(HKEY_LOCAL_MACHINE,
+    'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64',
+    'Installed', Installed) then
+    Result := (Installed <> 1);
 end;
 
 function ServiceExists(Name: string): Boolean;
@@ -155,7 +175,12 @@ begin
 end;
 
 [Run]
-; Self-register the daemon service (downloads the WinSW wrapper on first use).
+; Install the VC++ x64 runtime when it's missing — the Palworld server won't
+; launch without it, and this is exactly the fresh box that can't download it.
+; 3010 (success, reboot required) is fine; /norestart defers the reboot.
+Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; Check: VCRedistNeeded; Flags: waituntilterminated; StatusMsg: "Installing the Visual C++ runtime (the Palworld server needs it)..."
+; Self-register the daemon service (uses the WinSW wrapper bundled next to the
+; palctl exes; nothing is downloaded).
 Filename: "{app}\palctl-daemon.exe"; Parameters: "install-service"; Tasks: daemonservice; Flags: runhidden waituntilterminated; StatusMsg: "Registering the palctl service..."
 ; On an upgrade of an existing (wizard-registered) service, PrepareToInstall
 ; stopped it to free the exe; start it back so the watchdog/scheduler/bot don't
