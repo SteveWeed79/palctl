@@ -15,6 +15,17 @@ from . import localauth
 DAEMON_PORT = 8830  # localhost only; the daemon binds 127.0.0.1
 
 
+def daemon_reachable(timeout: float = 0.5) -> bool:
+    """Is a daemon answering on the localhost control port? A bare TCP probe —
+    no token, no HTTP — so the GUI can decide at launch whether setup actually
+    produced a running daemon, cheaply and without auth noise in the logs."""
+    import socket
+
+    with socket.socket() as s:
+        s.settimeout(timeout)
+        return s.connect_ex(("127.0.0.1", DAEMON_PORT)) == 0
+
+
 class DaemonError(RuntimeError):
     """Anything that prevents talking to the daemon — with a human message."""
 

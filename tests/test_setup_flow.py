@@ -309,6 +309,31 @@ def test_verify_surfaces_why_the_server_service_wont_start(env, monkeypatch):
     assert any("did not start" in ln and "1069" in ln for ln in lines)
 
 
+def test_should_prompt_setup_rule():
+    from palctl.setup_flow import should_prompt_setup
+
+    # True first run: no config at all.
+    assert should_prompt_setup(
+        config_exists=False, daemon_reachable=False, daemon_startup=""
+    )
+    # Setup died partway (config exists, daemon dead): keep prompting — this is
+    # the half-state that used to strand users in a GUI wired to nothing.
+    assert should_prompt_setup(
+        config_exists=True, daemon_reachable=False, daemon_startup="service"
+    )
+    assert should_prompt_setup(
+        config_exists=True, daemon_reachable=False, daemon_startup=""
+    )
+    # Healthy daemon: never nag.
+    assert not should_prompt_setup(
+        config_exists=True, daemon_reachable=True, daemon_startup="service"
+    )
+    # Explicit "no background palctl": a deliberate choice, respected.
+    assert not should_prompt_setup(
+        config_exists=True, daemon_reachable=False, daemon_startup="none"
+    )
+
+
 def test_would_split_accounts_rule():
     from palctl.setup_flow import would_split_accounts
 

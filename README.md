@@ -213,9 +213,11 @@ works if you'd rather drive it yourself.
 Download `palctl-setup.exe` from the
 [latest release](https://github.com/SteveWeed79/palctl/releases/latest)
 (or build it yourself from `packaging/`, see
-[packaging/README.md](packaging/README.md)). No Python needed. It installs both
-binaries, adds shortcuts, and offers to register the palctl background service.
-Then it opens the GUI, and the **first-run wizard** does the rest:
+[packaging/README.md](packaging/README.md)). No Python needed. It installs the
+binaries (including everything setup needs — nothing is downloaded during
+install), adds shortcuts, then opens the GUI, and the **first-run wizard** does
+the rest — and keeps re-opening at launch until palctl is actually running,
+so a setup that failed partway can't strand you in a dead GUI:
 
 - **finds** your server root and steamcmd (registry, Steam libraries, or the
   running process) — nothing to type

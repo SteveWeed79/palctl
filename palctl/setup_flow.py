@@ -191,6 +191,26 @@ def needs_admin(*, register_server_service: bool, daemon_startup: str) -> bool:
     return winservice.service_exists(daemon.SERVICE_NAME)
 
 
+def should_prompt_setup(
+    *, config_exists: bool, daemon_reachable: bool, daemon_startup: str
+) -> bool:
+    """Whether the GUI should open the setup wizard at launch, unasked.
+
+    The wizard used to auto-open only when no config existed — so a setup that
+    died PARTWAY (config saved, then a failed download / refused service
+    registration) never re-prompted: the user landed in a GUI wired to a daemon
+    that isn't running, with no signpost back to the thing that fixes it. The
+    rule now: prompt until the daemon is actually up. The one exception is an
+    explicit daemon_startup="none" — the user said no background palctl, and
+    nagging them every launch would punish a deliberate choice. Pure, so the
+    GUI can't drift from it."""
+    if not config_exists:
+        return True  # true first run
+    if daemon_reachable:
+        return False  # setup produced a live daemon; nothing to prompt about
+    return daemon_startup != "none"
+
+
 def would_split_accounts(
     *, daemon_startup: str, service_password: str, register_server_service: bool
 ) -> bool:

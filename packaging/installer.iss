@@ -68,11 +68,12 @@ Name: "{autodesktop}\palctl"; Filename: "{app}\palctl-gui.exe"; Tasks: desktopic
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
-; Off by default: the first-run wizard now chooses how the daemon runs in the
-; background (password-free login startup by default, or a service). Registering
-; a service here too would leave two daemons fighting for the control port. Tick
-; this only for an unattended install with no wizard.
-Name: "daemonservice"; Description: "Register the palctl background service now (advanced; the wizard normally handles this)"; Flags: unchecked
+; There is deliberately NO "register the service now" task: it could only
+; register a LocalSystem daemon with no config — a half-setup that either
+; fights the wizard's registration or pairs a SYSTEM daemon with a
+; user-account server (the split that blinds the watchdog). The wizard is the
+; one supported setup path; unattended deployments script
+; `palctl-daemon install-service` instead.
 Name: "addtopath"; Description: "Add palctl to the PATH (use the ""palctl"" command in any terminal)"; Flags: unchecked
 
 [Registry]
@@ -158,20 +159,17 @@ end;
 
 function NeedsServiceRestart: Boolean;
 begin
-  { Restart the daemon ourselves only when it was already registered AND the
-    user did not tick the daemonservice task — that task's [Run] step already
-    re-registers and starts it, so we must not double up. }
-  Result := ServiceWasRegistered and not WizardIsTaskSelected('daemonservice');
+  { Restart the daemon after the upgrade stopped it to free the exe — only
+    when a service registration already existed (the wizard's doing). }
+  Result := ServiceWasRegistered;
 end;
 
 function NeedsLoginDaemonRestart: Boolean;
 begin
   { Same idea for the login-startup mode: bring the daemon back after the
     upgrade killed it, or the watchdog/scheduler/bot silently stay dead until
-    the next sign-in. Skipped if a service is (being) registered — one daemon
-    only. }
-  Result := LoginStartupWasRegistered and not ServiceWasRegistered
-    and not WizardIsTaskSelected('daemonservice');
+    the next sign-in. Skipped when a service is registered — one daemon only. }
+  Result := LoginStartupWasRegistered and not ServiceWasRegistered;
 end;
 
 [Run]
@@ -179,12 +177,9 @@ end;
 ; launch without it, and this is exactly the fresh box that can't download it.
 ; 3010 (success, reboot required) is fine; /norestart defers the reboot.
 Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; Check: VCRedistNeeded; Flags: waituntilterminated; StatusMsg: "Installing the Visual C++ runtime (the Palworld server needs it)..."
-; Self-register the daemon service (uses the WinSW wrapper bundled next to the
-; palctl exes; nothing is downloaded).
-Filename: "{app}\palctl-daemon.exe"; Parameters: "install-service"; Tasks: daemonservice; Flags: runhidden waituntilterminated; StatusMsg: "Registering the palctl service..."
 ; On an upgrade of an existing (wizard-registered) service, PrepareToInstall
 ; stopped it to free the exe; start it back so the watchdog/scheduler/bot don't
-; stay dead until reboot. Skipped when the daemonservice task above already did it.
+; stay dead until reboot.
 Filename: "{sys}\net.exe"; Parameters: "start palctl-daemon"; Check: NeedsServiceRestart; Flags: runhidden waituntilterminated; StatusMsg: "Restarting the palctl background service..."
 ; Same for the login-startup mode (the wizard's DEFAULT): PrepareToInstall
 ; killed the running daemon to free the exe; relaunch it the way the Run key

@@ -199,6 +199,19 @@ Installers for every release are on the
   the runtime is actually missing. A brand-new Windows box now goes from
   `palctl-setup.exe` to a working server with zero downloads during install;
   the wizard's download path remains for portable/pip users.
+- **The setup wizard re-opens at every launch until palctl is actually
+  running.** It used to auto-open only when no config existed — so a setup that
+  died partway (config saved, then a failed download or a refused service
+  registration) stranded the user in a GUI wired to a daemon that isn't there,
+  with no signpost back to the fix. The GUI now prompts until the daemon
+  answers on its control port; an explicit "no background palctl" choice is
+  respected and never nagged.
+- **The installer's "register the palctl service now" checkbox is gone.** It
+  could only ever register a LocalSystem daemon with no configuration — a
+  half-setup that either fought the wizard's later registration or paired a
+  SYSTEM daemon with a user-account server (the split that blinds the
+  watchdog). The wizard is the one supported setup path; unattended
+  deployments script `palctl-daemon install-service` instead.
 - **The wizard defaults to the one correct install path and removes the wrong
   one from the menu.** "Run as a Windows service under your account" is now the
   pre-selected default, and while "Register the Palworld server as a Windows

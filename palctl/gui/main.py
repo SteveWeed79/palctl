@@ -1054,11 +1054,23 @@ class Main(QMainWindow):
 
         self._tray()
 
-        # First launch (no config yet): walk the user through setup rather than
-        # dropping them onto a Config tab full of blank boxes. Deferred so the
-        # main window is up before the dialog appears.
-        if not CONFIG_PATH.exists():
-            QTimer.singleShot(300, lambda: self._open_wizard(first_run=True))
+        # Open the wizard unasked until setup has actually produced a running
+        # daemon — not merely a config file. A setup that died partway (config
+        # saved, then a failed download or refused service registration) used
+        # to land here silently: a GUI wired to a dead daemon with no signpost
+        # back to the fix. Rule shared with setup_flow.should_prompt_setup;
+        # an explicit "none" startup choice is respected and never nagged.
+        # Deferred so the main window is up before the dialog appears.
+        from ..client import daemon_reachable
+        from ..setup_flow import should_prompt_setup
+
+        first_run = not CONFIG_PATH.exists()
+        if should_prompt_setup(
+            config_exists=not first_run,
+            daemon_reachable=daemon_reachable(),
+            daemon_startup=self.cfg.daemon_startup,
+        ):
+            QTimer.singleShot(300, lambda: self._open_wizard(first_run=first_run))
 
     def _open_wizard(self, *, first_run: bool = False) -> None:
         from .wizard import SetupWizard
