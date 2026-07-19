@@ -29,11 +29,26 @@ Pop-Location
 # download the service wrapper at install time — which is exactly where fresh
 # Windows boxes (sparse root-cert store) and AV HTTPS-scanning used to kill
 # setup with CERTIFICATE_VERIFY_FAILED.
+function Get-FileWithRetry([string]$Url, [string]$Dest) {
+    # Retry TRANSPORT failures only (a truncated response killed the 1.2.5.2
+    # release build); integrity checks after the download still fail hard.
+    for ($i = 1; $i -le 4; $i++) {
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
+            return
+        } catch {
+            Write-Host "download attempt ${i}: $($_.Exception.Message)"
+            Start-Sleep -Seconds (5 * $i)
+        }
+    }
+    throw "download failed after 4 attempts: $Url"
+}
+
 Write-Host "==> Bundling WinSW (hash-verified) into dist\palctl\"
 $winswUrl = & $py -c "from palctl.winservice import WINSW_URL; print(WINSW_URL)"
 $winswSha = & $py -c "from palctl.winservice import WINSW_SHA256; print(WINSW_SHA256)"
 $winswDest = "dist\palctl\winsw.exe"
-Invoke-WebRequest -Uri $winswUrl -OutFile $winswDest -UseBasicParsing
+Get-FileWithRetry $winswUrl $winswDest
 $actual = (Get-FileHash -Algorithm SHA256 $winswDest).Hash.ToLower()
 if ($actual -ne $winswSha.ToLower()) {
     Remove-Item $winswDest
@@ -50,7 +65,7 @@ if (Test-Path $iscc) {
     Write-Host "==> Bundling the VC++ runtime (Authenticode-verified)"
     $vcUrl = & $py -c "from palctl.preflight import VCREDIST_URL; print(VCREDIST_URL)"
     $vcDest = "dist\vc_redist.x64.exe"
-    Invoke-WebRequest -Uri $vcUrl -OutFile $vcDest -UseBasicParsing
+    Get-FileWithRetry $vcUrl $vcDest
     $sig = Get-AuthenticodeSignature -LiteralPath $vcDest
     if ($sig.Status -ne "Valid") {
         Remove-Item $vcDest

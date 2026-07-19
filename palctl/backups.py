@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+# palctl's own settings/history, snapshotted INTO every backup so a dead disk
+# loses zero setup (the world was covered; the config that manages it wasn't).
+# Lives inside the backup dir so retention and the off-site mirror cover it
+# with no extra machinery; restore() explicitly excludes it from SaveGames.
+CONFIG_SNAPSHOT_NAME = "palctl-config.zip"
+
+# Whitelist, not "everything in the config dir": logs rotate (big), bin/ holds
+# binaries, and daemon_token is a local secret that must not ride a backup to
+# cloud storage (it's regenerated on first run anyway; config.py's rule is that
+# no secret leaves the box in the clear).
+_SNAPSHOT_FILES = ("config.json", "daemon_state.json", "sessions.db")
 
 
 @dataclass(frozen=True)
@@ -123,7 +137,31 @@ def create(
             break
 
     os.replace(tmp, dest)
+    _write_config_snapshot(dest)
     return Backup(dest.name, dest, _dir_size_mb(dest), datetime.now(), consistent)
+
+
+def _write_config_snapshot(dest: Path) -> None:
+    """Zip palctl's own config/history into the finished backup. Best-effort by
+    design — the world copy is the point of a backup and must never fail over
+    its passenger. sessions.db is copied hot (the daemon may be writing); a
+    torn copy of a stats database is an acceptable DR artifact, the config.json
+    beside it is the part that saves the day after a dead disk."""
+    from .config import config_dir
+
+    try:
+        src_dir = config_dir()
+        with zipfile.ZipFile(
+            dest / CONFIG_SNAPSHOT_NAME, "w", zipfile.ZIP_DEFLATED
+        ) as z:
+            for name in _SNAPSHOT_FILES:
+                f = src_dir / name
+                if f.is_file():
+                    z.write(f, name)
+    except Exception:
+        # Don't leave a half-written zip looking like a snapshot.
+        with contextlib.suppress(OSError):
+            (dest / CONFIG_SNAPSHOT_NAME).unlink(missing_ok=True)
 
 
 def listing(backup_root: Path) -> list[Backup]:
@@ -184,7 +222,12 @@ def restore(backup_root: Path, name: str, savegames: Path) -> None:
     if staged.exists():
         shutil.rmtree(staged)  # leftover from a previous failed attempt
     try:
-        shutil.copytree(src, staged)
+        # The config snapshot rides inside the backup dir for retention and
+        # mirroring — but it is palctl's file, not the world's. Restoring it
+        # into SaveGames would hand the game server a stray zip.
+        shutil.copytree(
+            src, staged, ignore=shutil.ignore_patterns(CONFIG_SNAPSHOT_NAME)
+        )
     except BaseException:
         shutil.rmtree(staged, ignore_errors=True)
         raise

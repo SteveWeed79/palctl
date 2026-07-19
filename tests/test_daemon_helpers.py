@@ -426,6 +426,124 @@ def test_disable_background_startup_removes_both_and_stops_the_daemon(monkeypatc
     assert calls == ["runkey", "service", "stop"]
 
 
+# ---------------- scheduled health check (hung-daemon recovery) ----------------
+
+
+def _health_env(monkeypatch, tmp_path, *, probes):
+    """Wire run_health_check to canned probe results and a real state file."""
+    import palctl.healthcheck as hc
+
+    monkeypatch.setattr(hc, "_STATE_PATH", tmp_path / "health_state.json")
+    it = iter(probes)
+    monkeypatch.setattr(hc, "probe", lambda timeout=5.0: next(it))
+    heals: list[bool] = []
+
+    def _heal():
+        heals.append(True)
+        return True
+
+    monkeypatch.setattr(daemon_mod, "_heal_daemon", _heal)
+    return heals
+
+
+def test_health_check_heals_only_after_a_confirmed_streak(monkeypatch, tmp_path):
+    heals = _health_env(monkeypatch, tmp_path, probes=[False, False, False])
+    assert daemon_mod.run_health_check(threshold=3) == 0  # 1/3 — wait
+    assert daemon_mod.run_health_check(threshold=3) == 0  # 2/3 — wait
+    assert heals == []
+    assert daemon_mod.run_health_check(threshold=3) == 0  # 3/3 — heal
+    assert heals == [True]
+
+
+def test_health_check_one_good_probe_resets_the_streak(monkeypatch, tmp_path):
+    heals = _health_env(monkeypatch, tmp_path, probes=[False, False, True, False])
+    daemon_mod.run_health_check(threshold=3)
+    daemon_mod.run_health_check(threshold=3)
+    daemon_mod.run_health_check(threshold=3)  # healthy — streak resets
+    daemon_mod.run_health_check(threshold=3)  # 1/3 again, not 3/3
+    assert heals == []
+
+
+def test_health_check_failed_heal_exits_nonzero(monkeypatch, tmp_path):
+    import palctl.healthcheck as hc
+
+    monkeypatch.setattr(hc, "_STATE_PATH", tmp_path / "health_state.json")
+    monkeypatch.setattr(hc, "probe", lambda timeout=5.0: False)
+    monkeypatch.setattr(daemon_mod, "_heal_daemon", lambda: False)
+    assert daemon_mod.run_health_check(threshold=1) == 1  # visible in task history
+
+
+def test_heal_daemon_service_mode_stops_clears_port_starts(monkeypatch):
+    # The wedged case: SCM stop lands but the process survives holding the
+    # port — it must be force-cleared BEFORE the fresh start, or the new
+    # daemon loses the port fight and the heal reports failure.
+    import palctl.winservice as winservice
+
+    calls: list[str] = []
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+    monkeypatch.setattr(winservice, "service_exists", lambda name: True)
+    monkeypatch.setattr(
+        "palctl.procs._run_capture", lambda cmd, timeout=30.0: calls.append("sc-stop") or ""
+    )
+    monkeypatch.setattr("palctl.procs.service_state", lambda name: "STOPPED")
+    # Port answers before the kill (the wedged process survived the SCM stop)
+    # and after the fresh start (heal verified) — True both times.
+    monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: True)
+    monkeypatch.setattr(daemon_mod, "_stop_daemon_process", lambda: calls.append("kill"))
+    monkeypatch.setattr(winservice, "start_service", lambda name: calls.append("start"))
+    monkeypatch.setattr(
+        daemon_mod, "_wait_until", lambda pred, timeout, interval=1.0: pred()
+    )
+
+    assert daemon_mod._heal_daemon() is True
+    assert calls == ["sc-stop", "kill", "start"]
+
+
+def test_install_service_registers_the_health_task(monkeypatch):
+    import palctl.preflight as preflight
+    import palctl.startup as startup_mod
+    import palctl.winservice as winservice
+    import palctl.wintask as wintask
+
+    registered: dict = {}
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+    monkeypatch.setattr(preflight, "is_elevated", lambda: True)
+    monkeypatch.setattr(startup_mod, "uninstall_startup", lambda: None)
+    monkeypatch.setattr(winservice, "ensure_winsw", lambda d: "winsw.exe")
+    monkeypatch.setattr(winservice, "install_service", lambda *a, **k: None)
+    monkeypatch.setattr(winservice, "start_service", lambda name: None)
+    monkeypatch.setattr(daemon_mod, "_daemon_reachable", lambda: True)
+    monkeypatch.setattr(daemon_mod, "_stop_daemon_process", lambda: None)
+
+    def _register(exe, args="", *, every_minutes=5, as_system=False):
+        registered["as_system"] = as_system
+        return True
+
+    monkeypatch.setattr(wintask, "register_health_task", _register)
+
+    assert daemon_mod.install_service() is True
+    # SYSTEM: a service restart needs elevation, and the healer must run with
+    # nobody logged in — matching when a service-mode daemon runs.
+    assert registered["as_system"] is True
+
+
+def test_uninstall_service_removes_the_health_task(monkeypatch):
+    import palctl.preflight as preflight
+    import palctl.winservice as winservice
+    import palctl.wintask as wintask
+
+    removed: list[bool] = []
+    monkeypatch.setattr(daemon_mod.sys, "platform", "win32")
+    monkeypatch.setattr(winservice, "service_exists", lambda name: True)
+    monkeypatch.setattr(preflight, "is_elevated", lambda: True)
+    monkeypatch.setattr(winservice, "remove_service", lambda name: None)
+    monkeypatch.setattr("palctl.firewall.remove_rule", lambda: "removed")
+    monkeypatch.setattr(wintask, "remove_health_task", lambda: removed.append(True) or True)
+
+    daemon_mod.uninstall_service()
+    assert removed == [True]  # no healer left to resurrect a removed daemon
+
+
 # ---------------- login-startup daemon replacement ----------------
 
 # start_detached is the login-startup counterpart to the service-reinstall fix:
