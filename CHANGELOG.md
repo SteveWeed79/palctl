@@ -10,6 +10,12 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+## [1.2.5.5] — 2026-07-19
+
+An install-, daemon-, and desktop-GUI reliability pass, done after a full
+codebase audit — the setup/uninstall/service lifecycle and the GUI hardened,
+with the accumulated 1.2-line work now filed under a version heading.
+
 ### Added
 - **A hung daemon on Windows now heals itself.** The service wrapper restarts
   a *crashed* daemon, and systemd's watchdog restarts a *wedged* one on Linux —
@@ -124,6 +130,15 @@ Installers for every release are on the
   and encrypts the connection.
 
 ### Changed
+- **Packaging docs and installer comments brought in line with reality, and the
+  uninstall scope written down.** The packaging README still described an
+  installer that downloaded NSSM and registered a service at install time —
+  neither of which it does any more (WinSW and the VC++ runtime ship inside the
+  build, verified, and no service is registered by the installer). Stale
+  comments that called login-startup "the wizard's default" were corrected, and
+  what uninstall deliberately leaves in place (the separate PalServer game
+  service and the config directory) is now documented in `install-design.md` and
+  the installer script rather than surprising anyone.
 - **The Linux unit is now `Type=notify` with `WatchdogSec`.** The daemon
   reports readiness to systemd and sends periodic liveness pings, so a wedged
   event loop (process alive, daemon not working) gets restarted automatically —
@@ -146,6 +161,38 @@ Installers for every release are on the
   can assert the outcome.
 
 ### Fixed
+- **The desktop app now runs a single instance per user.** Closing the window
+  only hides it to the tray (the daemon is a separate process, so the server
+  keeps being managed), which meant every Start-Menu / desktop / tray click and
+  the installer's "Launch palctl" spawned *another* `palctl-gui.exe` that kept
+  running invisibly — a box could end up with four stacked on the installer's
+  "these applications should be closed" screen, which also made upgrades flaky.
+  A second launch now surfaces the running window instead of stacking a process.
+- **Re-running setup no longer restarts a healthy server.** The wizard
+  re-registered the Palworld service unconditionally, and re-registration is a
+  stop→restart — so opening setup just to change a backup folder or add the
+  Discord bot would bounce a live server and disconnect its players. Setup now
+  skips re-registration when the service is already registered with exactly the
+  configuration it would write, and only ever replaces (and restarts) on a real
+  change.
+- **Discord `/restart` and `/update` report "busy" instead of silently
+  queueing.** They now match the dashboard's behaviour: if the server is
+  mid-operation, the bot says so rather than stacking a second countdown or
+  update behind the first.
+- **Saving Config no longer rewrites — or accidentally blanks — your saved
+  secrets.** The admin password and Discord token were written to the keyring on
+  every Save, and because the fields are prefilled, clearing one and saving an
+  unrelated setting could wipe a working REST password or bot token. Save now
+  writes a secret only when it actually changed (unticking Discord, not clearing
+  the token, is still how you turn the bot off).
+- **Setup refuses to register a nameless service account.** If Windows reported
+  no account name for the process, `--as-user` registration used to fall through
+  to LocalSystem — silently re-creating the account split it exists to prevent.
+  It now fails with the cause instead.
+- **The wizard's "Windows password needed" message no longer points at a button
+  that was removed.** It now names the real choices, including the console
+  escape hatch (`palctl-daemon install-startup`) for PIN-only / passwordless
+  accounts that cannot host a service logon.
 - **The GUI's "daemon rejected the token" 401 under a user-account service —
   the service now really shares your config.** Windows builds a service's
   environment from the SYSTEM block: `%APPDATA%` is set by your interactive
