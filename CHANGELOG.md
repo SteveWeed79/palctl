@@ -11,6 +11,27 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Added
+- **A hung daemon on Windows now heals itself.** The service wrapper restarts
+  a *crashed* daemon, and systemd's watchdog restarts a *wedged* one on Linux —
+  but on Windows a daemon that was alive-yet-stuck (the state `/healthz`
+  reports with a 503) was only ever *visible*, never acted on. Registering the
+  daemon (service or login startup) now also schedules a Task Scheduler job
+  that runs `palctl-daemon health-check` every 5 minutes: it probes `/healthz`,
+  counts consecutive failures across runs, and after three (~15 minutes of
+  confirmed wedge) restarts the daemon the way it's actually deployed — then
+  verifies the control port answers, never assumes. One blip (a restart in
+  progress, a box waking from sleep) triggers nothing, and a single healthy
+  probe resets the streak. The task is removed with whatever registered it, so
+  it can never resurrect a daemon you turned off.
+- **Every backup now carries palctl's own settings — disaster recovery for the
+  brain, not just the world.** Each backup folder gains a `palctl-config.zip`
+  with `config.json`, the daemon state, and the playtime/session history, so a
+  dead disk no longer costs your whole setup alongside nothing (the world was
+  covered; the config that manages it wasn't). It rides inside the backup
+  directory, so retention and the off-site mirror cover it with zero new
+  machinery; restores explicitly exclude it, so it can never leak into
+  SaveGames. Deliberately whitelisted: the API token (a local secret) and the
+  logs never leave the box.
 - **A frame-time watchdog — restart on the *slideshow*, not just the leak.**
   The memory watchdog restarts on RSS, but Palworld can bog down to single-digit
   server FPS while still under the memory limit. Opt-in in Config: when the

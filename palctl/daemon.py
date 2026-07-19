@@ -1337,6 +1337,9 @@ def install_service(as_user: bool = False, password: str | None = None) -> bool:
     # control port answering is the signal that it actually came up.
     if _wait_until(_daemon_reachable, timeout=30.0):
         print(f"[daemon] service '{SERVICE_NAME}' installed and started.")
+        # SYSTEM: restarting a service needs elevation, and the healer must
+        # run with nobody logged in — matching when a service-mode daemon runs.
+        _register_health_task(as_system=True)
         return True
 
     # It didn't come up. Say WHY as specifically as we can rather than one
@@ -1400,15 +1403,39 @@ def uninstall_service() -> None:
         # the cache still describes a service that no longer exists.
         for p in winservice.wrapper_paths(config_dir() / "bin", SERVICE_NAME):
             p.unlink(missing_ok=True)
-        # Don't leave the dashboard firewall port open after uninstall.
-        from . import firewall
+        # Don't leave the dashboard firewall port open after uninstall — nor a
+        # health task that would resurrect a daemon the user just removed.
+        from . import firewall, wintask
 
         firewall.remove_rule()
+        wintask.remove_health_task()
     else:
         from . import systemd
 
         systemd.remove_service(SERVICE_NAME)
     print(f"[daemon] service '{SERVICE_NAME}' removed.")
+
+
+def _register_health_task(*, as_system: bool) -> None:
+    """Best-effort: put the hung-daemon healer in place (Windows Task
+    Scheduler). The wrapper restarts a crash; this catches the wedge — alive
+    but not polling — that nothing on Windows acted on before. Never fatal:
+    a daemon without its healer is still a daemon."""
+    if not sys.platform.startswith("win"):
+        return
+    from . import wintask
+
+    exe, args, _ = service_target()
+    if wintask.register_health_task(exe, args, as_system=as_system):
+        print(
+            "[daemon] health watchdog scheduled: every 5 minutes palctl checks "
+            "itself and auto-restarts a hung daemon."
+        )
+    else:
+        print(
+            "[daemon] couldn't schedule the health watchdog (Task Scheduler "
+            "refused) — a hung daemon will need a manual restart."
+        )
 
 
 def install_startup() -> None:
@@ -1422,6 +1449,10 @@ def install_startup() -> None:
 
     exe, args, _ = service_target()
     startup.install_startup(exe, args)
+    # The healer runs as the user (no elevation needed to restart your own
+    # process) and thus only while logged in — exactly when a login-mode
+    # daemon is supposed to exist at all.
+    _register_health_task(as_system=False)
     print(
         "[daemon] palctl will start automatically when you log in — no password "
         "or Windows service needed."
@@ -1431,9 +1462,12 @@ def install_startup() -> None:
 def uninstall_startup() -> None:
     if not sys.platform.startswith("win"):
         return
-    from . import startup
+    from . import startup, wintask
 
     startup.uninstall_startup()
+    # The healer must go with the thing it heals, or it resurrects a daemon
+    # the user just turned off.
+    wintask.remove_health_task()
     print("[daemon] removed palctl from login startup.")
 
 
@@ -1546,6 +1580,71 @@ def start_detached() -> bool:
     return _wait_until(_daemon_reachable, timeout=30.0)
 
 
+def _heal_daemon() -> bool:
+    """Restart the daemon the way it's actually deployed. Called by the
+    scheduled health check after confirmed consecutive /healthz failures.
+    Service mode: bounce the service (stopping first clears a wedged process;
+    force-kill anything still on the port so the fresh start can bind it).
+    Login mode: replace the process, exactly like start_detached. Returns
+    whether a daemon answers afterward — verified, never assumed."""
+    if sys.platform.startswith("win"):
+        from . import winservice
+
+        if winservice.service_exists(SERVICE_NAME):
+            procs._run_capture(["sc.exe", "stop", SERVICE_NAME])
+            _wait_until(
+                lambda: procs.service_state(SERVICE_NAME) in ("STOPPED", "UNKNOWN"),
+                timeout=60.0,
+            )
+            if _daemon_reachable():
+                _stop_daemon_process()  # wedged process survived the SCM stop
+            winservice.start_service(SERVICE_NAME)
+            return _wait_until(_daemon_reachable, timeout=30.0)
+        return start_detached()
+    # Linux: systemd's WatchdogSec is the primary wedge-recovery; this path
+    # exists so a manual `palctl-daemon health-check` still heals there too.
+    procs._run_capture(["systemctl", "restart", SERVICE_NAME])
+    return _wait_until(_daemon_reachable, timeout=30.0)
+
+
+def run_health_check(threshold: int | None = None) -> int:
+    """The `health-check` command the scheduled task runs. Probes /healthz,
+    counts consecutive failures across runs, and heals only on a confirmed
+    streak — one blip (a restart in progress, a box waking from sleep) never
+    triggers anything. Exit code: 0 unless a heal was attempted and failed,
+    so the Task Scheduler history shows real failures and nothing else."""
+    from . import healthcheck
+
+    log = setup_logging()
+    threshold = threshold if threshold is not None else healthcheck.DEFAULT_THRESHOLD
+    healthy = healthcheck.probe()
+    action, failures = healthcheck.decide(
+        healthy=healthy, failures=healthcheck.load_failures(), threshold=threshold
+    )
+    healthcheck.save_failures(failures)
+    if action == "ok":
+        return 0
+    if action == "wait":
+        log.warning(
+            "health-check: daemon unhealthy (%d/%d consecutive probes)",
+            failures, threshold,
+        )
+        return 0
+    log.warning(
+        "health-check: daemon unhealthy for %d consecutive probes — restarting it",
+        threshold,
+    )
+    ok = _heal_daemon()
+    if ok:
+        log.warning("health-check: daemon restarted and answering again")
+        return 0
+    log.error(
+        "health-check: restart attempted but the daemon is still not answering "
+        "— it needs a human (try `palctl-daemon run` in a console to see why)."
+    )
+    return 1
+
+
 def _hide_console() -> None:
     """Hide our own console window (the --headless login-startup path), so
     logging in doesn't flash a black box. No-op if there's no console."""
@@ -1578,9 +1677,12 @@ def main() -> None:
             "uninstall-service",
             "install-startup",
             "uninstall-startup",
+            "health-check",
         ],
-        help="run the daemon (default); (un)register a Windows service; or "
-        "(un)register password-free login startup",
+        help="run the daemon (default); (un)register a Windows service; "
+        "(un)register password-free login startup; or probe the daemon's "
+        "health and restart it if it's been unresponsive (used by the "
+        "scheduled health task)",
     )
     parser.add_argument(
         "--as-user",
@@ -1617,6 +1719,8 @@ def main() -> None:
     if args.command == "uninstall-startup":
         uninstall_startup()
         return
+    if args.command == "health-check":
+        sys.exit(run_health_check())
 
     if args.headless:
         _hide_console()

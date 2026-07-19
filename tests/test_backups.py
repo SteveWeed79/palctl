@@ -299,3 +299,57 @@ def test_prune_never_deletes_non_backup_dirs(tmp_path: Path):
     remaining = {d.name for d in root.iterdir()}
     assert "Photos" in remaining and "0-user-folder" in remaining  # untouched
     assert "2026-01-03_00-00-00-scheduled" in remaining  # newest backup kept
+
+
+# ---------- config snapshot (palctl's own DR, riding inside each backup) ----------
+
+
+def test_create_writes_config_snapshot(tmp_path: Path, monkeypatch):
+    # The world was covered; the config that manages it wasn't. Every backup now
+    # carries palctl-config.zip with the config/state/history — whitelisted, so
+    # the token (a local secret) and the logs never ride a backup off-box.
+    import zipfile
+
+    cfgdir = tmp_path / "palctl-config"
+    cfgdir.mkdir()
+    (cfgdir / "config.json").write_text('{"api_port": 8212}', encoding="utf-8")
+    (cfgdir / "sessions.db").write_bytes(b"sqlite-ish")
+    (cfgdir / "daemon_token").write_text("SECRET", encoding="utf-8")
+    (cfgdir / "daemon_state.json").write_text('{"desired_running": true}', encoding="utf-8")
+    monkeypatch.setattr("palctl.config.config_dir", lambda: cfgdir)
+
+    b = backups.create(make_savegames(tmp_path), tmp_path / "backups", "manual")
+
+    snap = b.path / backups.CONFIG_SNAPSHOT_NAME
+    assert snap.exists()
+    with zipfile.ZipFile(snap) as z:
+        names = set(z.namelist())
+    assert "config.json" in names
+    assert "sessions.db" in names
+    assert "daemon_state.json" in names
+    assert "daemon_token" not in names  # a local secret never leaves the box
+
+
+def test_create_survives_missing_config(tmp_path: Path, monkeypatch):
+    # A snapshot problem must never fail the world backup — the world is the point.
+    monkeypatch.setattr("palctl.config.config_dir", lambda: tmp_path / "missing")
+    b = backups.create(make_savegames(tmp_path), tmp_path / "backups", "manual")
+    assert b.path.exists()  # backup fine regardless
+
+
+def test_restore_excludes_the_config_snapshot(tmp_path: Path, monkeypatch):
+    # The snapshot rides inside the backup dir (so retention/mirroring cover
+    # it), but it is palctl's file — restoring must not plant a zip in SaveGames.
+    cfgdir = tmp_path / "palctl-config"
+    cfgdir.mkdir()
+    (cfgdir / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("palctl.config.config_dir", lambda: cfgdir)
+
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+    b = backups.create(sg, root, "manual")
+    assert (b.path / backups.CONFIG_SNAPSHOT_NAME).exists()
+
+    backups.restore(root, b.name, sg)
+    assert not (sg / backups.CONFIG_SNAPSHOT_NAME).exists()
+    assert (sg / "0" / "world" / "Level.sav").exists()  # the world came back
