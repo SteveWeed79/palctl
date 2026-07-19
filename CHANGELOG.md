@@ -158,6 +158,16 @@ Installers for every release are on the
   `bin` folder, re-run setup — with the SHA-256 to check it against), and setup
   fetches everything it needs to download *before* touching a single byte of
   config, so a blocked download aborts a setup that changed nothing.
+- **The installer now ships WinSW inside the build — no install-time download
+  at all.** The release build downloads the service wrapper once, verifies it
+  against the pin, and places it next to palctl's exes; `ensure_winsw` prefers
+  that bundled copy (hash-checked again at use; a tampered copy is skipped,
+  never used). Installer users can now register services fully offline, and
+  the class of first-run failures on fresh Windows boxes — whose sparse
+  root-certificate store makes Python's HTTPS verification fail even though
+  the browser works — is gone entirely. The bundling step also re-verifies the
+  pin on every release, so a wrong pin fails the build instead of a user's
+  setup. (pip/source installs keep the verified download as the fallback.)
 - **The wizard defaults to the one correct install path and removes the wrong
   one from the menu.** "Run as a Windows service under your account" is now the
   pre-selected default, and while "Register the Palworld server as a Windows

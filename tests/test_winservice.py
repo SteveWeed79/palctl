@@ -231,6 +231,51 @@ def test_ensure_winsw_caches_a_matching_download(tmp_path: Path, monkeypatch):
     assert winservice.ensure_winsw(tmp_path / "cache", sha256=good) == out
 
 
+def _fake_frozen(monkeypatch, exe_dir: Path):
+    """Pretend we're the frozen build, with palctl's exe living in exe_dir."""
+    monkeypatch.setattr(winservice.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(winservice.sys, "executable", str(exe_dir / "palctl-gui.exe"))
+
+
+def test_ensure_winsw_prefers_the_bundled_copy_over_downloading(
+    tmp_path: Path, monkeypatch
+):
+    # The installer ships winsw.exe next to palctl's exes; a frozen build must
+    # use it and never touch the network — that download is where fresh boxes
+    # (sparse cert store) and AV HTTPS-scanning used to kill setup.
+    data = b"MZ-bundled-winsw"
+    good = hashlib.sha256(data).hexdigest()
+    exe_dir = tmp_path / "app"
+    exe_dir.mkdir()
+    (exe_dir / "winsw.exe").write_bytes(data)
+    _fake_frozen(monkeypatch, exe_dir)
+    monkeypatch.setattr(
+        "palctl.fetch.open_url",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("downloaded")),
+    )
+
+    out = winservice.ensure_winsw(tmp_path / "cache", sha256=good)
+    assert out == tmp_path / "cache" / "winsw.exe"
+    assert out.read_bytes() == data
+
+
+def test_bundled_winsw_rejects_a_tampered_copy_and_none_when_not_frozen(
+    tmp_path: Path, monkeypatch
+):
+    exe_dir = tmp_path / "app"
+    exe_dir.mkdir()
+    (exe_dir / "winsw.exe").write_bytes(b"MZ-tampered")
+    # Not frozen (dev checkout): no bundled copy, regardless of what's on disk.
+    monkeypatch.setattr(winservice.sys, "frozen", False, raising=False)
+    assert winservice.bundled_winsw(sha256="f" * 64) is None
+    # Frozen but the bytes don't match the pin: skipped, never used.
+    _fake_frozen(monkeypatch, exe_dir)
+    assert winservice.bundled_winsw(sha256="f" * 64) is None
+    # Frozen and matching: returned.
+    good = hashlib.sha256(b"MZ-tampered").hexdigest()
+    assert winservice.bundled_winsw(sha256=good) == exe_dir / "winsw.exe"
+
+
 def test_ensure_winsw_blocked_download_names_the_manual_workaround(
     tmp_path: Path, monkeypatch
 ):

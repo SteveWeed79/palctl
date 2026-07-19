@@ -24,6 +24,22 @@ Push-Location packaging
 & $py -m PyInstaller --noconfirm --clean --distpath ..\dist --workpath ..\build palctl.spec
 Pop-Location
 
+# Ship WinSW inside the build, verified here against the pin in
+# palctl/winservice.py (single source of truth). Installer users then never
+# download the service wrapper at install time — which is exactly where fresh
+# Windows boxes (sparse root-cert store) and AV HTTPS-scanning used to kill
+# setup with CERTIFICATE_VERIFY_FAILED.
+Write-Host "==> Bundling WinSW (hash-verified) into dist\palctl\"
+$winswUrl = & $py -c "from palctl.winservice import WINSW_URL; print(WINSW_URL)"
+$winswSha = & $py -c "from palctl.winservice import WINSW_SHA256; print(WINSW_SHA256)"
+$winswDest = "dist\palctl\winsw.exe"
+Invoke-WebRequest -Uri $winswUrl -OutFile $winswDest -UseBasicParsing
+$actual = (Get-FileHash -Algorithm SHA256 $winswDest).Hash.ToLower()
+if ($actual -ne $winswSha.ToLower()) {
+    Remove-Item $winswDest
+    throw "WinSW hash mismatch: expected $winswSha, got $actual — refusing to bundle."
+}
+
 Write-Host "==> Binaries are in dist\palctl\"
 
 $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"

@@ -62,6 +62,25 @@ jobs:
         working-directory: packaging
         run: python -m PyInstaller --noconfirm --clean --distpath ..\dist --workpath ..\build palctl.spec
 
+      - name: Bundle WinSW (hash-verified) into the build
+        # Ship the service wrapper inside the installer, verified against the
+        # pin in palctl/winservice.py, so installer users never download it at
+        # install time — fresh Windows boxes (sparse root-cert store) and AV
+        # HTTPS-scanning used to kill setup there with CERTIFICATE_VERIFY_FAILED.
+        # This step doubles as the pin's independent re-verification on every
+        # release: a wrong pin fails the build, never a user's setup.
+        shell: pwsh
+        run: |
+          $url = python -c "from palctl.winservice import WINSW_URL; print(WINSW_URL)"
+          $sha = python -c "from palctl.winservice import WINSW_SHA256; print(WINSW_SHA256)"
+          $dest = "dist\palctl\winsw.exe"
+          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+          $actual = (Get-FileHash -Algorithm SHA256 $dest).Hash.ToLower()
+          if ($actual -ne $sha.ToLower()) {
+            Remove-Item $dest
+            throw "WinSW hash mismatch: expected $sha, got $actual - refusing to bundle."
+          }
+
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
 

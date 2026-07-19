@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -242,18 +243,44 @@ def remove_service(name: str) -> None:
     _run(["sc.exe", "delete", name])
 
 
+def bundled_winsw(*, sha256: str = WINSW_SHA256) -> Path | None:
+    """The WinSW copy shipped inside the frozen build (packaging places a
+    hash-verified winsw.exe next to palctl's own exes at build time). ``None``
+    in a dev checkout, when the file is absent, or when it doesn't match the
+    pin — a tampered or stale bundled copy is silently skipped in favour of the
+    verified download, never used."""
+    if not getattr(sys, "frozen", False):
+        return None
+    p = Path(sys.executable).parent / "winsw.exe"
+    try:
+        if p.is_file() and (not sha256 or _sha256_of(p).lower() == sha256.lower()):
+            return p
+    except OSError:
+        pass
+    return None
+
+
 def ensure_winsw(
     cache_dir: Path, *, url: str = WINSW_URL, sha256: str = WINSW_SHA256
 ) -> Path:
     """
-    Return a usable WinSW exe, downloading and caching it under ``cache_dir``
-    the first time. Subsequent calls reuse the cached copy. The download is
-    verified against the pinned SHA-256 before it lands as the cached binary;
-    pass ``sha256=""`` only to deliberately skip that (there is no good reason
-    to in production).
+    Return a usable WinSW exe: the cached copy, else the copy bundled inside
+    the frozen build, else a verified download into ``cache_dir``. The frozen
+    installer ships winsw.exe next to palctl's own exes (downloaded and
+    hash-verified by CI at build time), so installer users never download at
+    install time — the network path exists only for pip/source installs and as
+    a fallback. Anything that lands in the cache is verified against the
+    pinned SHA-256 first; pass ``sha256=""`` only to deliberately skip that
+    (there is no good reason to in production).
     """
     cached = cache_dir / "winsw.exe"
     if cached.exists():
+        return cached
+
+    bundled = bundled_winsw(sha256=sha256)
+    if bundled is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bundled, cached)
         return cached
 
     cache_dir.mkdir(parents=True, exist_ok=True)
