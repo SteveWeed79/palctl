@@ -51,6 +51,20 @@ CI job, which exercises the real state machine against a real Windows SCM.
   on an active unit). This mirrors Debian's own packaging convention:
   `dh_installsystemd` generates `restart` on upgrade, `start` on fresh install.
 
+**Exception — never bounce a healthy game server.** Replacing a registration
+restarts the service, which is fine for palctl's own daemon but *not* for the
+Palworld server: a host who re-opens the wizard to change an unrelated setting
+must not have their live server stopped and their players disconnected.
+`_register_server_service` therefore consults `winservice.config_is_current`
+first and **skips re-registration entirely** when the PalServer service is
+already registered with byte-for-byte the config it would write (password
+excluded — it's scrubbed post-install). A genuine change (account, path, args)
+still replaces-and-restarts; an unchanged re-run leaves the server running. The
+downstream verify step never restarts either — `procs.start_service` no-ops on
+an already-`RUNNING` service and never issues a stop. This is the one place the
+"reinstall replaces" rule is deliberately softened, and it is softened toward
+*not touching a running server*.
+
 ### 2. Exactly one startup mechanism owns the daemon
 
 Three modes exist: **service** (WinSW / systemd), **login startup** (HKCU Run
@@ -176,6 +190,30 @@ after — see the comments in `installer.iss`. Known accepted limitation: its
 HKCU Run-key probe runs in the elevated user's hive, so the
 standard-user-plus-admin-credentials case won't auto-restart a login-mode
 daemon after upgrade.
+
+### What uninstall removes — and what it deliberately doesn't
+
+`[UninstallRun]` removes everything palctl owns of *itself*: the
+**palctl-daemon** service, the login-startup Run key, any running daemon/GUI
+process, the dashboard firewall rule, and the health task. What it does **not**
+touch, by design:
+
+* **The PalServer service.** It is a *separate* service the wizard registered
+  for the user's game server; removing palctl should not silently deregister
+  the thing that keeps their world online. A user who wants it gone runs
+  `sc delete PalServer` (or unticks the server-service option and re-runs the
+  wizard). This is intentional, not an oversight — but there is no palctl
+  command that removes only the PalServer service today, so a full manual
+  cleanup means one `sc.exe` line.
+* **The config directory** (`%APPDATA%\palctl`), which holds `config.json`, the
+  daemon state, backups metadata, logs, and the per-service WinSW wrapper copies
+  under `bin\`. Config is preserved so a reinstall keeps the user's setup;
+  `uninstall-service` already unlinks the daemon's own wrapper pair, but the
+  PalServer wrapper copy stays as long as that service does.
+
+If uninstall is ever made to remove the game server too, it must go through
+`sc.exe stop`/`delete` (WinSW may be gone) and prompt first — silently stopping
+someone's live server on an app uninstall is the wrong default.
 
 ## Sources
 

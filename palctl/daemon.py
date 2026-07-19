@@ -1243,7 +1243,23 @@ def install_service(as_user: bool = False, password: str | None = None) -> bool:
 
         user = None
         if as_user:
-            username = os.environ.get("USERNAME", "")
+            # %USERNAME%, else getpass — `.\` + empty is a nameless account spec
+            # that WinSW silently falls back to LocalSystem for, exactly the
+            # account split --as-user exists to avoid. Fail with the cause, don't
+            # register a service that claims your account but runs as SYSTEM.
+            username = (os.environ.get("USERNAME") or "").strip()
+            if not username:
+                try:
+                    username = getpass.getuser().strip()
+                except Exception:
+                    username = ""
+            if not username:
+                print(
+                    "[daemon] Windows didn't report a user account for this "
+                    "process, so --as-user can't register the service under your "
+                    "account. Run this from your normal signed-in session."
+                )
+                return False
             user = f".\\{username}"
             # A password passed in (the setup flow / GUI, which collect it in a
             # field) is used as-is; only an interactive CLI run prompts for it.

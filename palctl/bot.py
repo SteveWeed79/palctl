@@ -257,6 +257,15 @@ class PalBot(discord.Client):
                 "bot background task failed", exc_info=task.exception()
             )
 
+    async def _run_reserved(self, name: str, coro) -> None:
+        """Run a reserved fire-and-forget operation, clearing the reservation
+        when it finishes (or fails before ever taking the real lock). Pairs with
+        self._sched.reserve(name) — see the /restart and /update commands."""
+        try:
+            await coro
+        finally:
+            self._sched.clear_reservation(name)
+
     def reconfigure(self, cfg: Config, api: PalApi) -> None:
         """Pick up a config reload: channel, notification toggles, API endpoint.
 
@@ -514,10 +523,22 @@ class PalBot(discord.Client):
             if not self._is_admin(interaction):
                 await interaction.response.send_message("Not allowed.", ephemeral=True)
                 return
+            # Reserve up front so a second /restart (or a restart while an update
+            # is mid-flight) reports 'busy' instead of silently queueing another
+            # full countdown behind the first — parity with the HTTP /action path.
+            if not self._sched.reserve("restart"):
+                await interaction.response.send_message(
+                    f"⏳ The server is mid-operation ({self._sched.current_op}) — "
+                    "try again in a moment.",
+                    ephemeral=True,
+                )
+                return
             await interaction.response.send_message(
                 f"🔁 Restarting with countdown — *{reason}*. I'll report back."
             )
-            self._spawn(self._sched.restart_with_countdown(reason))
+            self._spawn(
+                self._run_reserved("restart", self._sched.restart_with_countdown(reason))
+            )
 
         @tree.command(
             name="update", description="Update the server via SteamCMD (stops it first)"
@@ -532,11 +553,20 @@ class PalBot(discord.Client):
                 "a pre-update world backup is taken first.",
             ):
                 return
+            # Reserve only AFTER the confirm dialog (don't hold the server
+            # reserved while waiting on a button press), so a busy server is
+            # reported rather than queueing a second update behind the first.
+            if not self._sched.reserve("update"):
+                await interaction.followup.send(
+                    f"⏳ The server is mid-operation ({self._sched.current_op}) — "
+                    "try again in a moment."
+                )
+                return
             await interaction.followup.send(
                 "⏬ Updating the server via SteamCMD — I'll report back here when "
                 "it's finished."
             )
-            self._spawn(self._sched.update_server())
+            self._spawn(self._run_reserved("update", self._sched.update_server()))
 
         @tree.command(name="backups", description="List the most recent backups")
         async def backups_cmd(interaction: discord.Interaction) -> None:

@@ -243,6 +243,30 @@ def test_service_mode_with_password_registers_both_under_the_user(env):
     assert env.server_service_kwargs.get("stop_timeout") == "90 sec"
 
 
+def test_rerun_leaves_an_already_correct_server_untouched(env, monkeypatch):
+    # The "never bounce a healthy server" guarantee: re-running setup when the
+    # PalServer service is already registered with exactly this config must NOT
+    # re-register it (which would stop→restart a running server and disconnect
+    # players). It should report success and skip the registration entirely.
+    monkeypatch.setattr("palctl.winservice.config_is_current", lambda *a, **k: True)
+
+    plan = _plan(
+        env.tmp_path,
+        daemon_startup="service",
+        register_server_service=True,
+        service_password="hunter2",
+    )
+    server_root = Path(plan.server_root)
+    server_root.mkdir(parents=True, exist_ok=True)
+    (server_root / "PalServer.exe").write_text("x", encoding="utf-8")
+
+    result, lines = env.run(plan)
+    assert result.ok is True and result.server_registered is True
+    # The game service was NOT re-registered (no stop→delete→restart cycle).
+    assert env.server_service_kwargs is None
+    assert any("leaving it, and your running server" in ln for ln in lines)
+
+
 def test_service_mode_without_password_stays_localsystem(env):
     # No password → the old LocalSystem behaviour is preserved (the daemon's
     # runtime account-mismatch warning then nudges the user toward Path A).

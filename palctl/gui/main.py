@@ -649,7 +649,11 @@ class ConfigTab(QWidget):
         self.api_port = NoScrollSpinBox()
         self.api_port.setRange(1, 65535)
         self.api_port.setValue(cfg.api_port)
-        self.admin_pw = QLineEdit(get_admin_password())
+        # Prefilled from the keyring; remembered so Save only rewrites the
+        # secret when it actually changed — and never blanks a stored password
+        # just because the field was cleared (see _save).
+        self._orig_admin_pw = get_admin_password()
+        self.admin_pw = QLineEdit(self._orig_admin_pw)
         self.admin_pw.setEchoMode(QLineEdit.EchoMode.Password)
         af.addRow("Port", self.api_port)
         af.addRow("Admin password", self.admin_pw)
@@ -802,7 +806,12 @@ class ConfigTab(QWidget):
         dc = QGroupBox("Discord bot")
         df = QFormLayout(dc)
         self.dc_enabled = QCheckBox(checked=cfg.discord.enabled)
-        self.dc_token = QLineEdit(get_discord_token())
+        # Remembered like the admin password: Save only rewrites the token when
+        # it changed, and never blanks a stored token because the field was
+        # cleared (unticking Enabled is how you turn the bot off, not clearing
+        # the token).
+        self._orig_dc_token = get_discord_token()
+        self.dc_token = QLineEdit(self._orig_dc_token)
         self.dc_token.setEchoMode(QLineEdit.EchoMode.Password)
         self.dc_channel = QLineEdit(str(cfg.discord.channel_id or ""))
         self.dc_role = QLineEdit(str(cfg.discord.admin_role_id or ""))
@@ -987,8 +996,17 @@ class ConfigTab(QWidget):
             return
 
         c.save()
-        set_admin_password(self.admin_pw.text())
-        set_discord_token(self.dc_token.text())
+        # Only touch the keyring when a secret actually changed, and never write
+        # a blank over a stored one (a cleared field is not "remove the
+        # password" — that would break the REST API / bot on an unrelated save).
+        new_pw = self.admin_pw.text()
+        if new_pw and new_pw != self._orig_admin_pw:
+            set_admin_password(new_pw)
+            self._orig_admin_pw = new_pw
+        new_token = self.dc_token.text()
+        if new_token and new_token != self._orig_dc_token:
+            set_discord_token(new_token)
+            self._orig_dc_token = new_token
 
         try:
             call("/action/reload-config", {})
@@ -1205,10 +1223,122 @@ class Main(QMainWindow):
         )
 
 
+class _SingleInstance:
+    """One running palctl GUI per Windows/Linux user.
+
+    Closing the window only hides it to the tray (``setQuitOnLastWindowClosed``
+    is False, on purpose — the tray icon is the point). So without this guard
+    every Start-Menu / desktop / tray click and the installer's "Launch palctl"
+    would spawn *another* ``palctl-gui.exe`` that keeps running invisibly —
+    which is how a box ends up with four of them stacked on the installer's
+    "these applications should be closed" screen.
+
+    The standard Qt pattern: the first instance listens on a per-user local
+    endpoint (a named pipe on Windows, a socket file on Linux); a later launch
+    connects to it, asks it to surface its window, and exits instead of stacking
+    a second process. Per-user name so two signed-in users each keep their own
+    single instance. Fails **open** — any socket quirk returns "you're the
+    primary" rather than locking someone out of their own GUI. QtNetwork is
+    imported lazily so merely importing this module (import-smoke) never needs
+    it."""
+
+    def __init__(self, key: str = "palctl-gui") -> None:
+        import getpass
+
+        try:
+            user = getpass.getuser()
+        except Exception:
+            user = "user"
+        # Keep the endpoint name pipe/path-safe regardless of the account name.
+        safe = "".join(c if c.isalnum() else "_" for c in user) or "user"
+        self._name = f"{key}-{safe}"
+        self._server = None
+        self._window = None
+
+    def acquire(self) -> bool:
+        """True if we became the primary instance (and are now listening for
+        later launches); False if a live instance already owns the endpoint."""
+        try:
+            from PySide6.QtNetwork import QLocalServer, QLocalSocket
+
+            probe = QLocalSocket()
+            probe.connectToServer(self._name)
+            if probe.waitForConnected(200):
+                probe.abort()
+                return False  # a live instance answered — we're the second one
+            probe.abort()
+            # No live peer. A crashed instance can leave a stale endpoint behind
+            # (a Linux socket file, a Windows pipe); clear it, then claim the name.
+            QLocalServer.removeServer(self._name)
+            server = QLocalServer()
+            try:
+                # Restrict the endpoint to this user account where supported.
+                server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+            except Exception:
+                pass
+            if not server.listen(self._name):
+                # Someone claimed the name in the tiny gap between probe and
+                # listen: if they answer now, defer to them; otherwise fail open.
+                racer = QLocalSocket()
+                racer.connectToServer(self._name)
+                won = racer.waitForConnected(200)
+                racer.abort()
+                return not won
+            server.newConnection.connect(self._on_new_connection)
+            self._server = server
+            return True
+        except Exception:
+            # Never let a socket problem stop the user opening their GUI.
+            return True
+
+    def signal_existing(self, timeout_ms: int = 800) -> bool:
+        """Ask the already-running instance to bring its window to the front."""
+        try:
+            from PySide6.QtNetwork import QLocalSocket
+
+            sock = QLocalSocket()
+            sock.connectToServer(self._name)
+            if not sock.waitForConnected(timeout_ms):
+                return False
+            sock.write(b"activate")
+            sock.flush()
+            sock.waitForBytesWritten(timeout_ms)
+            sock.disconnectFromServer()
+            return True
+        except Exception:
+            return False
+
+    def set_activation_target(self, window) -> None:
+        """The window a second launch should raise. Held so it isn't GC'd."""
+        self._window = window
+
+    def _on_new_connection(self) -> None:
+        if self._server is not None:
+            conn = self._server.nextPendingConnection()
+            if conn is not None:
+                conn.disconnected.connect(conn.deleteLater)
+        win = self._window
+        if win is not None:
+            # Undo the minimise-to-tray and pull the existing window forward.
+            win.showNormal()
+            win.raise_()
+            win.activateWindow()
+
+
 def main() -> None:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+
+    # One GUI per user: if palctl is already running (usually just hidden in the
+    # tray — closing the window doesn't quit), ask that instance to surface and
+    # exit, rather than stacking another invisible palctl-gui.exe.
+    guard = _SingleInstance()
+    if not guard.acquire():
+        guard.signal_existing()
+        return
+
     w = Main()
+    guard.set_activation_target(w)
     w.show()
     sys.exit(app.exec())
 

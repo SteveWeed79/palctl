@@ -30,6 +30,24 @@ Log = Callable[[str], None]
 PALSERVER_ARGS = "-useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS"
 
 
+def _invoking_username() -> str:
+    """The account the user-account services should log on as. %USERNAME% is what
+    Windows sets for an interactive process; getpass.getuser() is the fallback
+    (and what the faked-platform tests, which don't set %USERNAME%, resolve to).
+    Returns "" only when neither yields a name — the one case setup must refuse
+    rather than register a nameless (→ LocalSystem) service account."""
+    import getpass
+    import os
+
+    name = os.environ.get("USERNAME")
+    if not name:
+        try:
+            name = getpass.getuser()
+        except Exception:
+            name = ""
+    return (name or "").strip()
+
+
 @dataclass
 class SetupPlan:
     server_root: str
@@ -39,8 +57,12 @@ class SetupPlan:
     install_server: bool
     install_vcredist: bool
     register_server_service: bool
-    # How the daemon starts in the background: "login" (password-free HKCU Run
-    # key, the default), "service" (Windows service, starts on boot), or "none".
+    # How the daemon starts in the background: "service" (Windows service under
+    # your account, starts on boot — the wizard's default), "none", or "login"
+    # (password-free HKCU Run key). "login" is the CLI/legacy path only
+    # (palctl-daemon install-startup, or configs from before the service
+    # default); the wizard no longer offers it — see the background-group
+    # comment in gui/wizard.py.
     daemon_startup: str
     service_name: str
     # Windows account password for user-account services (Path A: the daemon and
@@ -428,8 +450,6 @@ def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
     With a service password (Path A), it registers under the invoking user — so
     palctl, running as that same user, can actually read the server process it
     watches; otherwise it stays LocalSystem."""
-    import os
-
     from . import winservice
 
     exe = Path(plan.server_root) / "PalServer.exe"
@@ -442,17 +462,50 @@ def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
         return False
     user = password = None
     if plan.service_password:
-        user = f".\\{os.environ.get('USERNAME', '')}"
+        # The account the service must log on as. `.\` + empty is a nameless
+        # account spec that WinSW silently turns into LocalSystem — re-creating
+        # the very account split Path A exists to prevent — so resolve a real
+        # name (%USERNAME%, else getpass) and refuse with the cause if there
+        # genuinely isn't one, rather than registering a broken service.
+        username = _invoking_username()
+        if not username:
+            raise RuntimeError(
+                "Windows didn't report a user account for this process, so palctl "
+                "can't register the server under your account. Run setup from your "
+                "normal signed-in session."
+            )
+        user = f".\\{username}"
         password = plan.service_password
+
+    bin_dir = config_dir() / "bin"
+    # PalServer flushes the world on the way down; a wrapper that kills it at the
+    # default 30s on a plain `net stop` or system shutdown risks the save. 90s
+    # matches how long palctl itself waits for a stopping server.
+    stop_timeout = "90 sec"
+
+    # Never bounce a healthy, already-correct server on a wizard re-run. If the
+    # service is already registered with exactly the config we'd write,
+    # re-registering (stop → delete → register → start) would only restart a
+    # running server — disconnecting players — for no change at all. Leave it be.
+    # Both the start=False registration below and _verify_and_report's
+    # start_service are no-ops on an already-running service, so skipping here
+    # means the whole re-run never touches the server.
+    if winservice.config_is_current(
+        bin_dir, plan.service_name, exe, PALSERVER_ARGS, plan.server_root,
+        user=user, stop_timeout=stop_timeout,
+    ):
+        log(
+            f"  Service '{plan.service_name}' is already registered and unchanged "
+            "— leaving it, and your running server, exactly as they are."
+        )
+        return True
+
     log(f"Registering the '{plan.service_name}' Windows service…")
-    winsw = winservice.ensure_winsw(config_dir() / "bin")
+    winsw = winservice.ensure_winsw(bin_dir)
     winservice.install_service(
         winsw, plan.service_name, exe, PALSERVER_ARGS, plan.server_root,
         user=user, password=password, start=False,
-        # PalServer flushes the world on the way down; a wrapper that kills it
-        # at the default 30s on a plain `net stop` or system shutdown risks the
-        # save. 90s matches how long palctl itself waits for a stopping server.
-        stop_timeout="90 sec",
+        stop_timeout=stop_timeout,
     )
     log(
         f"  Service '{plan.service_name}' registered"
