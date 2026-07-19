@@ -36,6 +36,34 @@ def test_config_xml_minimal_omits_optional_fields():
     assert "<description>svc</description>" in xml  # falls back to the name
 
 
+def test_config_xml_stop_timeout_default_and_override():
+    assert "<stoptimeout>30 sec</stoptimeout>" in winservice.winsw_config_xml("s", "s.exe")
+    assert "<stoptimeout>90 sec</stoptimeout>" in winservice.winsw_config_xml(
+        "s", "s.exe", stop_timeout="90 sec"
+    )
+
+
+def test_install_service_scrubs_the_password_after_registration(monkeypatch, tmp_path):
+    # The SCM stores the account password itself (encrypted) once `install`
+    # runs — the XML copy must not outlive that moment. Leaving it would keep a
+    # Windows password in a plaintext file for the service's lifetime (NSSM
+    # never had this trap; it stored nothing).
+    calls, winsw = _install_env(monkeypatch, tmp_path, exists=False)
+
+    winservice.install_service(
+        winsw, "palctl-daemon", "svc.exe", user=r".\steve", password="hunter2",
+    )
+
+    _, svc_xml = winservice.wrapper_paths(tmp_path, "palctl-daemon")
+    text = svc_xml.read_text(encoding="utf-8")
+    assert "hunter2" not in text                      # the secret is gone
+    assert r"<username>.\steve</username>" in text    # the account remains
+    assert "<allowservicelogon>true</allowservicelogon>" in text
+    # And registration really happened before the scrub (install was issued).
+    svc_exe, _ = winservice.wrapper_paths(tmp_path, "palctl-daemon")
+    assert [str(svc_exe), "install"] in calls
+
+
 def test_config_xml_as_user_sets_serviceaccount_and_logon_right():
     xml = winservice.winsw_config_xml(
         "svc", "svc.exe", user=r".\steve", password="hunter2",
@@ -203,8 +231,9 @@ def test_wait_for_times_out(monkeypatch):
 
 
 def _fake_download(monkeypatch, data: bytes):
+    # ensure_winsw downloads via fetch.open_url (system trust + certifi retry).
     monkeypatch.setattr(
-        winservice.urllib.request, "urlopen",
+        "palctl.fetch.open_url",
         lambda url, timeout=None: io.BytesIO(data),
     )
 
@@ -224,10 +253,87 @@ def test_ensure_winsw_caches_a_matching_download(tmp_path: Path, monkeypatch):
     assert out.read_bytes() == data
     # Second call reuses the cache — no download.
     monkeypatch.setattr(
-        winservice.urllib.request, "urlopen",
+        "palctl.fetch.open_url",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-downloaded")),
     )
     assert winservice.ensure_winsw(tmp_path / "cache", sha256=good) == out
+
+
+def _fake_frozen(monkeypatch, exe_dir: Path):
+    """Pretend we're the frozen build, with palctl's exe living in exe_dir."""
+    monkeypatch.setattr(winservice.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(winservice.sys, "executable", str(exe_dir / "palctl-gui.exe"))
+
+
+def test_ensure_winsw_discards_a_tampered_cache(tmp_path: Path, monkeypatch):
+    # The cache becomes a SYSTEM service binary — it is verified on every use,
+    # not just at download time. Tampered bytes are discarded and replaced via
+    # the verified paths; a manual drop that MATCHES the pin still works.
+    data = b"MZ-good-winsw"
+    good = hashlib.sha256(data).hexdigest()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "winsw.exe").write_bytes(b"MZ-tampered")
+    _fake_download(monkeypatch, data)
+
+    out = winservice.ensure_winsw(cache, sha256=good)
+    assert out.read_bytes() == data  # replaced, not trusted
+
+
+def test_ensure_winsw_prefers_the_bundled_copy_over_downloading(
+    tmp_path: Path, monkeypatch
+):
+    # The installer ships winsw.exe next to palctl's exes; a frozen build must
+    # use it and never touch the network — that download is where fresh boxes
+    # (sparse cert store) and AV HTTPS-scanning used to kill setup.
+    data = b"MZ-bundled-winsw"
+    good = hashlib.sha256(data).hexdigest()
+    exe_dir = tmp_path / "app"
+    exe_dir.mkdir()
+    (exe_dir / "winsw.exe").write_bytes(data)
+    _fake_frozen(monkeypatch, exe_dir)
+    monkeypatch.setattr(
+        "palctl.fetch.open_url",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("downloaded")),
+    )
+
+    out = winservice.ensure_winsw(tmp_path / "cache", sha256=good)
+    assert out == tmp_path / "cache" / "winsw.exe"
+    assert out.read_bytes() == data
+
+
+def test_bundled_winsw_rejects_a_tampered_copy_and_none_when_not_frozen(
+    tmp_path: Path, monkeypatch
+):
+    exe_dir = tmp_path / "app"
+    exe_dir.mkdir()
+    (exe_dir / "winsw.exe").write_bytes(b"MZ-tampered")
+    # Not frozen (dev checkout): no bundled copy, regardless of what's on disk.
+    monkeypatch.setattr(winservice.sys, "frozen", False, raising=False)
+    assert winservice.bundled_winsw(sha256="f" * 64) is None
+    # Frozen but the bytes don't match the pin: skipped, never used.
+    _fake_frozen(monkeypatch, exe_dir)
+    assert winservice.bundled_winsw(sha256="f" * 64) is None
+    # Frozen and matching: returned.
+    good = hashlib.sha256(b"MZ-tampered").hexdigest()
+    assert winservice.bundled_winsw(sha256=good) == exe_dir / "winsw.exe"
+
+
+def test_ensure_winsw_blocked_download_names_the_manual_workaround(
+    tmp_path: Path, monkeypatch
+):
+    # A box where HTTPS verification fails (AV scanning, broken cert store)
+    # must get an actionable escape hatch — the exact file to download and
+    # where to put it — not a bare _ssl.c error that stops setup dead.
+    monkeypatch.setattr(
+        "palctl.fetch.open_url",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("could not verify the HTTPS")),
+    )
+    cache = tmp_path / "cache"
+    with pytest.raises(OSError, match="Workaround") as ei:
+        winservice.ensure_winsw(cache)
+    assert str(cache / "winsw.exe") in str(ei.value)  # tells them where to put it
+    assert winservice.WINSW_SHA256 in str(ei.value)   # and how to check it
 
 
 def test_ensure_winsw_refuses_a_tampered_download(tmp_path: Path, monkeypatch):

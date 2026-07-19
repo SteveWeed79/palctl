@@ -213,18 +213,26 @@ works if you'd rather drive it yourself.
 Download `palctl-setup.exe` from the
 [latest release](https://github.com/SteveWeed79/palctl/releases/latest)
 (or build it yourself from `packaging/`, see
-[packaging/README.md](packaging/README.md)). No Python needed. It installs both
-binaries, adds shortcuts, and offers to register the palctl background service.
-Then it opens the GUI, and the **first-run wizard** does the rest:
+[packaging/README.md](packaging/README.md)). No Python needed. It installs the
+binaries (including everything setup needs — nothing is downloaded during
+install), adds shortcuts, then opens the GUI, and the **first-run wizard** does
+the rest — and keeps re-opening at launch until palctl is actually running,
+so a setup that failed partway can't strand you in a dead GUI:
 
 - **finds** your server root and steamcmd (registry, Steam libraries, or the
   running process) — nothing to type
 - **installs the server for you** from Steam via SteamCMD, if it isn't already
 - **enables the REST API** — seeds the blank `PalWorldSettings.ini`, sets
   `RESTAPIEnabled=True`, the port, and your admin password
-- **registers the game server** as a Windows service and sets **palctl itself
-  to run in the background** — password-free login startup by default, or a
-  Windows service — so your server keeps being managed after a reboot or sign-in
+- **registers the game server AND palctl as Windows services under your
+  account** (the default — it asks for your Windows password, which goes
+  straight to the service manager and is never stored). One account for both is
+  what lets the memory watchdog actually read the server process and keeps the
+  Discord bot's secrets readable; both start on boot, before anyone signs in.
+  The wizard refuses combinations that would split the two across accounts —
+  that split silently blinds the watchdog. Password-free login startup remains
+  for setups that can't host a service (PIN-only accounts) or that don't run
+  the server as a service
 - **sets up backups** — a local backup folder and how often (local backups
   always run, at least daily), plus an optional **off-site copy** you can turn on
   for another disk, a network share, or the cloud
@@ -261,26 +269,34 @@ daemon runs in the background, backups (local always-on, off-site optional), and
 — as an optional section — the Discord bot. Prefer to do it by hand?
 
 ```
-palctl-daemon.exe install-startup      # start at login — password-free (recommended)
-palctl-daemon.exe install-service      # or run as a Windows service
+palctl-daemon.exe install-service --as-user   # run as a service under your account (recommended)
+palctl-daemon.exe install-startup             # or start at login — password-free
 ```
 
-**Login startup vs. service.** By default palctl starts with your login via the
-current user's Run key. It needs **no password**, runs with full access to your
-config and saved secrets (so the Discord bot works), and avoids Windows **Error
-1069** — which a service under a passwordless / PIN-only account fails with. The
-one tradeoff is it only runs while you're logged in; a **service** starts on boot
-before login, so it's the better pick for a truly headless box. Secrets go into
-Windows Credential Manager (DPAPI-encrypted), never a config file.
+**Service vs. login startup.** The recommended setup runs palctl **and** the
+game server as Windows services under **your account** (the wizard's default):
+both start on boot before anyone signs in, palctl can read the server process
+it watches (the memory watchdog needs this — a server owned by a *different*
+account reads as an idle few-MB launcher and the watchdog never fires), and
+your DPAPI secrets (the Discord bot token) stay readable. It needs your
+Windows account password once, handed straight to the service manager. **Login
+startup** (the current user's Run key) needs no password and avoids Windows
+**Error 1069** on PIN-only / passwordless accounts — but it only runs while
+you're logged in, and it must not be combined with a game server that runs as
+a service under another account (the wizard refuses that split; the daemon
+warns loudly if it finds itself in it). Secrets go into Windows Credential
+Manager (DPAPI-encrypted), never a config file.
 
-> **Which account runs the service?** By default the service runs as
-> LocalSystem with `%APPDATA%` redirected to yours, so it shares your config,
-> token, and logs — and it reads `AdminPassword` from the server's own ini,
-> which is where Palworld keeps it anyway. The one thing LocalSystem can't
-> reach is your DPAPI-encrypted secrets (the Discord bot token). Using the
-> bot? Register with `palctl-daemon install-service --as-user` — the service
-> then runs as *you* and sees everything the GUI saved. It asks for your
-> Windows password once, passing it straight to the service manager.
+> **Which account runs the service?** Prefer `--as-user` (what the wizard
+> does): the service runs as *you*, sees everything the GUI saved, and can
+> read the server process it watches. A bare `install-service` stays on
+> LocalSystem with `%APPDATA%` redirected to yours — it shares your config,
+> token, and logs, and reads `AdminPassword` from the server's own ini — but
+> it can't reach your DPAPI secrets (the Discord bot token), and it should
+> only be paired with a server service that also runs as LocalSystem, or the
+> two accounts split and the watchdog goes blind. The password `--as-user`
+> asks for goes straight to the service manager; after registration it is
+> scrubbed from disk — Windows itself holds it from then on.
 
 ### Linux (headless)
 

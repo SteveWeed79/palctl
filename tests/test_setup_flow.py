@@ -235,9 +235,12 @@ def test_service_mode_with_password_registers_both_under_the_user(env):
     # Daemon: registered as the user, password passed straight through (no prompt).
     assert env.daemon_service_as_user is True
     assert env.daemon_service_password == "hunter2"
-    # Game service: registered under a user account too.
+    # Game service: registered under a user account too, with the longer stop
+    # timeout (PalServer flushes the world on the way down; the wrapper must
+    # not kill it at the default 30s).
     assert env.server_service_kwargs.get("user")  # .\<username>
     assert env.server_service_kwargs.get("password") == "hunter2"
+    assert env.server_service_kwargs.get("stop_timeout") == "90 sec"
 
 
 def test_service_mode_without_password_stays_localsystem(env):
@@ -256,6 +259,79 @@ def test_service_mode_without_password_stays_localsystem(env):
     assert result.ok is True
     assert env.daemon_service_as_user is False
     assert env.server_service_kwargs.get("user") is None
+
+
+def test_blocked_wrapper_download_aborts_before_touching_anything(env, monkeypatch):
+    # The user-visible failure this pins: setup used to save the config, edit
+    # the ini, and THEN die on the WinSW download (e.g. CERTIFICATE_VERIFY_FAILED
+    # from AV https-scanning) — a half-finished setup. Downloads now come first:
+    # a blocked download aborts a setup that has changed nothing.
+    monkeypatch.setattr("palctl.setup_flow.sys.platform", "win32")
+    monkeypatch.setattr(
+        "palctl.winservice.ensure_winsw",
+        lambda d: (_ for _ in ()).throw(OSError("could not verify the HTTPS connection")),
+    )
+    plan = _plan(
+        env.tmp_path,
+        daemon_startup="service",
+        register_server_service=True,
+        service_password="pw",
+    )
+    result, lines = env.run(plan)
+    assert result.ok is False
+    assert any("could not verify" in ln for ln in lines)
+    # Nothing was touched: no config written, no secrets stored, no ini edit.
+    assert not (env.tmp_path / "config.json").exists()
+    assert env.admin_passwords == []
+    assert env.rest_api == []
+
+
+def test_verify_surfaces_why_the_server_service_wont_start(env, monkeypatch):
+    # A registered game service the SCM refuses to start (Error 1069 now that
+    # Path A can register PalServer under a user account) used to read as
+    # "hasn't answered yet" after a pointless four-minute REST wait. The real
+    # reason is surfaced and the wait skipped.
+    async def _start_fails(name):
+        return False
+
+    monkeypatch.setattr("palctl.procs.start_service", _start_fails)
+    monkeypatch.setattr(
+        "palctl.procs.service_failure_reason",
+        lambda name: "Error 1069: the service's logon account was rejected.",
+    )
+    plan = _plan(env.tmp_path, register_server_service=True)
+    server_root = Path(plan.server_root)
+    server_root.mkdir(parents=True, exist_ok=True)
+    (server_root / "PalServer.exe").write_text("x", encoding="utf-8")
+
+    result, lines = env.run(plan)
+    assert result.ok is True  # setup itself completed; the start failure is reported
+    assert any("did not start" in ln and "1069" in ln for ln in lines)
+
+
+def test_should_prompt_setup_rule():
+    from palctl.setup_flow import should_prompt_setup
+
+    # True first run: no config at all.
+    assert should_prompt_setup(
+        config_exists=False, daemon_reachable=False, daemon_startup=""
+    )
+    # Setup died partway (config exists, daemon dead): keep prompting — this is
+    # the half-state that used to strand users in a GUI wired to nothing.
+    assert should_prompt_setup(
+        config_exists=True, daemon_reachable=False, daemon_startup="service"
+    )
+    assert should_prompt_setup(
+        config_exists=True, daemon_reachable=False, daemon_startup=""
+    )
+    # Healthy daemon: never nag.
+    assert not should_prompt_setup(
+        config_exists=True, daemon_reachable=True, daemon_startup="service"
+    )
+    # Explicit "no background palctl": a deliberate choice, respected.
+    assert not should_prompt_setup(
+        config_exists=True, daemon_reachable=False, daemon_startup="none"
+    )
 
 
 def test_would_split_accounts_rule():

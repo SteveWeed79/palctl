@@ -34,6 +34,7 @@ MODULES = [
     "palctl.scheduler",
     "palctl.watchdog",
     "palctl.discovery",
+    "palctl.fetch",
     "palctl.steamcmd",
     "palctl.winservice",
     "palctl.systemd",

@@ -15,6 +15,7 @@ this module (e.g. from a test) stays cheap and side-effect free.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,6 +99,19 @@ def run_setup(cfg: Config, plan: SetupPlan, log: Log) -> SetupResult:
             )
             return SetupResult(False)
 
+        # Anything that has to be downloaded comes FIRST, before a single byte
+        # of config/ini is touched: a blocked download (AV HTTPS-scanning, no
+        # network) then aborts a setup that hasn't changed anything, instead of
+        # dying halfway with the config saved, the ini edited, and no services.
+        if sys.platform.startswith("win") and (
+            plan.register_server_service or plan.daemon_startup == "service"
+        ):
+            from . import winservice
+
+            log("Fetching the service wrapper…")
+            winservice.ensure_winsw(config_dir() / "bin")
+            log("  Service wrapper ready.")
+
         log("Saving configuration…")
         cfg.server_root = plan.server_root
         cfg.steamcmd_path = plan.steamcmd_path
@@ -175,6 +189,26 @@ def needs_admin(*, register_server_service: bool, daemon_startup: str) -> bool:
     from . import daemon, winservice
 
     return winservice.service_exists(daemon.SERVICE_NAME)
+
+
+def should_prompt_setup(
+    *, config_exists: bool, daemon_reachable: bool, daemon_startup: str
+) -> bool:
+    """Whether the GUI should open the setup wizard at launch, unasked.
+
+    The wizard used to auto-open only when no config existed — so a setup that
+    died PARTWAY (config saved, then a failed download / refused service
+    registration) never re-prompted: the user landed in a GUI wired to a daemon
+    that isn't running, with no signpost back to the thing that fixes it. The
+    rule now: prompt until the daemon is actually up. The one exception is an
+    explicit daemon_startup="none" — the user said no background palctl, and
+    nagging them every launch would punish a deliberate choice. Pure, so the
+    GUI can't drift from it."""
+    if not config_exists:
+        return True  # true first run
+    if daemon_reachable:
+        return False  # setup produced a live daemon; nothing to prompt about
+    return daemon_startup != "none"
 
 
 def would_split_accounts(
@@ -338,10 +372,22 @@ def _verify_and_report(plan: SetupPlan, server_registered: bool, log: Log) -> No
 
     if server_registered:
         log("Starting the server to check it actually works…")
+        started = False
         try:
-            asyncio.run(procs.start_service(plan.service_name))
+            started = asyncio.run(procs.start_service(plan.service_name))
         except Exception as e:
             log(f"  couldn't start the service: {e}")
+        if not started:
+            # The SCM refused or the service died — say WHY (Error 1069 & co.,
+            # read from the service's recorded exit code) instead of sitting
+            # out a four-minute REST wait for a server that never launched.
+            reason = procs.service_failure_reason(plan.service_name)
+            log(
+                f"  ❌ The '{plan.service_name}' service did not start"
+                + (f" — {reason}" if reason else "")
+                + " Check services.msc, then run setup again."
+            )
+            return
 
         log("  waiting for the server to answer (this can take a minute)…")
         api = PalApi("127.0.0.1", plan.api_port, plan.password)
@@ -403,6 +449,10 @@ def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
     winservice.install_service(
         winsw, plan.service_name, exe, PALSERVER_ARGS, plan.server_root,
         user=user, password=password, start=False,
+        # PalServer flushes the world on the way down; a wrapper that kills it
+        # at the default 30s on a plain `net stop` or system shutdown risks the
+        # save. 90s matches how long palctl itself waits for a stopping server.
+        stop_timeout="90 sec",
     )
     log(
         f"  Service '{plan.service_name}' registered"

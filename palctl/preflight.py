@@ -19,7 +19,6 @@ import socket
 import subprocess
 import sys
 import tempfile
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -250,8 +249,12 @@ def install_vcredist(on_line=None) -> int:
     try:
         if on_line:
             on_line("Downloading the Visual C++ runtime…")
-        # Timeout so a hung CDN can't stall the wizard indefinitely.
-        with urllib.request.urlopen(VCREDIST_URL, timeout=120) as resp, path.open("wb") as f:
+        from . import fetch
+
+        # Timeout so a hung CDN can't stall the wizard indefinitely; fetch
+        # retries verification against certifi when the system trust fails
+        # (AV HTTPS-scanning, broken cert store).
+        with fetch.open_url(VCREDIST_URL, timeout=120) as resp, path.open("wb") as f:
             shutil.copyfileobj(resp, f)
         # We can't pin a checksum (aka.ms is evergreen — Microsoft reissues this
         # exe every servicing update), so verify its Authenticode signature

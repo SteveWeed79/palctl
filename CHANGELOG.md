@@ -125,6 +125,29 @@ Installers for every release are on the
   can assert the outcome.
 
 ### Fixed
+- **Audit of the NSSM→WinSW conversion — four gaps closed.** The wrapper swap
+  (1.2.3) kept NSSM's runtime-download pattern and picked up WinSW's config
+  model without re-examining what NSSM had been providing implicitly:
+  - *A service-account password no longer outlives its one moment of use.*
+    WinSW takes the account password via its XML config file, and palctl left
+    it there — a Windows account password in a plaintext file for the lifetime
+    of the service (NSSM passed it straight to Windows, which stores it
+    encrypted, and kept nothing). The password is now scrubbed from the XML
+    immediately after registration; the service keeps working (Windows itself
+    holds the credential from that point).
+  - *The cached wrapper binary is verified on every use, not just at download.*
+    Anything sitting in palctl's cache becomes a SYSTEM service binary; a
+    tampered copy is now discarded and replaced through the verified paths. A
+    manually dropped copy that matches the pin still works.
+  - *The game service gets 90 seconds to stop, not WinSW's 30.* PalServer
+    flushes the world on the way down; on a plain `net stop` or system
+    shutdown the wrapper would have killed it at 30s — a world-corruption risk
+    NSSM's escalation ladder never had this sharply. 90s matches how long
+    palctl itself waits for a stopping server.
+  - *A game service the SCM refuses to start is reported with the actual
+    reason* (Error 1069 & co., read from the service's recorded exit code)
+    instead of setup waiting four minutes for a server that never launched and
+    then blaming the REST API.
 - **The memory-leak watchdog no longer goes blind when the server runs under a
   different Windows account than palctl.** In the common setup — PalServer as a
   LocalSystem service, the daemon under your login user — palctl couldn't read
@@ -146,6 +169,57 @@ Installers for every release are on the
   palctl and the server on different accounts (the classic default: login
   startup + a SYSTEM server service), so the watchdog-blinding split can't be
   installed in the first place.
+- **Setup no longer dies on `CERTIFICATE_VERIFY_FAILED` — and no longer dies
+  halfway.** On a machine where Python can't verify HTTPS against the system
+  certificate store (an antivirus doing HTTPS scanning, a broken store), the
+  WinSW / VC++ / SteamCMD downloads failed with a bare `_ssl.c:1010` — after
+  setup had already saved the config and edited the server ini. Downloads now
+  retry verification against the CA bundle `certifi` ships (verification is
+  never disabled — both failing still fails closed, with a message that names
+  the antivirus/proxy cause), the WinSW failure spells out the manual escape
+  hatch (download the exact release asset in a browser, drop it in palctl's
+  `bin` folder, re-run setup — with the SHA-256 to check it against), and setup
+  fetches everything it needs to download *before* touching a single byte of
+  config, so a blocked download aborts a setup that changed nothing.
+- **The installer now ships WinSW inside the build — no install-time download
+  at all.** The release build downloads the service wrapper once, verifies it
+  against the pin, and places it next to palctl's exes; `ensure_winsw` prefers
+  that bundled copy (hash-checked again at use; a tampered copy is skipped,
+  never used). Installer users can now register services fully offline, and
+  the class of first-run failures on fresh Windows boxes — whose sparse
+  root-certificate store makes Python's HTTPS verification fail even though
+  the browser works — is gone entirely. The bundling step also re-verifies the
+  pin on every release, so a wrong pin fails the build instead of a user's
+  setup. (pip/source installs keep the verified download as the fallback.)
+- **The installer also carries the Visual C++ runtime.** The other install-time
+  download a fresh box needs — and the same class of machine that lacks the
+  runtime is the one whose sparse certificate store can't download it. The
+  installer now bundles `vc_redist.x64.exe` (Authenticode-verified at build
+  time; the evergreen URL can't be hash-pinned) and runs it silently only when
+  the runtime is actually missing. A brand-new Windows box now goes from
+  `palctl-setup.exe` to a working server with zero downloads during install;
+  the wizard's download path remains for portable/pip users.
+- **The setup wizard re-opens at every launch until palctl is actually
+  running.** It used to auto-open only when no config existed — so a setup that
+  died partway (config saved, then a failed download or a refused service
+  registration) stranded the user in a GUI wired to a daemon that isn't there,
+  with no signpost back to the fix. The GUI now prompts until the daemon
+  answers on its control port; an explicit "no background palctl" choice is
+  respected and never nagged.
+- **The installer's "register the palctl service now" checkbox is gone.** It
+  could only ever register a LocalSystem daemon with no configuration — a
+  half-setup that either fought the wizard's later registration or paired a
+  SYSTEM daemon with a user-account server (the split that blinds the
+  watchdog). The wizard is the one supported setup path; unattended
+  deployments script `palctl-daemon install-service` instead.
+- **The wizard defaults to the one correct install path and removes the wrong
+  one from the menu.** "Run as a Windows service under your account" is now the
+  pre-selected default, and while "Register the Palworld server as a Windows
+  service" is ticked the login-startup option is greyed out with the reason —
+  the server service and palctl must share one account, so the split that
+  blinds the watchdog can no longer even be selected. Login startup remains
+  available when palctl doesn't manage the server as a service (no split
+  possible) — the setups, like PIN-only accounts, that genuinely need it.
 - **A failed Windows service install now says *why* instead of a misleading
   catch-all.** `palctl-daemon install-service` used to let `sc.exe`/WinSW fail
   silently when not elevated, wait out a 30-second probe, and then blame the

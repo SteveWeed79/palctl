@@ -70,6 +70,30 @@ key, Windows only), and **none**. Switching modes removes the other mechanism
 The chosen mode is persisted (`Config.daemon_startup`), so a wizard re-run
 defaults to what the user actually picked instead of silently switching back.
 
+### 2b. One Windows account owns both services ("Path A")
+
+The daemon and the game server must run under the **same Windows account**.
+A split — the classic default was PalServer as a LocalSystem service with the
+daemon on login startup — means palctl cannot reliably read the server
+process: metrics silently degrade to the idle few-MB bootstrap launcher and
+the memory watchdog can never fire. Three layers enforce this:
+
+* `setup_flow.would_split_accounts` is the single shared rule; `run_setup`
+  **refuses** any plan that would split (the wizard applies the same rule and
+  greys the login option out while palctl manages the server as a service).
+* The wizard's default registers **both** services under the invoking user
+  (`SetupPlan.service_password`); the account password is handed to the SCM at
+  registration and **scrubbed from the WinSW XML immediately after** — it must
+  never persist on disk (NSSM stored nothing; WinSW's config file would).
+* At runtime the daemon compares the server process owner against its own
+  account (`procs.server_account_mismatch`) and warns loudly on a mismatch —
+  the backstop for states created outside setup (hand-edited services, CLI
+  combinations, old installs).
+
+Login startup remains only where no split is possible: palctl not managing
+the server as a service, or PIN-only/passwordless accounts that cannot hold a
+service logon at all (Error 1069).
+
 ### 3. Success is verified, never assumed
 
 The service manager's opinion is not the success signal — **the daemon's own
@@ -87,17 +111,29 @@ admin too. Preflight (`setup_flow.needs_admin`) checks the real system state,
 not just the requested mode; an unelevated removal that silently fails would
 leave the old daemon running while setup claims success.
 
-### 5. Downloads are pinned or signature-verified
+### 5. Nothing is downloaded at install time; what is downloaded is verified
 
-Anything downloaded and then run as SYSTEM must be verifiable:
+The install-time download was itself the defect: the machines that need a
+first-run most — fresh Windows boxes — are exactly the ones whose sparse
+root-certificate store fails Python's HTTPS verification (Python never
+triggers CryptoAPI's on-demand root fetch the way browsers do), and AV
+HTTPS-scanning breaks the same call on seasoned boxes. So:
 
-* **WinSW** — SHA-256-pinned to an exact release asset (`WINSW_SHA256`),
-  re-verified from independent infrastructure by the CI lifecycle job on every
-  run. Refuse on mismatch; never unpack-then-check.
-* **VC++ redistributable** — evergreen URL, can't be pinned; Authenticode
-  signature is the integrity anchor (fail closed only on a positive tamper
-  signal).
-* **SteamCMD** — TLS to Valve's CDN; content changes too often to pin.
+* **WinSW and the VC++ redistributable ship inside the build** — downloaded
+  and verified once by the release build (WinSW against the SHA-256 pin;
+  VC++ by Authenticode, since the evergreen URL can't be pinned), which also
+  makes every release an independent re-verification of the pin: a wrong pin
+  fails the build, never a user's setup. `ensure_winsw` prefers the bundled
+  copy, then the cache, then the network — and **verifies against the pin at
+  every step**, including a cached or manually dropped copy (anything in that
+  cache becomes a SYSTEM service binary; trust nothing on sight).
+* Remaining runtime downloads (SteamCMD; the wizard's fallback paths for
+  pip/portable users) go through `fetch.open_url`: system trust first, one
+  certifi retry on a certificate-verification failure, fail **closed** with a
+  message naming the cause. Verification is never disabled.
+* Anything setup must download is fetched **before** the first byte of
+  config/ini/secret is written, so a blocked download aborts a setup that
+  changed nothing (`run_setup` fetches the wrapper up front).
 
 ## Why WinSW (and not NSSM)
 
@@ -113,6 +149,18 @@ itself (`<allowservicelogon>`), removing one cause of Error 1069 for
 Removal and start/stop go through plain `sc.exe`, which works on *any*
 service — so palctl versions that used NSSM migrate cleanly: the next install
 stops and deletes the old NSSM-wrapped service and registers the WinSW one.
+
+**Two WinSW traps NSSM never had** (found by auditing the conversion; both
+handled — keep them handled):
+
+* WinSW takes the service-account password via its **XML config file**. NSSM
+  passed it straight to the SCM and stored nothing. The XML must be scrubbed
+  immediately after `install` (the SCM holds the credential, encrypted, from
+  that point) — see `install_service`.
+* WinSW's `<stoptimeout>` **kills** the process when it expires — a flat
+  guillotine where NSSM had an escalation ladder. The game service gets 90s
+  (PalServer flushes the world on the way down; palctl's own stop paths wait
+  that long), the daemon keeps the 30s default.
 
 ## The layers
 

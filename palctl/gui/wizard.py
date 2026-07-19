@@ -186,16 +186,21 @@ class SetupWizard(QDialog):
         bg.setChecked(True)
         bgf = QVBoxLayout(bg)
         self.startup_login = QRadioButton(
-            "Start when I log in  —  no password, but only runs while you're "
-            "logged in (the memory watchdog can't read a server that runs as a "
-            "service)"
+            "Start when I log in  —  no password needed, but only runs while "
+            "you're logged in (for PIN-only accounts, or when palctl doesn't "
+            "manage the server as a service)"
         )
-        self.startup_login.setChecked(True)
         self.startup_service = QRadioButton(
             "Run as a Windows service under your account  —  recommended: starts "
             "on boot, and the memory watchdog and Discord bot both work (needs "
             "your Windows password)"
         )
+        # Path A is the default: one account for palctl AND the server, so the
+        # watchdog can read the process it watches. Login startup exists for the
+        # setups where a service genuinely can't work (PIN-only/passwordless
+        # accounts) or isn't needed (palctl doesn't manage the server as a
+        # service — then there's no account split to worry about).
+        self.startup_service.setChecked(True)
         bgf.addWidget(self.startup_login)
         bgf.addWidget(self.startup_service)
         # Path A: a service registered under YOUR account (not LocalSystem) both
@@ -216,18 +221,28 @@ class SetupWizard(QDialog):
         self._svc_pw_host.setLayout(svc_pw_form)
         bgf.addWidget(self._svc_pw_host)
 
-        def _sync_service_password_enabled(*_a) -> None:
-            # Needed whenever the daemon runs as you AND palctl registers the
-            # server, so the server lands on your account too (never SYSTEM).
-            self._svc_pw_host.setEnabled(
-                self.startup_service.isChecked()
-                or (self.startup_login.isChecked() and self.reg_server.isChecked())
+        def _sync_startup_options(*_a) -> None:
+            # While palctl manages the server as a Windows service, login
+            # startup is NOT offered: the server service needs an account, the
+            # login daemon runs as you, and any answer other than "the same
+            # account for both" blinds the watchdog. Rather than let the combo
+            # be picked and refuse it later, remove it from the menu.
+            server_managed = self.reg_server.isChecked()
+            if server_managed and self.startup_login.isChecked():
+                self.startup_service.setChecked(True)
+            self.startup_login.setEnabled(not server_managed)
+            self.startup_login.setToolTip(
+                "Unavailable while “Register the Palworld server as a Windows "
+                "service” is ticked: the server service and palctl must run "
+                "under the same account, so palctl runs as a service too."
+                if server_managed else ""
             )
+            self._svc_pw_host.setEnabled(self.startup_service.isChecked())
 
-        self.startup_service.toggled.connect(_sync_service_password_enabled)
-        self.startup_login.toggled.connect(_sync_service_password_enabled)
-        self.reg_server.toggled.connect(_sync_service_password_enabled)
-        _sync_service_password_enabled()
+        self.startup_service.toggled.connect(_sync_startup_options)
+        self.startup_login.toggled.connect(_sync_startup_options)
+        self.reg_server.toggled.connect(_sync_startup_options)
+        _sync_startup_options()
         # Restore the previously chosen mode (setup persists it), so a re-run
         # doesn't silently switch a "service" or "none" choice back to the
         # login-startup default. A config from before the field existed ("")
@@ -236,6 +251,10 @@ class SetupWizard(QDialog):
             bg.setChecked(False)
         elif cfg.daemon_startup == "service":
             self.startup_service.setChecked(True)
+        elif cfg.daemon_startup == "login":
+            # Restored, but _sync_startup_options still flips it to service if
+            # the server-service box is ticked — the split stays unpickable.
+            self.startup_login.setChecked(True)
         elif not cfg.daemon_startup:
             try:
                 from .. import winservice

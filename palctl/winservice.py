@@ -29,9 +29,9 @@ from __future__ import annotations
 import hashlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
-import urllib.request
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -78,6 +78,7 @@ def winsw_config_xml(
     password: str | None = None,
     appdata: str | None = None,
     description: str | None = None,
+    stop_timeout: str = "30 sec",
 ) -> str:
     """
     The complete WinSW service definition. Pure — install just writes this file
@@ -123,7 +124,13 @@ def winsw_config_xml(
     lines += [
         "  <startmode>Automatic</startmode>",
         '  <onfailure action="restart" delay="5 sec"/>',
-        "  <stoptimeout>30 sec</stoptimeout>",
+        # How long the wrapper waits on stop before killing the process. The
+        # default suits the daemon; the GAME service gets longer (see
+        # install_service callers) — PalServer flushes the world on the way
+        # down, and a wrapper that kills it at 30s on a plain `net stop` or a
+        # system shutdown is a world-corruption risk NSSM's kill ladder never
+        # had this sharply.
+        f"  <stoptimeout>{escape(stop_timeout)}</stoptimeout>",
         # The daemon and PalServer both do their own logging; the wrapper
         # capturing stdout too would just duplicate it into the config dir.
         '  <log mode="none"/>',
@@ -179,6 +186,7 @@ def install_service(
     password: str | None = None,
     appdata: str | None = None,
     start: bool = True,
+    stop_timeout: str = "30 sec",
 ) -> None:
     """Register the service from a freshly written config, then optionally
     start it.
@@ -186,7 +194,14 @@ def install_service(
     A re-install replaces the whole registration: any existing service (this
     module's, or one left by the old NSSM builds) is stopped and removed first,
     and the config XML is rewritten whole — so nothing stale can survive from a
-    previous install, by construction."""
+    previous install, by construction.
+
+    The account password is needed only AT registration (the SCM stores it
+    itself, encrypted, once `install` runs) — so it is scrubbed from the XML
+    immediately afterward. Leaving it there would keep a Windows account
+    password in a plaintext file for the lifetime of the service, which
+    violates palctl's no-secrets-on-disk rule (NSSM never had this trap: it
+    passed the password straight to the SCM and stored nothing)."""
     winsw = Path(winsw)
     if service_exists(name):
         remove_service(name)
@@ -210,10 +225,24 @@ def install_service(
         winsw_config_xml(
             name, exe, args, app_dir,
             user=user, password=password, appdata=appdata,
+            stop_timeout=stop_timeout,
         ),
         encoding="utf-8",
     )
     _run([str(svc_exe), "install"])
+    if user and password:
+        # Registration is done; the SCM now holds the password (encrypted, in
+        # LSA). Rewrite the config without it so no plaintext account password
+        # outlives the one command that needed it. WinSW reads <serviceaccount>
+        # only at install, so the scrubbed file stays fully functional.
+        svc_xml.write_text(
+            winsw_config_xml(
+                name, exe, args, app_dir,
+                user=user, password=None, appdata=appdata,
+                stop_timeout=stop_timeout,
+            ),
+            encoding="utf-8",
+        )
     if start:
         _run([str(svc_exe), "start"])
 
@@ -243,26 +272,78 @@ def remove_service(name: str) -> None:
     _run(["sc.exe", "delete", name])
 
 
+def bundled_winsw(*, sha256: str = WINSW_SHA256) -> Path | None:
+    """The WinSW copy shipped inside the frozen build (packaging places a
+    hash-verified winsw.exe next to palctl's own exes at build time). ``None``
+    in a dev checkout, when the file is absent, or when it doesn't match the
+    pin — a tampered or stale bundled copy is silently skipped in favour of the
+    verified download, never used."""
+    if not getattr(sys, "frozen", False):
+        return None
+    p = Path(sys.executable).parent / "winsw.exe"
+    try:
+        if p.is_file() and (not sha256 or _sha256_of(p).lower() == sha256.lower()):
+            return p
+    except OSError:
+        pass
+    return None
+
+
 def ensure_winsw(
     cache_dir: Path, *, url: str = WINSW_URL, sha256: str = WINSW_SHA256
 ) -> Path:
     """
-    Return a usable WinSW exe, downloading and caching it under ``cache_dir``
-    the first time. Subsequent calls reuse the cached copy. The download is
-    verified against the pinned SHA-256 before it lands as the cached binary;
-    pass ``sha256=""`` only to deliberately skip that (there is no good reason
-    to in production).
+    Return a usable WinSW exe: the cached copy, else the copy bundled inside
+    the frozen build, else a verified download into ``cache_dir``. The frozen
+    installer ships winsw.exe next to palctl's own exes (downloaded and
+    hash-verified by CI at build time), so installer users never download at
+    install time — the network path exists only for pip/source installs and as
+    a fallback. Anything that lands in the cache is verified against the
+    pinned SHA-256 first; pass ``sha256=""`` only to deliberately skip that
+    (there is no good reason to in production).
     """
     cached = cache_dir / "winsw.exe"
     if cached.exists():
+        # The cache is not trusted on sight: this binary becomes a SYSTEM
+        # service, so anything sitting there — including a manually dropped
+        # copy (the documented offline workaround) — must still match the pin.
+        # A mismatch is discarded and replaced through the verified paths.
+        try:
+            if not sha256 or _sha256_of(cached).lower() == sha256.lower():
+                return cached
+            cached.unlink()
+        except OSError:
+            pass
+
+    bundled = bundled_winsw(sha256=sha256)
+    if bundled is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bundled, cached)
         return cached
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as tmp:
         tmp_path = Path(tmp.name)
     try:
-        # Timeout so a hung/blocked CDN can't stall setup indefinitely.
-        with urllib.request.urlopen(url, timeout=60) as resp, tmp_path.open("wb") as f:
+        from . import fetch
+
+        # Timeout so a hung/blocked CDN can't stall setup indefinitely. fetch
+        # retries certificate verification against certifi's CAs, because on
+        # real boxes (AV HTTPS-scanning, broken cert stores) the system trust
+        # fails and the raw _ssl.c error used to stop setup dead. If even that
+        # fails, name the escape hatch: this download is only a cache fill, so
+        # the user can fetch the exact release asset in a browser and drop it
+        # in place themselves.
+        try:
+            resp = fetch.open_url(url, timeout=60)
+        except OSError as e:
+            raise OSError(
+                f"{e}\nWorkaround: download {url} with your browser, save it "
+                f"as {cached}, and run setup again — palctl will use that copy "
+                f"(you can check it yourself: certutil -hashfile file SHA256 "
+                f"should print {sha256 or WINSW_SHA256})."
+            ) from e
+        with resp, tmp_path.open("wb") as f:
             shutil.copyfileobj(resp, f)
         # Verify BEFORE it can be used — this binary ends up running as SYSTEM,
         # so a tampered or corrupted download must never become winsw.exe.
