@@ -52,13 +52,20 @@ def test_install_service_scrubs_the_password_after_registration(monkeypatch, tmp
 
     winservice.install_service(
         winsw, "palctl-daemon", "svc.exe", user=r".\steve", password="hunter2",
+        appdata=r"C:\Users\steve\AppData\Roaming",
     )
 
     _, svc_xml = winservice.wrapper_paths(tmp_path, "palctl-daemon")
     text = svc_xml.read_text(encoding="utf-8")
     assert "hunter2" not in text                      # the secret is gone
-    assert r"<username>.\steve</username>" in text    # the account remains
+    # WinSW v2 schema: <domain> + <user>, never <username> (silently ignored →
+    # LocalSystem fallback — the bug the as-user CI job caught).
+    assert "<domain>.</domain>" in text
+    assert "<user>steve</user>" in text               # the account remains
     assert "<allowservicelogon>true</allowservicelogon>" in text
+    # The APPDATA redirect must survive the scrub — losing it here would
+    # re-create the split-config 401 on the next service start.
+    assert 'name="APPDATA"' in text
     # And registration really happened before the scrub (install was issued).
     svc_exe, _ = winservice.wrapper_paths(tmp_path, "palctl-daemon")
     assert [str(svc_exe), "install"] in calls
@@ -68,10 +75,23 @@ def test_config_xml_as_user_sets_serviceaccount_and_logon_right():
     xml = winservice.winsw_config_xml(
         "svc", "svc.exe", user=r".\steve", password="hunter2",
     )
-    assert r"<username>.\steve</username>" in xml
+    # WinSW v2 wants <domain> + <user>; the old <username> element was silently
+    # ignored and the service fell back to LocalSystem while claiming success —
+    # caught by the as-user-lifecycle CI job's `sc qc` on its first real run.
+    assert "<domain>.</domain>" in xml
+    assert "<user>steve</user>" in xml
+    assert "<username>" not in xml
     assert "<password>hunter2</password>" in xml
     # WinSW grants "Log on as a service" itself — one less 1069 cause.
     assert "<allowservicelogon>true</allowservicelogon>" in xml
+
+
+def test_config_xml_serviceaccount_splits_domain_forms():
+    # DOMAIN\name keeps its domain; a bare name gets the local machine (".").
+    xml = winservice.winsw_config_xml("s", "s.exe", user=r"CORP\bob", password="x")
+    assert "<domain>CORP</domain>" in xml and "<user>bob</user>" in xml
+    xml2 = winservice.winsw_config_xml("s", "s.exe", user="bob", password="x")
+    assert "<domain>.</domain>" in xml2 and "<user>bob</user>" in xml2
 
 
 def test_config_xml_localsystem_redirects_appdata():
@@ -84,14 +104,20 @@ def test_config_xml_localsystem_redirects_appdata():
     assert r'<env name="APPDATA" value="C:\Users\steve\AppData\Roaming"/>' in xml
 
 
-def test_config_xml_user_wins_over_appdata_redirect():
-    # Running AS the user makes the redirect pointless — never set both.
+def test_config_xml_user_service_still_gets_appdata_redirect():
+    # A user-account service needs the redirect TOO: the SCM builds a service's
+    # environment from the SYSTEM block — %APPDATA% is an interactive-shell
+    # variable, absent even when the service logs on as that user. Without the
+    # env line the daemon falls into config_dir()'s ~/.config fallback and
+    # reads a different token than the GUI → 401 on every call. (This test
+    # used to pin the opposite — "user wins over the redirect" — which is
+    # exactly the bug that shipped.)
     xml = winservice.winsw_config_xml(
         "svc", "svc.exe",
         user=r".\steve", password="pw", appdata=r"C:\Users\steve\AppData\Roaming",
     )
     assert "<serviceaccount>" in xml
-    assert "APPDATA" not in xml
+    assert r'<env name="APPDATA" value="C:\Users\steve\AppData\Roaming"/>' in xml
 
 
 def test_config_xml_escapes_markup_in_values():

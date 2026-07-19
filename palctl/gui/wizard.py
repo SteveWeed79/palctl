@@ -34,7 +34,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QRadioButton,
     QScrollArea,
     QTextEdit,
     QVBoxLayout,
@@ -176,94 +175,44 @@ class SetupWizard(QDialog):
             sf.addWidget(cb)
         form.addWidget(steps)
 
-        # How the daemon runs in the background. Login startup is the default:
-        # it needs no password (unlike a user service, which fails with Error
-        # 1069 on PIN-only accounts) and gets full user context incl. the
-        # Discord token. A service is offered for boxes that must run before
-        # anyone logs in.
-        bg = QGroupBox("Keep palctl running in the background")
+        # ONE background mode, on or off. palctl and the game server run as
+        # Windows services under the same user account — that's what makes the
+        # memory watchdog able to read the server, keeps the Discord bot's
+        # DPAPI secrets readable, and starts both on boot. There is no
+        # login-startup choice here by design: every alternative either
+        # couldn't watch the server or couldn't run the bot, and offering it
+        # was how users ended up in the broken split. (PIN-only accounts that
+        # genuinely can't host a service logon can use
+        # `palctl-daemon install-startup` from a console — a power-user
+        # escape hatch, not a wizard option.)
+        bg = QGroupBox(
+            "Keep palctl running in the background (Windows service under "
+            "your account)"
+        )
         bg.setCheckable(True)
-        bg.setChecked(True)
+        bg.setChecked(cfg.daemon_startup != "none")
         bgf = QVBoxLayout(bg)
-        self.startup_login = QRadioButton(
-            "Start when I log in  —  no password needed, but only runs while "
-            "you're logged in (for PIN-only accounts, or when palctl doesn't "
-            "manage the server as a service)"
+        note = QLabel(
+            "Starts on boot — before anyone signs in — and runs as <b>you</b>, "
+            "so the memory watchdog can read the server and the Discord bot "
+            "keeps working. Windows needs your account password to register "
+            "the service; it goes straight to the service manager and palctl "
+            "never stores it. Untick to run palctl only while this window is "
+            "open."
         )
-        self.startup_service = QRadioButton(
-            "Run as a Windows service under your account  —  recommended: starts "
-            "on boot, and the memory watchdog and Discord bot both work (needs "
-            "your Windows password)"
-        )
-        # Path A is the default: one account for palctl AND the server, so the
-        # watchdog can read the process it watches. Login startup exists for the
-        # setups where a service genuinely can't work (PIN-only/passwordless
-        # accounts) or isn't needed (palctl doesn't manage the server as a
-        # service — then there's no account split to worry about).
-        self.startup_service.setChecked(True)
-        bgf.addWidget(self.startup_login)
-        bgf.addWidget(self.startup_service)
-        # Path A: a service registered under YOUR account (not LocalSystem) both
-        # starts on boot AND shares your account with the game server, so palctl
-        # can read the server it watches and decrypt your DPAPI secrets (the
-        # Discord token). Windows needs the account password to create a
-        # user-account service — it goes straight to the service manager; palctl
-        # never stores it. Enabled only while the service option is selected.
+        note.setWordWrap(True)
+        bgf.addWidget(note)
         self.service_password = QLineEdit()
         self.service_password.setEchoMode(QLineEdit.EchoMode.Password)
         self.service_password.setPlaceholderText(
             "Your Windows account password (for the service logon)"
         )
         svc_pw_form = QFormLayout()
-        svc_pw_form.setContentsMargins(24, 0, 0, 0)
+        svc_pw_form.setContentsMargins(0, 0, 0, 0)
         svc_pw_form.addRow("Windows password", self.service_password)
         self._svc_pw_host = QWidget()
         self._svc_pw_host.setLayout(svc_pw_form)
         bgf.addWidget(self._svc_pw_host)
-
-        def _sync_startup_options(*_a) -> None:
-            # While palctl manages the server as a Windows service, login
-            # startup is NOT offered: the server service needs an account, the
-            # login daemon runs as you, and any answer other than "the same
-            # account for both" blinds the watchdog. Rather than let the combo
-            # be picked and refuse it later, remove it from the menu.
-            server_managed = self.reg_server.isChecked()
-            if server_managed and self.startup_login.isChecked():
-                self.startup_service.setChecked(True)
-            self.startup_login.setEnabled(not server_managed)
-            self.startup_login.setToolTip(
-                "Unavailable while “Register the Palworld server as a Windows "
-                "service” is ticked: the server service and palctl must run "
-                "under the same account, so palctl runs as a service too."
-                if server_managed else ""
-            )
-            self._svc_pw_host.setEnabled(self.startup_service.isChecked())
-
-        self.startup_service.toggled.connect(_sync_startup_options)
-        self.startup_login.toggled.connect(_sync_startup_options)
-        self.reg_server.toggled.connect(_sync_startup_options)
-        _sync_startup_options()
-        # Restore the previously chosen mode (setup persists it), so a re-run
-        # doesn't silently switch a "service" or "none" choice back to the
-        # login-startup default. A config from before the field existed ("")
-        # falls back to probing what's actually registered.
-        if cfg.daemon_startup == "none":
-            bg.setChecked(False)
-        elif cfg.daemon_startup == "service":
-            self.startup_service.setChecked(True)
-        elif cfg.daemon_startup == "login":
-            # Restored, but _sync_startup_options still flips it to service if
-            # the server-service box is ticked — the split stays unpickable.
-            self.startup_login.setChecked(True)
-        elif not cfg.daemon_startup:
-            try:
-                from .. import winservice
-                from ..daemon import SERVICE_NAME as _DAEMON_SVC
-
-                if winservice.service_exists(_DAEMON_SVC):
-                    self.startup_service.setChecked(True)
-            except Exception:
-                pass  # cosmetic only — never block the wizard over a state probe
         self._bg_group = bg
         form.addWidget(bg)
 
@@ -459,9 +408,9 @@ class SetupWizard(QDialog):
         self.password.setEchoMode(QLineEdit.EchoMode.Normal)
 
     def _daemon_startup(self) -> str:
-        if not self._bg_group.isChecked():
-            return "none"
-        return "service" if self.startup_service.isChecked() else "login"
+        # "service" or "none" — login startup is deliberately not a wizard
+        # concept anymore (see the background group's comment).
+        return "service" if self._bg_group.isChecked() else "none"
 
     def _setup_running(self) -> bool:
         worker = getattr(self, "_worker", None)

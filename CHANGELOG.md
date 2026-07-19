@@ -146,6 +146,35 @@ Installers for every release are on the
   can assert the outcome.
 
 ### Fixed
+- **The GUI's "daemon rejected the token" 401 under a user-account service —
+  the service now really shares your config.** Windows builds a service's
+  environment from the SYSTEM block: `%APPDATA%` is set by your interactive
+  shell at login, not by the service manager — even when the service logs on
+  as your own account. So an `--as-user` daemon silently read
+  `<profile>\.config\palctl` while the GUI read
+  `<profile>\AppData\Roaming\palctl`: two config folders, two tokens, and
+  every GUI call answered 401 despite both running as the same user (latent
+  since the wrapper swap; the moment `--as-user` became the recommended path,
+  it bit). The service definition now injects the `APPDATA` redirect for
+  user-account services too — as it always did for LocalSystem — and the 401
+  message explains the actual cause and fix instead of suggesting a
+  re-registration that wouldn't have helped. And the fallback itself is
+  fixed at the root: with `%APPDATA%` absent, palctl on Windows now falls
+  back to `<profile>\AppData\Roaming` — where the GUI actually lives —
+  instead of a Linux-style `~/.config`. That means **updating palctl alone
+  heals an affected install**: even under an old service registration with no
+  redirect, the daemon now computes the same folder as the GUI. No re-running
+  the wizard, no re-registration, no hand-edits.
+- **The wizard's background section is one switch, not a menu.** The
+  login-startup option is removed from the wizard entirely — not disabled, not
+  hidden: every alternative to "service under your account" either couldn't
+  watch the server or couldn't run the Discord bot, and offering it was how
+  users ended up in the broken split. The group is now a single checkable
+  choice: background on (service under your account, password field right
+  there) or off. A legacy "login" choice from an older config maps to service
+  on the next wizard run. PIN-only accounts that genuinely can't host a
+  service logon still have `palctl-daemon install-startup` from a console — a
+  power-user escape hatch, no longer a wizard option.
 - **Audit of the NSSM→WinSW conversion — four gaps closed.** The wrapper swap
   (1.2.3) kept NSSM's runtime-download pattern and picked up WinSW's config
   model without re-examining what NSSM had been providing implicitly:

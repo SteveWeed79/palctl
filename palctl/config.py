@@ -26,7 +26,21 @@ SERVICE_ID = "palctl"
 
 
 def config_dir() -> Path:
-    base = os.environ.get("APPDATA") or str(Path.home() / ".config")
+    base = os.environ.get("APPDATA")
+    if not base:
+        # %APPDATA% is set by the interactive shell, NOT by the service
+        # manager — a Windows service (even one running as this user) doesn't
+        # have it. The canonical per-user location on Windows is still
+        # <profile>\AppData\Roaming, so land exactly where the GUI lands; the
+        # old ~/.config fallback was a Linux convention that, on Windows, put
+        # a service daemon in a folder no GUI ever reads (two configs, two
+        # tokens, 401 on every call). ~/.config remains the non-Windows path.
+        home = Path.home()
+        base = str(
+            home / "AppData" / "Roaming"
+            if sys.platform.startswith("win")
+            else home / ".config"
+        )
     d = Path(base) / "palctl"
     d.mkdir(parents=True, exist_ok=True)
     return d

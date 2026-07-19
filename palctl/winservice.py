@@ -91,10 +91,11 @@ def winsw_config_xml(
 
       * `user`/`password` set — run the service AS that account
         (<serviceaccount>, with allowservicelogon granting the logon right).
-      * else, `appdata` set — stay LocalSystem but point %APPDATA% at the
-        installing user's config dir, so config, token, and logs are shared.
-        Per-user secrets remain unreadable (the daemon falls back to the
-        AdminPassword already sitting in PalWorldSettings.ini).
+      * `appdata` set — inject %APPDATA% into the service environment. Needed
+        for BOTH accounts: the SCM gives services the SYSTEM environment
+        block, and %APPDATA% is an interactive-shell variable — absent even
+        for a user-account service. Without it the daemon reads a different
+        config dir (and token) than the user's GUI and every call 401s.
 
     <onfailure action="restart"> gives the same 'keep it up' behaviour the
     systemd unit's Restart=on-failure provides on Linux.
@@ -112,14 +113,30 @@ def winsw_config_xml(
     if app_dir:
         lines.append(f"  <workingdirectory>{escape(str(app_dir))}</workingdirectory>")
     if user:
+        # WinSW v2's schema is <domain> + <user> — NOT <username>. An unknown
+        # element is silently ignored, and a <serviceaccount> without a user
+        # falls back to LocalSystem: --as-user then registers a LocalSystem
+        # service while claiming success. Caught by the as-user-lifecycle CI
+        # job's sc qc output on its first run; nothing below a real SCM could
+        # see it. ".\name" and "DOMAIN\name" both split; a bare name gets the
+        # local-machine domain ".".
+        domain, _, account = str(user).rpartition("\\")
         lines += [
             "  <serviceaccount>",
-            f"    <username>{escape(user)}</username>",
+            f"    <domain>{escape(domain or '.')}</domain>",
+            f"    <user>{escape(account)}</user>",
             f"    <password>{escape(password or '')}</password>",
             "    <allowservicelogon>true</allowservicelogon>",
             "  </serviceaccount>",
         ]
-    elif appdata:
+    # The APPDATA redirect applies to BOTH accounts — including a user-account
+    # service. Windows builds a service's environment from the SYSTEM block:
+    # %APPDATA% is set by the interactive shell at login, NOT by the SCM, even
+    # when the service logs on as that user. Without this env line the daemon
+    # falls into config_dir()'s Path.home()/.config fallback — a DIFFERENT
+    # config and token than the user's GUI, and every GUI call 401s ("the
+    # daemon rejected the token") despite both running as the same account.
+    if appdata:
         lines.append(f'  <env name="APPDATA" value="{q(appdata)}"/>')
     lines += [
         "  <startmode>Automatic</startmode>",
