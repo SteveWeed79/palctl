@@ -107,9 +107,14 @@ def call(path: str, body: dict | None = None, *, timeout: float = 10) -> dict:
         ) from e
     if r.status_code == 401:
         raise DaemonDown(
-            "The daemon rejected the token. The GUI and the daemon must run as "
-            "the same Windows user; if the daemon runs as a service, re-register "
-            "it with:  palctl-daemon install-service --as-user"
+            "The daemon rejected the token — it is reading a different config "
+            "folder than this window, so they hold different tokens. The usual "
+            "cause: the daemon service was registered by an older palctl, whose "
+            "service environment lacked the APPDATA redirect (a Windows service "
+            "doesn't inherit your shell's %APPDATA%, even under your account). "
+            "Fix: update palctl, then re-run the setup wizard (or "
+            "`palctl-daemon install-service --as-user`) so the service is "
+            "re-registered with the redirect."
         )
     if r.status_code >= 400:
         # The daemon puts a human reason in {"error": ...} — e.g. a 409
