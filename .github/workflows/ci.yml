@@ -143,7 +143,16 @@ jobs:
         run: |
           python -c "import os, sys; from palctl.daemon import install_service; sys.exit(0 if install_service(as_user=True, password=os.environ['PALCTL_CI_PW']) else 1)"
           if ($LASTEXITCODE -ne 0) { throw "as-user install-service failed (see output above for the reason)" }
-          sc.exe qc palctl-daemon
+          $qc = (sc.exe qc palctl-daemon) -join "`n"
+          Write-Host $qc
+          # ASSERT the logon account, don't just print it: the first run of
+          # this job showed SERVICE_START_NAME : LocalSystem while everything
+          # else was green — palctl wrote <username> where WinSW v2 wants
+          # <domain>+<user>, the element was silently ignored, and --as-user
+          # registered LocalSystem while claiming success.
+          if ($qc -notmatch "SERVICE_START_NAME\s*:\s*.*$env:USERNAME") {
+            throw "service did NOT register under $env:USERNAME - silent LocalSystem fallback is back"
+          }
       - name: THE HANDSHAKE - the interactive token must be accepted by the service
         shell: pwsh
         run: |

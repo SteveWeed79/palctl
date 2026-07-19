@@ -113,9 +113,18 @@ def winsw_config_xml(
     if app_dir:
         lines.append(f"  <workingdirectory>{escape(str(app_dir))}</workingdirectory>")
     if user:
+        # WinSW v2's schema is <domain> + <user> — NOT <username>. An unknown
+        # element is silently ignored, and a <serviceaccount> without a user
+        # falls back to LocalSystem: --as-user then registers a LocalSystem
+        # service while claiming success. Caught by the as-user-lifecycle CI
+        # job's sc qc output on its first run; nothing below a real SCM could
+        # see it. ".\name" and "DOMAIN\name" both split; a bare name gets the
+        # local-machine domain ".".
+        domain, _, account = str(user).rpartition("\\")
         lines += [
             "  <serviceaccount>",
-            f"    <username>{escape(user)}</username>",
+            f"    <domain>{escape(domain or '.')}</domain>",
+            f"    <user>{escape(account)}</user>",
             f"    <password>{escape(password or '')}</password>",
             "    <allowservicelogon>true</allowservicelogon>",
             "  </serviceaccount>",

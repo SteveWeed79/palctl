@@ -58,7 +58,10 @@ def test_install_service_scrubs_the_password_after_registration(monkeypatch, tmp
     _, svc_xml = winservice.wrapper_paths(tmp_path, "palctl-daemon")
     text = svc_xml.read_text(encoding="utf-8")
     assert "hunter2" not in text                      # the secret is gone
-    assert r"<username>.\steve</username>" in text    # the account remains
+    # WinSW v2 schema: <domain> + <user>, never <username> (silently ignored →
+    # LocalSystem fallback — the bug the as-user CI job caught).
+    assert "<domain>.</domain>" in text
+    assert "<user>steve</user>" in text               # the account remains
     assert "<allowservicelogon>true</allowservicelogon>" in text
     # The APPDATA redirect must survive the scrub — losing it here would
     # re-create the split-config 401 on the next service start.
@@ -72,10 +75,23 @@ def test_config_xml_as_user_sets_serviceaccount_and_logon_right():
     xml = winservice.winsw_config_xml(
         "svc", "svc.exe", user=r".\steve", password="hunter2",
     )
-    assert r"<username>.\steve</username>" in xml
+    # WinSW v2 wants <domain> + <user>; the old <username> element was silently
+    # ignored and the service fell back to LocalSystem while claiming success —
+    # caught by the as-user-lifecycle CI job's `sc qc` on its first real run.
+    assert "<domain>.</domain>" in xml
+    assert "<user>steve</user>" in xml
+    assert "<username>" not in xml
     assert "<password>hunter2</password>" in xml
     # WinSW grants "Log on as a service" itself — one less 1069 cause.
     assert "<allowservicelogon>true</allowservicelogon>" in xml
+
+
+def test_config_xml_serviceaccount_splits_domain_forms():
+    # DOMAIN\name keeps its domain; a bare name gets the local machine (".").
+    xml = winservice.winsw_config_xml("s", "s.exe", user=r"CORP\bob", password="x")
+    assert "<domain>CORP</domain>" in xml and "<user>bob</user>" in xml
+    xml2 = winservice.winsw_config_xml("s", "s.exe", user="bob", password="x")
+    assert "<domain>.</domain>" in xml2 and "<user>bob</user>" in xml2
 
 
 def test_config_xml_localsystem_redirects_appdata():
