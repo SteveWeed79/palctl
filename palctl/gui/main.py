@@ -649,7 +649,11 @@ class ConfigTab(QWidget):
         self.api_port = NoScrollSpinBox()
         self.api_port.setRange(1, 65535)
         self.api_port.setValue(cfg.api_port)
-        self.admin_pw = QLineEdit(get_admin_password())
+        # Prefilled from the keyring; remembered so Save only rewrites the
+        # secret when it actually changed — and never blanks a stored password
+        # just because the field was cleared (see _save).
+        self._orig_admin_pw = get_admin_password()
+        self.admin_pw = QLineEdit(self._orig_admin_pw)
         self.admin_pw.setEchoMode(QLineEdit.EchoMode.Password)
         af.addRow("Port", self.api_port)
         af.addRow("Admin password", self.admin_pw)
@@ -802,7 +806,12 @@ class ConfigTab(QWidget):
         dc = QGroupBox("Discord bot")
         df = QFormLayout(dc)
         self.dc_enabled = QCheckBox(checked=cfg.discord.enabled)
-        self.dc_token = QLineEdit(get_discord_token())
+        # Remembered like the admin password: Save only rewrites the token when
+        # it changed, and never blanks a stored token because the field was
+        # cleared (unticking Enabled is how you turn the bot off, not clearing
+        # the token).
+        self._orig_dc_token = get_discord_token()
+        self.dc_token = QLineEdit(self._orig_dc_token)
         self.dc_token.setEchoMode(QLineEdit.EchoMode.Password)
         self.dc_channel = QLineEdit(str(cfg.discord.channel_id or ""))
         self.dc_role = QLineEdit(str(cfg.discord.admin_role_id or ""))
@@ -987,8 +996,17 @@ class ConfigTab(QWidget):
             return
 
         c.save()
-        set_admin_password(self.admin_pw.text())
-        set_discord_token(self.dc_token.text())
+        # Only touch the keyring when a secret actually changed, and never write
+        # a blank over a stored one (a cleared field is not "remove the
+        # password" — that would break the REST API / bot on an unrelated save).
+        new_pw = self.admin_pw.text()
+        if new_pw and new_pw != self._orig_admin_pw:
+            set_admin_password(new_pw)
+            self._orig_admin_pw = new_pw
+        new_token = self.dc_token.text()
+        if new_token and new_token != self._orig_dc_token:
+            set_discord_token(new_token)
+            self._orig_dc_token = new_token
 
         try:
             call("/action/reload-config", {})

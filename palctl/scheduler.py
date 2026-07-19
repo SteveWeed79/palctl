@@ -499,6 +499,28 @@ class Scheduler:
             ok = await self._control.stop()
         return "ok" if ok else "failed"
 
+    # ---------- fire-and-forget reservation (bot /restart, /update) ----------
+
+    @property
+    def current_op(self) -> str | None:
+        """Name of the operation currently holding (or reserved on) the server,
+        or None. Lets a caller tell the user *why* the server is busy."""
+        return self._control.current_op
+
+    def reserve(self, name: str) -> bool:
+        """Synchronously claim the server for a fire-and-forget operation the
+        caller is about to spawn as a task (the Discord bot's /restart and
+        /update, which post 'I'll report back' and run detached). Returns False
+        if something already holds or reserved it, so the caller can report
+        'busy' instead of silently queueing a second countdown behind the first
+        — matching the daemon's HTTP /action path. Pair with clear_reservation()
+        in the spawned task's finally; operation() clears the reservation itself
+        the moment it takes the real lock."""
+        return self._control.reserve(name)
+
+    def clear_reservation(self, name: str) -> None:
+        self._control.clear_reservation(name)
+
     # ---------- restore ----------
 
     async def restore_backup(self, name: str) -> None:

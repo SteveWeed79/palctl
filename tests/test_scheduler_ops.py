@@ -722,6 +722,51 @@ def test_stop_server_saves_records_intent_and_stops(monkeypatch):
     assert ("stop", cfg.service_name) in calls
 
 
+def test_reserve_blocks_a_second_op_and_reports_the_current_one():
+    # The bot's /restart and /update reserve up front so a second one reports
+    # 'busy' instead of silently queueing a second countdown.
+    sched = sched_mod.Scheduler(Config(), FakeApi(), EventBus())
+    assert sched.reserve("restart") is True
+    assert sched.current_op == "restart"
+    assert sched.reserve("update") is False  # busy — something already holds it
+    sched.clear_reservation("restart")
+    assert sched.current_op is None
+    assert sched.reserve("update") is True  # free again
+
+
+def test_reserved_restart_runs_and_clears_the_reservation(monkeypatch):
+    # The bot flow: reserve("restart") → spawn restart_with_countdown → the
+    # operation lock clears the reservation, the restart runs, and the finally
+    # clears again. Proves the reserve+run path can't deadlock or leak a
+    # reservation. Countdown sleeps are faked so the test is instant.
+    cfg = Config()
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+
+    sched = sched_mod.Scheduler(cfg, FakeApi(), EventBus())
+
+    async def _no_wait(_delay):
+        return False  # never "cancelled", and no real sleeping
+
+    monkeypatch.setattr(sched, "_sleep_or_cancel", _no_wait)
+
+    assert sched.reserve("restart") is True
+
+    async def _drive():
+        # Mirror the bot: run the reserved op through _run_reserved's contract.
+        try:
+            return await sched.restart_with_countdown("test")
+        finally:
+            sched.clear_reservation("restart")
+
+    assert _run(_drive()) is True
+    assert ("stop", cfg.service_name) in calls
+    assert ("start", cfg.service_name) in calls
+    # Reservation released, server free for the next op.
+    assert sched.current_op is None
+    assert sched.reserve("update") is True
+
+
 def test_stop_server_reports_failure_when_stop_does_not_confirm(monkeypatch):
     cfg = Config()
 
