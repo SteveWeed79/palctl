@@ -158,8 +158,13 @@ Installers for every release are on the
   it bit). The service definition now injects the `APPDATA` redirect for
   user-account services too — as it always did for LocalSystem — and the 401
   message explains the actual cause and fix instead of suggesting a
-  re-registration that wouldn't have helped. Existing affected installs: update,
-  then re-run the setup wizard (or `install-service --as-user`) once.
+  re-registration that wouldn't have helped. And the fallback itself is
+  fixed at the root: with `%APPDATA%` absent, palctl on Windows now falls
+  back to `<profile>\AppData\Roaming` — where the GUI actually lives —
+  instead of a Linux-style `~/.config`. That means **updating palctl alone
+  heals an affected install**: even under an old service registration with no
+  redirect, the daemon now computes the same folder as the GUI. No re-running
+  the wizard, no re-registration, no hand-edits.
 - **The wizard's background section is one switch, not a menu.** The
   login-startup option is removed from the wizard entirely — not disabled, not
   hidden: every alternative to "service under your account" either couldn't

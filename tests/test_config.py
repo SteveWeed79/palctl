@@ -124,3 +124,36 @@ def test_secret_reads_still_propagate_keyboard_interrupt(monkeypatch: pytest.Mon
     monkeypatch.setattr(config_mod.keyring, "get_password", interrupt)
     with pytest.raises(KeyboardInterrupt):
         config_mod.get_admin_password()
+
+
+# ---------------- config_dir: the same folder for GUI and service ----------------
+
+
+def test_config_dir_uses_appdata_when_set(tmp_path, monkeypatch):
+    import palctl.config as config_mod
+
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    assert config_mod.config_dir() == tmp_path / "Roaming" / "palctl"
+
+
+def test_config_dir_windows_fallback_is_roaming_not_dot_config(tmp_path, monkeypatch):
+    # THE 401 bug: %APPDATA% is an interactive-shell variable — a Windows
+    # service (even under your own account) doesn't get it. The fallback must
+    # land exactly where the GUI lands (<profile>\AppData\Roaming), never in a
+    # Linux-style ~/.config the GUI will never read — that split produced two
+    # tokens and "the daemon rejected the token" on every call.
+    import palctl.config as config_mod
+
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.setattr(config_mod.sys, "platform", "win32")
+    monkeypatch.setattr(config_mod.Path, "home", staticmethod(lambda: tmp_path))
+    assert config_mod.config_dir() == tmp_path / "AppData" / "Roaming" / "palctl"
+
+
+def test_config_dir_linux_fallback_stays_dot_config(tmp_path, monkeypatch):
+    import palctl.config as config_mod
+
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.setattr(config_mod.sys, "platform", "linux")
+    monkeypatch.setattr(config_mod.Path, "home", staticmethod(lambda: tmp_path))
+    assert config_mod.config_dir() == tmp_path / ".config" / "palctl"
