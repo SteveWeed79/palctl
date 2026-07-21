@@ -20,8 +20,8 @@ from palctl.daemon import (  # noqa: E402  (after importorskip guard)
     autorecover_phase,
     lan_exposure_warning,
     make_auth_middleware,
+    recover_decision,
     service_target,
-    should_recover_now,
 )
 from palctl.localauth import TOKEN_HEADER  # noqa: E402
 
@@ -60,11 +60,12 @@ def test_within_window_all_recent():
 
 # ---------------- auto-recover state machine ----------------
 
-_CLEAR = dict(enabled=True, ever_alive=True, busy=False, restarting=False, desired_running=True)
+_CLEAR = dict(ever_alive=True, busy=False, restarting=False, desired_running=True)
 
 
-def test_phase_ignore_when_disabled_or_never_alive():
-    assert autorecover_phase(**{**_CLEAR, "enabled": False}) == "ignore"
+def test_phase_ignore_when_never_alive():
+    # A server that never came up has nothing to recover — regardless of the
+    # feature toggle, which the phase no longer looks at.
     assert autorecover_phase(**{**_CLEAR, "ever_alive": False}) == "ignore"
 
 
@@ -80,13 +81,119 @@ def test_phase_count_on_genuine_outage():
     assert autorecover_phase(**_CLEAR) == "count"
 
 
-def test_should_recover_needs_confirmation_then_respects_cap():
-    # not enough confirming polls yet
-    assert should_recover_now(down_polls=1, confirm_polls=3, recent_restarts=0, cap=3) is False
-    # confirmed, and under the hourly cap
-    assert should_recover_now(down_polls=3, confirm_polls=3, recent_restarts=2, cap=3) is True
-    # confirmed, but already at the cap this hour -> hands off, let a human look
-    assert should_recover_now(down_polls=3, confirm_polls=3, recent_restarts=3, cap=3) is False
+def test_recover_decision_waits_recovers_then_caps():
+    # not enough confirming polls yet -> stay quiet and keep counting
+    assert recover_decision(down_polls=1, confirm_polls=3, recent_restarts=0, cap=3) == "wait"
+    # confirmed, and under the hourly cap -> restart
+    assert recover_decision(down_polls=3, confirm_polls=3, recent_restarts=2, cap=3) == "recover"
+    # confirmed, but already at the cap this hour -> hand off, let a human look
+    assert recover_decision(down_polls=3, confirm_polls=3, recent_restarts=3, cap=3) == "capped"
+
+
+# ---------------- _maybe_autorecover: the "can't/won't recover" alerts ----------------
+#
+# The pure decision functions above are pinned; these drive the daemon method
+# that wires them to the event bus, because the operator-facing behaviour that
+# matters here — a down server that palctl won't quietly abandon — lives in the
+# glue, not the deciders.
+
+
+class _FakeBus:
+    def __init__(self):
+        self.events = []
+
+    async def emit(self, e):
+        self.events.append(e)
+
+    def actions(self):
+        return [e.data.get("action") for e in self.events]
+
+
+def _fake_daemon(**wd_overrides):
+    """A stand-in with just the attributes _maybe_autorecover touches, so we can
+    call the real (unbound) method without spinning up a full Daemon."""
+    wd = types.SimpleNamespace(
+        **{
+            "auto_restart_on_crash": True,
+            "crash_confirm_polls": 3,
+            "crash_restart_max_per_hour": 3,
+            **wd_overrides,
+        }
+    )
+    spawned = []
+
+    async def _fake_autorecover():
+        return None
+
+    d = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(watchdog=wd),
+        control=types.SimpleNamespace(busy=False),
+        watchdog=types.SimpleNamespace(is_restarting=False),
+        _ever_alive=True,
+        _desired_running=True,
+        _down_polls=0,
+        _autorestart_times=[],
+        _cap_notified=False,
+        _recover_off_notified=False,
+        bus=_FakeBus(),
+        _autorecover=_fake_autorecover,
+        _spawn=lambda coro: spawned.append(coro) or coro.close(),
+    )
+    d._spawned = spawned
+    return d
+
+
+def _run_autorecover(d):
+    asyncio.run(daemon_mod.Daemon._maybe_autorecover(d))
+
+
+def test_autorecover_disabled_nudges_once_after_confirmation():
+    d = _fake_daemon(auto_restart_on_crash=False)
+    # Below the confirm threshold: no server touch, and stay quiet.
+    _run_autorecover(d)
+    _run_autorecover(d)
+    assert d.bus.actions() == []
+    # The confirming poll trips the nudge exactly once...
+    _run_autorecover(d)
+    _run_autorecover(d)
+    assert d.bus.actions() == ["autorecover_disabled"]
+    assert d._recover_off_notified is True
+    # ...and never spawns a recovery, because the feature is off.
+    assert d._spawned == []
+
+
+def test_autorecover_recovers_when_enabled_and_under_cap():
+    d = _fake_daemon()
+    for _ in range(3):  # crash_confirm_polls
+        _run_autorecover(d)
+    assert len(d._spawned) == 1
+    assert d._down_polls == 0  # reset when the attempt is launched
+    assert d.bus.actions() == []  # a real attempt is announced by _autorecover
+
+
+def test_autorecover_caps_out_loudly_once():
+    d = _fake_daemon()
+    # Pretend we've already spent the hour's restart budget.
+    now = daemon_mod.time.time()
+    d._autorestart_times = [now, now, now]  # == cap
+    for _ in range(5):
+        _run_autorecover(d)
+    # Confirmed outage, budget spent: hand-off event fires exactly once, and we
+    # never launch another doomed restart.
+    assert d.bus.actions() == ["autorecover_capped"]
+    assert d._spawned == []
+    assert d._cap_notified is True
+
+
+def test_autorecover_reset_clears_down_streak():
+    # An intentional-downtime phase (busy) must zero the streak so a later real
+    # outage starts counting from scratch.
+    d = _fake_daemon()
+    d._down_polls = 2
+    d.control.busy = True
+    _run_autorecover(d)
+    assert d._down_polls == 0
+    assert d.bus.actions() == []
 
 
 # ---------------- API token gate ----------------

@@ -10,6 +10,22 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+### Changed
+- **Crash/hang auto-recovery no longer disengages in silence.** When the server
+  keeps going down and palctl has already spent its hourly restart budget, it
+  used to just stop trying — no event, no notification — so a dead server sat
+  dead until someone happened to notice (or did a full system restart to get out
+  of it). The daemon now distinguishes "still confirming the outage" from
+  "confirmed, but I've hit the restart cap," and emits a loud, once-per-episode
+  hand-off alert for the latter: it has restarted the server N times this hour,
+  it won't stay up, automatic recovery can't fix a crash-loop, and a human needs
+  to look. The alert re-arms the moment the server comes back. And because
+  auto-recovery is **off** by default, an unexpected outage on a box where it's
+  disabled now nudges the operator once — the server is down, palctl didn't stop
+  it, and the one setting that would have brought it back on its own is switched
+  off — instead of leaving a recoverable server down with no hint that palctl
+  could have handled it.
+
 ## [1.2.5.5] — 2026-07-19
 
 An install-, daemon-, and desktop-GUI reliability pass, done after a full

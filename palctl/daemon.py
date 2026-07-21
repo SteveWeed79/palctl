@@ -104,7 +104,6 @@ def _within_window(times: list[float], now: float, window: float = 3600.0) -> li
 
 def autorecover_phase(
     *,
-    enabled: bool,
     ever_alive: bool,
     busy: bool,
     restarting: bool,
@@ -114,27 +113,44 @@ def autorecover_phase(
     First half of the crash-recovery decision — the guards. Pure, so the whole
     'never fight an intentional stop' rule is testable without a live daemon.
 
+    Deliberately independent of whether auto-recovery is *enabled*: a genuine
+    outage is a genuine outage either way, and the caller wants to know about
+    one even when it won't act on it (so it can nudge the operator that the
+    feature that would have handled this is switched off).
+
     Returns:
-      'ignore' — feature off, or the server never came up; do nothing.
+      'ignore' — the server never came up; nothing to recover.
       'reset'  — palctl took the server down on purpose (stop/restart/update/
                  restore/watchdog); clear the down-streak, do nothing.
       'count'  — a genuine unexpected outage; count this poll toward recovery.
     """
-    if not enabled or not ever_alive:
+    if not ever_alive:
         return "ignore"
     if busy or restarting or not desired_running:
         return "reset"
     return "count"
 
 
-def should_recover_now(
+def recover_decision(
     *, down_polls: int, confirm_polls: int, recent_restarts: int, cap: int
-) -> bool:
-    """Second half: only recover after N confirming polls, and not if we've
-    already restarted `cap` times this hour (a real crash-loop needs a human)."""
+) -> str:
+    """Second half: what to do about a confirmed outage. Pure.
+
+    Splitting apart the two ways a restart can be withheld matters — they call
+    for opposite operator experiences, and the old single-boolean form couldn't
+    tell them apart:
+
+      'wait'    — not enough confirming polls yet; a mid-restart or just-woke
+                  box briefly misses /metrics. Stay quiet and keep counting.
+      'recover' — confirmed, and under the hourly cap; restart the server.
+      'capped'  — confirmed, but we've already restarted `cap` times this hour
+                  and it keeps going back down. Automatic recovery can't fix a
+                  crash-loop; a human has to. The caller says so, loudly — the
+                  silent version of this is a dead server nobody knows is dead.
+    """
     if down_polls < max(1, confirm_polls):
-        return False
-    return recent_restarts < cap
+        return "wait"
+    return "recover" if recent_restarts < cap else "capped"
 
 
 def _busy_response(current_op: str | None) -> web.Response:
@@ -294,6 +310,11 @@ class Daemon:
         self._down_polls = 0               # consecutive unreachable polls
         self._api_fail_streak = 0          # debounce for the down/up announcement
         self._autorestart_times: list[float] = []
+        # One-shot latches for the "palctl can't/won't recover this" events, so a
+        # server that stays down doesn't repeat them every poll. Both re-arm when
+        # the server comes back (a good poll) — see _poll.
+        self._cap_notified = False         # hourly restart budget spent
+        self._recover_off_notified = False  # outage while auto-recovery is off
         # A 401 from the REST API means the server is UP but the admin password
         # is wrong (rotated out from under us, say) — NOT an outage. Warn once,
         # not every poll, and never let it drive down-detection/auto-recovery.
@@ -559,6 +580,10 @@ class Daemon:
         self._down_polls = 0
         self._api_fail_streak = 0
         self._auth_warned = False  # a good poll re-arms the password warning
+        # The server is reachable again: re-arm the "can't/won't recover" alerts
+        # so the *next* outage is announced fresh instead of staying silent.
+        self._cap_notified = False
+        self._recover_off_notified = False
         await self._maybe_warn_account_mismatch()
 
         await self.tracker.update(players)
@@ -616,10 +641,15 @@ class Daemon:
         Called on every poll where the REST API is unreachable. Brings the server
         back only when it was up before, palctl didn't stop it, and we haven't
         already restarted too many times this hour.
+
+        When it can't (or won't) bring the server back, it does not go quiet:
+        a crash-loop that's blown the hourly cap, and an outage on a box where
+        auto-recovery is switched off, both get a loud once-per-episode event so
+        the operator learns the server is down and needs a hand — instead of
+        finding out hours later that palctl silently stopped trying.
         """
         wd = self.cfg.watchdog
         phase = autorecover_phase(
-            enabled=wd.auto_restart_on_crash,
             ever_alive=self._ever_alive,
             busy=self.control.busy,
             restarting=self.watchdog.is_restarting,
@@ -633,16 +663,62 @@ class Daemon:
 
         # phase == "count": a genuine unexpected outage.
         self._down_polls += 1
+
+        if not wd.auto_restart_on_crash:
+            # Auto-recovery is off (the default). We won't touch the server, but
+            # once we're as sure as the recovery path would be that this is a
+            # real outage, tell the operator the one thing that would have fixed
+            # it unattended is switched off — once, not every poll.
+            if (
+                self._down_polls >= max(1, wd.crash_confirm_polls)
+                and not self._recover_off_notified
+            ):
+                self._recover_off_notified = True
+                await self.bus.emit(
+                    Event(
+                        "error",
+                        "🔴 The server is down and palctl didn't stop it, but "
+                        "crash/hang auto-recovery is turned **off** — palctl will "
+                        "not restart it for you. Turn on auto-recovery (Config → "
+                        "Watchdog) if you want palctl to bring it back on its own.",
+                        {"action": "autorecover_disabled"},
+                    )
+                )
+            return
+
         now = time.time()
         self._autorestart_times = _within_window(self._autorestart_times, now)
-        if not should_recover_now(
+        decision = recover_decision(
             down_polls=self._down_polls,
             confirm_polls=wd.crash_confirm_polls,
             recent_restarts=len(self._autorestart_times),
             cap=wd.crash_restart_max_per_hour,
-        ):
+        )
+        if decision == "wait":
+            return
+        if decision == "capped":
+            # Confirmed outage, but we've already restarted the server the
+            # hourly-max times and it keeps going back down. Restarting again
+            # won't help a crash-loop — hand off to a human, loudly, once.
+            if not self._cap_notified:
+                self._cap_notified = True
+                await self.bus.emit(
+                    Event(
+                        "error",
+                        f"🆘 The server keeps going down — palctl has already "
+                        f"restarted it {wd.crash_restart_max_per_hour} time(s) this "
+                        "hour and it won't stay up. Backing off automatic recovery: "
+                        "this needs a look (check the server logs, disk space, and "
+                        "the world save). palctl will try again once the hour's "
+                        "restart budget frees up.",
+                        {"action": "autorecover_capped"},
+                    )
+                )
             return
 
+        # decision == "recover": a fresh attempt, so re-arm the cap warning for
+        # the next time we might blow the budget.
+        self._cap_notified = False
         self._down_polls = 0
         self._spawn(self._autorecover())
 
