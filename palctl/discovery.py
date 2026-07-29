@@ -210,6 +210,40 @@ def detect_steamcmd() -> list[Path]:
     return _dedup_valid(candidates, is_steamcmd)
 
 
+def root_mismatch_warning(configured: str | Path, running: Path | None) -> str | None:
+    """
+    Warn when the install palctl *updates* isn't the one the server *runs* from.
+
+    ``server_root`` (what SteamCMD rewrites) and ``service_name`` (what palctl
+    starts) are independent settings, so nothing stops them pointing at two
+    different copies of the server — the classic result of installing a second
+    time to a new folder, or adopting palctl onto a box that already had a
+    service. Every update then lands on the copy nobody runs: the console says
+    the update succeeded, the running server never changes build, and players
+    are refused with a version mismatch that no amount of re-updating fixes.
+
+    Pure (a path comparison), so it's testable; ``None`` when they agree or when
+    the running install can't be determined — an unknown root is never reported
+    as a mismatch.
+    """
+    if running is None or not configured:
+        return None
+    try:
+        a, b = Path(configured).resolve(), Path(running).resolve()
+    except OSError:
+        return None
+    same = str(a).lower() == str(b).lower() if IS_WINDOWS else a == b
+    if same:
+        return None
+    return (
+        f"palctl is configured to update the server at '{a}', but the running "
+        f"server was started from '{b}'. Updates would rewrite the copy nobody "
+        "runs — the update reports success, the live server stays on its old "
+        "build, and players get a version mismatch. Point Server root at "
+        f"'{b}' in Config (or start the server from '{a}')."
+    )
+
+
 def best_server_root() -> Path | None:
     roots = detect_server_roots()
     return roots[0] if roots else None

@@ -74,9 +74,45 @@ def parse_latest_buildid(app_info_text: str) -> str | None:
     return m.group(1) if m else None
 
 
+def manifest_path(server_root: str | Path, app_id: str = APP_ID) -> Path | None:
+    """
+    Find Steam's ``appmanifest_<app_id>.acf`` for an installed server.
+
+    There are two layouts on disk and palctl has to read both:
+
+      * SteamCMD with ``+force_install_dir <root>`` (what palctl's own installer
+        does) puts it at ``<root>/steamapps/appmanifest_<id>.acf``.
+      * A Steam *library* — the Steam client's "Palworld Dedicated Server" tool,
+        or a plain SteamCMD run without force_install_dir — installs the game to
+        ``<lib>/steamapps/common/PalServer`` and keeps the manifest two levels up,
+        at ``<lib>/steamapps/appmanifest_<id>.acf``.
+
+    Only looking in the first place meant the build id read as "unknown" for
+    everyone on the second layout (which ``discovery`` detects on purpose), so
+    the update check silently never fired and their server sat on an old build
+    until players hit a version mismatch on the join screen.
+
+    The walk up stops after three levels — enough to cover ``steamapps/common/
+    PalServer`` — so it can't wander off and pick up an unrelated install's
+    manifest from higher up the drive.
+    """
+    name = f"appmanifest_{app_id}.acf"
+    root = Path(server_root)
+    for base in (root, *list(root.parents)[:3]):
+        candidate = base / "steamapps" / name
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
 def installed_buildid(server_root: str | Path, app_id: str = APP_ID) -> str | None:
     """Read the installed build id from the server's Steam manifest, if present."""
-    acf = Path(server_root) / "steamapps" / f"appmanifest_{app_id}.acf"
+    acf = manifest_path(server_root, app_id)
+    if acf is None:
+        return None
     try:
         return parse_installed_buildid(acf.read_text(encoding="utf-8", errors="ignore"))
     except OSError:

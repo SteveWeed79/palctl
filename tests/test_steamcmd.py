@@ -118,3 +118,47 @@ def test_parse_latest_buildid_reads_public_branch():
     assert steamcmd.parse_latest_buildid(txt) == "999"
     # No public branch -> no answer, rather than guessing the wrong branch.
     assert steamcmd.parse_latest_buildid('"branches" { "beta" { "buildid" "1" } }') is None
+
+
+ACF = '"AppState"\n{\n\t"appid"\t"2394010"\n\t"buildid"\t"777"\n}'
+
+
+def test_manifest_found_in_force_install_dir_layout(tmp_path: Path):
+    # SteamCMD with +force_install_dir keeps the manifest inside the server root.
+    root = tmp_path / "PalServer"
+    (root / "steamapps").mkdir(parents=True)
+    (root / "steamapps" / "appmanifest_2394010.acf").write_text(ACF)
+
+    assert steamcmd.manifest_path(root) == root / "steamapps" / "appmanifest_2394010.acf"
+    assert steamcmd.installed_buildid(root) == "777"
+
+
+def test_manifest_found_in_steam_library_layout(tmp_path: Path):
+    # A Steam-client install: the game is in <lib>/steamapps/common/PalServer and
+    # the manifest sits two levels up. Reading only the first layout made the
+    # build id 'unknown' for these installs, so the update check never fired.
+    lib = tmp_path / "Steam"
+    root = lib / "steamapps" / "common" / "PalServer"
+    root.mkdir(parents=True)
+    (lib / "steamapps" / "appmanifest_2394010.acf").write_text(ACF)
+
+    assert steamcmd.manifest_path(root) == lib / "steamapps" / "appmanifest_2394010.acf"
+    assert steamcmd.installed_buildid(root) == "777"
+
+
+def test_manifest_absent_reads_as_unknown(tmp_path: Path):
+    root = tmp_path / "PalServer"
+    root.mkdir()
+    assert steamcmd.manifest_path(root) is None
+    assert steamcmd.installed_buildid(root) is None
+
+
+def test_manifest_walk_up_stops_before_unrelated_installs(tmp_path: Path):
+    # A manifest further up than steamapps/common/<game> belongs to a different
+    # install; picking it up would report someone else's build id as ours.
+    root = tmp_path / "a" / "b" / "c" / "d" / "PalServer"
+    root.mkdir(parents=True)
+    (tmp_path / "steamapps").mkdir()
+    (tmp_path / "steamapps" / "appmanifest_2394010.acf").write_text(ACF)
+
+    assert steamcmd.manifest_path(root) is None

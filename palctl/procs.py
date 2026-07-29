@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import psutil
 
@@ -114,6 +115,54 @@ def shipping_processes() -> list[psutil.Process]:
     out: list[psutil.Process] = []
     for p in psutil.process_iter(["name"]):
         if (p.info.get("name") or "") in SHIPPING_PROCESS_NAMES:
+            out.append(p)
+    return out
+
+
+def _exe_under(exe: str | None, root: str | Path) -> bool:
+    """Whether `exe` lives inside `root`. Pure, so the path comparison is
+    testable on any OS. An unreadable exe (None) is never a match — see
+    processes_under(). Case-insensitive on Windows, where C:\\PalServer and
+    c:\\palserver are the same directory."""
+    if not exe or not root:
+        return False
+    try:
+        a, b = Path(exe).parts, Path(root).parts
+    except (TypeError, ValueError):
+        return False
+    if len(a) <= len(b):
+        return False
+    if IS_WINDOWS:
+        a = tuple(p.lower() for p in a)
+        b = tuple(p.lower() for p in b)
+    return a[: len(b)] == b
+
+
+def processes_under(root: str | Path) -> list[psutil.Process]:
+    """
+    Running Palworld server processes launched from inside `root`.
+
+    Checked before SteamCMD rewrites an install: SteamCMD cannot replace a file
+    another process still holds open, and on Windows it fails that overwrite
+    *quietly* — the download "succeeds", the old binaries survive, and the first
+    anyone hears of it is players being refused with a version mismatch. A
+    service that reports STOPPED while a PalServer process is still alive under
+    the install dir (a hung shutdown, or a leftover second service) is exactly
+    that case.
+
+    A process whose executable path can't be read — the cross-account split,
+    where the server runs as SYSTEM and palctl as the login user — is NOT
+    counted: it can't be attributed to this install, and blocking an update on a
+    process we can't identify would strand people who have that split. The
+    post-update build-id check catches a failed overwrite either way.
+    """
+    out: list[psutil.Process] = []
+    for p in shipping_processes():
+        try:
+            exe = p.exe()
+        except psutil.Error:
+            continue
+        if _exe_under(exe, root):
             out.append(p)
     return out
 
