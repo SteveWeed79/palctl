@@ -432,3 +432,46 @@ def test_account_check_is_conclusive_and_warns_on_a_split(monkeypatch):
     checked, warning = procs.server_account_check("me")
     assert checked is True
     assert warning and "SYSTEM" in warning
+# ---------- lingering processes over an install (the silent-failed-update bug) ----------
+
+
+class _FakeExeProc:
+    """Enumerable Palworld process with an exe path that may be unreadable."""
+
+    def __init__(self, exe, pid=1234):
+        self.pid = pid
+        self.info = {"name": "PalServer-Win64-Shipping.exe"}
+        self._exe = exe
+
+    def name(self):
+        return "PalServer-Win64-Shipping.exe"
+
+    def exe(self):
+        if self._exe is None:
+            raise psutil.AccessDenied()
+        return self._exe
+
+
+def test_exe_under_matches_only_paths_inside_the_root():
+    root = "/srv/PalServer"
+    assert procs._exe_under("/srv/PalServer/Pal/Binaries/Linux/PalServer-Linux-Shipping", root)
+    assert not procs._exe_under("/srv/OtherServer/Pal/Binaries/Linux/x", root)
+    # The root itself isn't "under" it, and an unreadable exe is never a match.
+    assert not procs._exe_under(root, root)
+    assert not procs._exe_under(None, root)
+    assert not procs._exe_under("/srv/PalServer/x", "")
+
+
+def test_processes_under_finds_a_server_still_holding_the_install(monkeypatch):
+    proc = _FakeExeProc("/srv/PalServer/Pal/Binaries/Linux/PalServer-Linux-Shipping")
+    _fake_iter(monkeypatch, [proc])
+    assert procs.processes_under("/srv/PalServer") == [proc]
+    assert procs.processes_under("/srv/Elsewhere") == []
+
+
+def test_processes_under_ignores_a_process_it_cannot_attribute(monkeypatch):
+    # The cross-account split (server as SYSTEM): the exe path can't be read, so
+    # it can't be blamed on this install — blocking updates on it would strand
+    # everyone with that setup. The post-update build check covers it instead.
+    _fake_iter(monkeypatch, [_FakeExeProc(None)])
+    assert procs.processes_under("/srv/PalServer") == []

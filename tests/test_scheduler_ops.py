@@ -897,6 +897,138 @@ def test_update_server_records_up_intent(tmp_path, monkeypatch):
     assert True in intent  # parity with the daemon's HTTP /action/update-server
 
 
+# ---------- the update actually landing (the version-mismatch bug) ----------
+
+
+def _update_cfg(tmp_path):
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path / "server")
+    cfg.backup_root = str(tmp_path / "backups")
+    return cfg
+
+
+def _patch_steamcmd(monkeypatch, calls, *, installed, latest="200"):
+    """Fake SteamCMD whose install leaves `installed` behind as the build id
+    (a list, popped per read, so before/after can differ)."""
+
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+        calls.append(("update",))
+        return 0
+
+    async def fake_latest(sc, app):
+        return latest
+
+    reads = list(installed)
+    monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
+    monkeypatch.setattr(sched_mod.steamcmd, "latest_buildid", fake_latest)
+    monkeypatch.setattr(sched_mod.steamcmd, "backup_file", lambda p: None)
+    monkeypatch.setattr(sched_mod, "is_blank", lambda p: False)
+    monkeypatch.setattr(
+        sched_mod.steamcmd, "installed_buildid",
+        lambda root, app: reads.pop(0) if reads else None,
+    )
+
+
+def test_update_aborts_when_a_process_still_holds_the_install(tmp_path, monkeypatch):
+    # The service says STOPPED but a server is still running out of the install:
+    # SteamCMD can't replace files it holds, and on Windows that failure is
+    # silent — the old binaries survive and players get a version mismatch.
+    cfg = _update_cfg(tmp_path)
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+    _patch_steamcmd(monkeypatch, calls, installed=["100", "100"])
+
+    class _Held:
+        pid = 4242
+
+    monkeypatch.setattr(sched_mod.procs, "processes_under", lambda root: [_Held()])
+
+    bus = EventBus()
+    events = _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+
+    assert ("update",) not in calls  # SteamCMD never ran against a locked install
+    assert [c[0] for c in calls] == ["stop"]  # and the server wasn't blind-started
+    assert any(
+        e.kind == "error" and "still running" in e.message and "4242" in e.message
+        for e in events
+    )
+
+
+def test_update_reports_the_build_it_landed_on(tmp_path, monkeypatch):
+    cfg = _update_cfg(tmp_path)
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+    _patch_steamcmd(monkeypatch, calls, installed=["100", "200"], latest="200")
+    monkeypatch.setattr(sched_mod.procs, "processes_under", lambda root: [])
+
+    bus = EventBus()
+    events = _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+
+    assert any("Build 100 → 200" in e.message for e in events)
+    assert not any(e.kind == "error" for e in events)
+
+
+def test_update_flags_a_build_that_never_changed(tmp_path, monkeypatch):
+    # SteamCMD exits 0 on a blocked overwrite, so the exit code is not proof.
+    # Steam says 200, the disk still says 100: the update did not land, and
+    # announcing success would leave players bouncing off a version mismatch.
+    cfg = _update_cfg(tmp_path)
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+    _patch_steamcmd(monkeypatch, calls, installed=["100", "100"], latest="200")
+    monkeypatch.setattr(sched_mod.procs, "processes_under", lambda root: [])
+
+    bus = EventBus()
+    events = _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+
+    assert ("update",) in calls  # it ran — it just didn't take
+    assert any(
+        e.kind == "error" and "did NOT land" in e.message and "version mismatch" in e.message
+        for e in events
+    )
+
+
+def test_update_says_so_when_it_cannot_verify(tmp_path, monkeypatch):
+    # No manifest to read: never claim a verified update we didn't verify.
+    cfg = _update_cfg(tmp_path)
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+    _patch_steamcmd(monkeypatch, calls, installed=[None, None], latest="200")
+    monkeypatch.setattr(sched_mod.procs, "processes_under", lambda root: [])
+
+    bus = EventBus()
+    events = _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+
+    assert any("Couldn't verify the update" in e.message for e in events)
+
+
+def test_update_available_warns_once_when_the_manifest_is_unreadable(tmp_path, monkeypatch):
+    # A build id that can't be read makes the update check permanently blind —
+    # which is indistinguishable from "no updates" unless it says so.
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path)
+    _patch_buildids(monkeypatch, installed=None, latest="200")
+
+    bus = EventBus()
+    events = _collect(bus)
+    sched = sched_mod.Scheduler(cfg, FakeApi(), bus)
+    assert _run(sched.check_update_available()) is False
+    assert _run(sched.check_update_available()) is False
+
+    blind = [e for e in events if e.kind == "error" and "build id" in e.message]
+    assert len(blind) == 1  # said once, not every few hours
+
+
 def test_update_that_resets_the_ini_restores_it_and_keeps_palctl_able_to_see(
     tmp_path, monkeypatch
 ):
@@ -960,7 +1092,6 @@ def test_update_that_resets_the_ini_restores_it_and_keeps_palctl_able_to_see(
         for e in events
     ), "and the admin has to be told it happened"
 
-
 def test_validate_is_available_as_an_explicit_repair(tmp_path, monkeypatch):
     """Removing validate from routine updates must not remove the ability to
     repair a genuinely broken install — it just stops being the default."""
@@ -985,41 +1116,3 @@ def test_validate_is_available_as_an_explicit_repair(tmp_path, monkeypatch):
     _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(validate=True))
 
     assert ("update", True) in calls
-
-
-def test_the_update_reports_what_it_actually_installed(tmp_path, monkeypatch):
-    """SteamCMD's exit code says nothing about whether anything was installed —
-    setup already refuses to trust it. Without the build id, an update that
-    quietly did nothing reads exactly like one that worked."""
-    steam = tmp_path / "steamcmd.exe"
-    steam.write_bytes(b"MZ")
-    cfg = Config()
-    cfg.steamcmd_path = str(steam)
-    cfg.server_root = str(tmp_path / "server")
-    cfg.backup_root = str(tmp_path / "backups")
-
-    builds = iter(["111", "222"])
-    monkeypatch.setattr(
-        sched_mod.steamcmd, "installed_buildid", lambda root, app_id: next(builds)
-    )
-    _patch_service(monkeypatch, [])
-
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line=None):
-        return 0
-
-    monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
-    monkeypatch.setattr(sched_mod.steamcmd, "backup_file", lambda p: None)
-
-    bus = EventBus()
-    events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
-
-    assert any("111" in e.message and "222" in e.message for e in events)
-
-
-def test_build_change_wording():
-    assert "already on 42" in sched_mod._build_change("42", "42")
-    assert "7 → **8**" in sched_mod._build_change("7", "8")
-    # No manifest to read: say nothing rather than guess.
-    assert sched_mod._build_change(None, "8") == ""
-    assert sched_mod._build_change("7", None) == ""

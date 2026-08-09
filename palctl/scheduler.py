@@ -44,21 +44,6 @@ def _free_bytes(path: Path | str) -> int | None:
         return None
 
 
-def _build_change(before: str | None, after: str | None) -> str:
-    """Say what the update actually did to the installed build.
-
-    Pure, and worth having: SteamCMD's exit code doesn't tell you whether
-    anything was installed, so "✅ SteamCMD finished (exit 0)" reads identically
-    whether the server was updated, was already current, or the run silently
-    achieved nothing. The build id in Steam's own manifest is the fact.
-    """
-    if before is None or after is None:
-        return ""  # no manifest to read; don't claim anything either way
-    if before != after:
-        return f" Server updated: build {before} → **{after}**."
-    return f" No new build — the server was already on {after}."
-
-
 def backup_interval_hours(raw: int) -> int:
     """Effective hours between local backups. Capped at 24 so local backups —
     the safety net — always happen at least once a day, even if a stale or
@@ -120,11 +105,18 @@ class Scheduler:
         # Armed for the duration of a countdown restart so /cancel can abort it
         # before the server actually goes down. None = no countdown in flight.
         self._cancel_restart: asyncio.Event | None = None
+        # One-shot: the update check runs every few hours, and a server root with
+        # no readable Steam manifest would otherwise repeat the same warning
+        # forever. Reset on reconfigure, so fixing the path re-arms it.
+        self._manifest_warned = False
 
     def reconfigure(self, cfg: Config, api: PalApi) -> None:
         self._cfg = cfg
         self._api = api
         self._control.reconfigure(cfg, api)
+        # A reload is how someone fixes a wrong server root; let the manifest
+        # warning fire again against the new one instead of staying quiet.
+        self._manifest_warned = False
 
     async def run(self) -> None:
         await asyncio.gather(
@@ -359,19 +351,48 @@ class Scheduler:
         installed = await asyncio.to_thread(
             steamcmd.installed_buildid, cfg.server_root, cfg.app_id
         )
+        if installed is None:
+            # Nothing to compare against: this check is now permanently blind,
+            # so the first sign of a server left behind on an old build would be
+            # players bouncing off the join screen. Say so once per daemon run.
+            await self._warn_unreadable_manifest()
+            return False
         latest = await steamcmd.latest_buildid(cfg.steamcmd_path, cfg.app_id)
-        if installed and latest and installed != latest:
+        if latest and installed != latest:
             await self._bus.emit(
                 Event(
                     "update_available",
                     f"⬆️ A Palworld server update is available (installed build "
-                    f"{installed}, latest {latest}). Use `/update` or the Console "
-                    "**Update** button when it's convenient.",
+                    f"{installed}, latest {latest}). Once Steam updates a "
+                    "player's game client, they'll be refused with a **version "
+                    "mismatch** until the server is on the same build — so don't "
+                    "leave this long. Use `/update` or the Console **Update** "
+                    "button.",
                     {"installed": installed, "latest": latest},
                 )
             )
             return True
         return False
+
+    async def _warn_unreadable_manifest(self) -> None:
+        """One warning per daemon run when Steam's appmanifest can't be found
+        under the configured server root. Without it, update detection fails
+        silently and looks exactly like 'there are no updates'."""
+        if self._manifest_warned:
+            return
+        self._manifest_warned = True
+        await self._bus.emit(
+            Event(
+                "error",
+                f"Can't read the installed Palworld build id: no "
+                f"`appmanifest_{self._cfg.app_id}.acf` under "
+                f"`{self._cfg.server_root}` or its Steam library. palctl can't "
+                "tell you when a server update lands, so the first sign will be "
+                "players getting a **version mismatch**. Check that Server root "
+                "in Config points at the install the server actually runs from.",
+                {"server_root": str(self._cfg.server_root)},
+            )
+        )
 
     def cancel_countdown(self) -> bool:
         """Ask an in-progress countdown restart to abort before it takes the
@@ -710,6 +731,92 @@ class Scheduler:
                 )
             )
 
+    async def _confirm_install_is_free(self, cfg: Config) -> bool:
+        """
+        The service says STOPPED — but is the install actually free to rewrite?
+
+        A hung shutdown, or a leftover second service pointed at the same folder,
+        can leave a PalServer process alive after the service manager has moved
+        on. SteamCMD can't replace files that process holds open, and on Windows
+        it fails that overwrite quietly: the update "succeeds", the old binaries
+        survive, and the first anyone hears of it is players being refused with a
+        version mismatch. Abort with the cause instead — the world is untouched
+        and the server is down, which is a state a human can act on.
+        """
+        alive = await asyncio.to_thread(procs.processes_under, cfg.server_root)
+        if not alive:
+            return True
+        pids = ", ".join(str(p.pid) for p in alive)
+        await self._bus.emit(
+            Event(
+                "error",
+                f"Update aborted: the service reports STOPPED but a Palworld "
+                f"server is still running from `{cfg.server_root}` (PID {pids}). "
+                "SteamCMD can't replace files a live process holds — it would "
+                "half-apply the update and leave the old binaries in place, "
+                "which players meet as a **version mismatch**. Nothing was "
+                "changed. End that process (and check for a second, leftover "
+                "server service in services.msc), then retry.",
+                {"pids": [p.pid for p in alive], "server_root": str(cfg.server_root)},
+            )
+        )
+        return False
+
+    async def _verify_update_landed(
+        self, cfg: Config, *, before: str | None, after: str | None
+    ) -> bool:
+        """
+        Confirm the build on disk is really Steam's latest, instead of trusting
+        the exit code.
+
+        SteamCMD's exit status is not proof: it exits 0 for "nothing to do", and
+        a blocked overwrite (locked file, full disk, a wrong ``force_install_dir``
+        that quietly installed somewhere else) can still finish tidily. Reporting
+        "✅ back up" on that leaves the server on the old build — the exact
+        failure players see as a version mismatch — so the build id gets checked
+        against Steam before we claim the update worked.
+
+        Best-effort by design: when Steam can't be reached, or the manifest can't
+        be read, we say what we couldn't verify rather than invent a verdict.
+        """
+        if after is None:
+            # Can't verify. Not an error in itself (the periodic check already
+            # reports an unreadable manifest as a config problem), but never
+            # claim a verified update we didn't verify.
+            await self._bus.emit(
+                Event(
+                    "update",
+                    f"⚠️ Couldn't verify the update: no "
+                    f"`appmanifest_{cfg.app_id}.acf` under `{cfg.server_root}`, "
+                    "so palctl can't confirm which build is now installed. If "
+                    "players hit a version mismatch, check that Server root "
+                    "points at the install SteamCMD is writing to.",
+                    {"server_root": str(cfg.server_root)},
+                )
+            )
+            return False
+        latest = await steamcmd.latest_buildid(cfg.steamcmd_path, cfg.app_id)
+        if not latest:
+            return False  # offline / steamcmd trouble: nothing to compare against
+        if after == latest:
+            return True
+        await self._bus.emit(
+            Event(
+                "error",
+                f"⚠️ The update did NOT land: the server is still on build "
+                f"{after} but Steam's latest is {latest}"
+                + (" (unchanged by this update)." if before == after else ".")
+                + " Players whose game client has updated will be refused with a "
+                "**version mismatch**. The usual causes: a file was locked by a "
+                "still-running server or a second server service; the disk is "
+                "full; or Server root in Config points at a different install "
+                "than the one the service actually starts. Fix that and run the "
+                "update again.",
+                {"installed": after, "latest": latest, "build_before": before},
+            )
+        )
+        return False
+
     async def _update_locked(self, cfg: Config, *, validate: bool) -> None:
         await self._bus.emit(
             Event("update", "⏬ Server update starting — backing up, saving, stopping.")
@@ -761,17 +868,16 @@ class Scheduler:
                 )
             )
             return
+        if not await self._confirm_install_is_free(cfg):
+            return
         try:
             ini = cfg.live_ini
-            ini_backup = await asyncio.to_thread(steamcmd.backup_file, ini)
-            # The build actually installed, before and after. SteamCMD's exit
-            # code is famously unreliable (setup already refuses to trust it and
-            # checks for the files instead), so "exit 0" on its own is not
-            # evidence that anything happened — which makes an update that
-            # quietly does nothing indistinguishable from one that worked.
-            build_before = await asyncio.to_thread(
+            # What's on disk before SteamCMD touches it, so the update can be
+            # verified afterwards rather than trusted (see _verify_update_landed).
+            before = await asyncio.to_thread(
                 steamcmd.installed_buildid, cfg.server_root, cfg.app_id
             )
+            ini_backup = await asyncio.to_thread(steamcmd.backup_file, ini)
 
             latest: list[str] = []
 
@@ -794,21 +900,25 @@ class Scheduler:
                 # died halfway is exactly when the ini is half-rewritten.
                 await self._heal_ini_after_update(cfg, ini, ini_backup)
 
-            build_after = await asyncio.to_thread(
+            tail = f" ({latest[0]})" if latest else ""
+            after = await asyncio.to_thread(
                 steamcmd.installed_buildid, cfg.server_root, cfg.app_id
             )
-            tail = f" ({latest[0]})" if latest else ""
+            build = ""
+            if after and after != before:
+                build = f" Build {before or 'unknown'} → {after}."
+            elif after:
+                build = f" Build {after} (unchanged)."
             await self._bus.emit(
                 Event(
                     "update",
                     (f"✅ SteamCMD finished (exit {code}).{tail}" if code == 0
                      else f"⚠️ SteamCMD exited {code}.{tail}")
-                    + _build_change(build_before, build_after)
-                    + " Starting server.",
-                    {"exit_code": code,
-                     "build_before": build_before, "build_after": build_after},
+                    + build + " Starting server.",
+                    {"exit_code": code, "build_before": before, "build_after": after},
                 )
             )
+            await self._verify_update_landed(cfg, before=before, after=after)
         except Exception as e:
             # Without this, a GUI- or bot-triggered update that throws would
             # restart the server and announce success with no trace of the
