@@ -1026,7 +1026,17 @@ class Daemon:
                     if not self._spawn_exclusive("backup", self.scheduler.backup_now("gui")):
                         return _busy_response(self.control.current_op)
                 elif what == "update-server":
-                    if not self._spawn_exclusive("update", self.scheduler.update_server()):
+                    # `{"validate": true}` asks SteamCMD to re-verify every file
+                    # against Steam's manifest — a repair for a suspected-broken
+                    # install, not part of a routine update. It is slow (a full
+                    # multi-GB pass) and it restores files that differ, which is
+                    # what resets PalWorldSettings.ini, so it is opt-in per call.
+                    if not self._spawn_exclusive(
+                        "update",
+                        self.scheduler.update_server(
+                            validate=bool(body.get("validate", False))
+                        ),
+                    ):
                         return _busy_response(self.control.current_op)
                     self._desired_running = True
                 elif what == "restore":

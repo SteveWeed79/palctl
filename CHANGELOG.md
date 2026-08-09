@@ -57,6 +57,24 @@ default (see **Changed**). Neither was reachable by reading files.
   would think to look.
 
 ### Fixed
+- **Updates no longer run `validate`, which is what was resetting your ini.**
+  Every update path — the schedule, the GUI button, Discord `/update` — ran
+  `app_update … validate`. `validate` is not an update: it is a full checksum of
+  every file in the install against Steam's manifest, restoring anything that
+  differs. Valve's guidance is to use it to repair a suspected-broken install,
+  not to update one. palctl ran it routinely, which cost a full multi-GB
+  verification pass every time and — as this code's own docstring admitted — is
+  the thing that resets `PalWorldSettings.ini`. palctl was causing that damage
+  itself, on a schedule, then trying to undo it afterwards. Plain `app_update`
+  still installs the newest build. Validation is still available deliberately,
+  as a repair: `POST /action/update-server {"validate": true}`.
+- **An update now tells you what it actually installed.** It reported SteamCMD's
+  exit code and nothing else — and setup already refuses to trust that code,
+  checking for the files instead. "✅ SteamCMD finished (exit 0)" read exactly
+  the same whether the server was updated, was already current, or the run
+  achieved nothing at all, which is no way to answer "did that work?". Updates
+  now report the installed build id from Steam's own manifest: either
+  `build 111 → 222`, or `no new build — already on 222`.
 - **A server update could leave palctl permanently blind, and silently wipe your
   settings.** This is the one that looks like "palctl is broken": after a
   SteamCMD update the dashboard shows nothing, the server can't be connected to,

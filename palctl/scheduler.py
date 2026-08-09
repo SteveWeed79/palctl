@@ -44,6 +44,21 @@ def _free_bytes(path: Path | str) -> int | None:
         return None
 
 
+def _build_change(before: str | None, after: str | None) -> str:
+    """Say what the update actually did to the installed build.
+
+    Pure, and worth having: SteamCMD's exit code doesn't tell you whether
+    anything was installed, so "✅ SteamCMD finished (exit 0)" reads identically
+    whether the server was updated, was already current, or the run silently
+    achieved nothing. The build id in Steam's own manifest is the fact.
+    """
+    if before is None or after is None:
+        return ""  # no manifest to read; don't claim anything either way
+    if before != after:
+        return f" Server updated: build {before} → **{after}**."
+    return f" No new build — the server was already on {after}."
+
+
 def backup_interval_hours(raw: int) -> int:
     """Effective hours between local backups. Capped at 24 so local backups —
     the safety net — always happen at least once a day, even if a stale or
@@ -579,15 +594,26 @@ class Scheduler:
 
     # ---------- server update (SteamCMD) ----------
 
-    async def update_server(self, *, validate: bool = True) -> None:
+    async def update_server(self, *, validate: bool = False) -> None:
         """
         Stop the server, run SteamCMD `app_update`, and bring it back — the thing
         that finally uses the steamcmd_path / app_id the config always stored.
 
-        The `validate` pass is what blanks PalWorldSettings.ini, so we copy the
-        ini aside first and, if Steam does wipe it, put it straight back. Losing
-        an afternoon of server tuning to an update is the exact papercut this
-        avoids.
+        ``validate`` is **off** for routine updates, and that is a deliberate
+        change from how this used to work. Every update — scheduled, GUI button,
+        Discord `/update` — used to run `app_update … validate`, and `validate`
+        is not an update: it is a full checksum of every file in the install
+        against Steam's manifest, restoring anything that differs. Valve's own
+        guidance is to use it to repair a suspected-broken install, not to
+        update one. Running it routinely cost a full multi-GB verification pass
+        on every single update, and — as this module's old docstring cheerfully
+        admitted — it is the thing that resets PalWorldSettings.ini. palctl was
+        causing that damage itself, on a schedule, and then trying to undo it
+        afterwards.
+
+        Plain `app_update` still installs the newest build; it just doesn't
+        re-verify files that were already correct. Pass ``validate=True`` to get
+        the old behaviour deliberately, as a repair.
         """
         cfg = self._cfg
         steam = Path(cfg.steamcmd_path)
@@ -738,6 +764,14 @@ class Scheduler:
         try:
             ini = cfg.live_ini
             ini_backup = await asyncio.to_thread(steamcmd.backup_file, ini)
+            # The build actually installed, before and after. SteamCMD's exit
+            # code is famously unreliable (setup already refuses to trust it and
+            # checks for the files instead), so "exit 0" on its own is not
+            # evidence that anything happened — which makes an update that
+            # quietly does nothing indistinguishable from one that worked.
+            build_before = await asyncio.to_thread(
+                steamcmd.installed_buildid, cfg.server_root, cfg.app_id
+            )
 
             latest: list[str] = []
 
@@ -760,13 +794,19 @@ class Scheduler:
                 # died halfway is exactly when the ini is half-rewritten.
                 await self._heal_ini_after_update(cfg, ini, ini_backup)
 
+            build_after = await asyncio.to_thread(
+                steamcmd.installed_buildid, cfg.server_root, cfg.app_id
+            )
             tail = f" ({latest[0]})" if latest else ""
             await self._bus.emit(
                 Event(
                     "update",
                     (f"✅ SteamCMD finished (exit {code}).{tail}" if code == 0
-                     else f"⚠️ SteamCMD exited {code}.{tail}") + " Starting server.",
-                    {"exit_code": code},
+                     else f"⚠️ SteamCMD exited {code}.{tail}")
+                    + _build_change(build_before, build_after)
+                    + " Starting server.",
+                    {"exit_code": code,
+                     "build_before": build_before, "build_after": build_after},
                 )
             )
         except Exception as e:

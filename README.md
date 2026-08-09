@@ -81,7 +81,8 @@ PC, which is the situation most people are trying to get out of.
 - Opt-in scheduled auto-update (Palworld patches constantly) — the same
   save → backup → SteamCMD → restart flow as a manual update, world backup
   included (updates are exactly when saves get eaten), and **no backup means
-  no update** unless you opt out
+  no update** unless you opt out. Reports the build id it actually installed,
+  so "it ran" and "it updated" aren't the same message
 - One **operation lock**: scheduled restarts, watchdog restarts, updates,
   restores, and crash recovery can't fire into the middle of each other
 - Notifies when a newer server build is available, or a newer palctl release
@@ -104,12 +105,13 @@ PC, which is the situation most people are trying to get out of.
 - Players: level, ping, location, building count, kick/ban
 - Console: announce (real spaces — REST, not RCON), save, backup, **restore a
   backup** (with a pre-restore safety copy), start/stop/restart, and **update the
-  server** (SteamCMD, with the ini guarded across `validate`)
+  server** (SteamCMD; routine updates don't run `validate`, so your ini isn't
+  reset — and the update reports the build id it actually installed)
 - **Settings editor**: parses the one-line `OptionSettings=(...)` blob into a
   searchable, grouped, typed form. Preserves unknown keys from future patches —
   and everything else in the file too: your comments and any other `[Section]`
-  survive a save byte-for-byte. Backs up the ini on every save, because SteamCMD
-  `validate` wipes it.
+  survive a save byte-for-byte. Backs up the ini on every save, because a
+  SteamCMD `validate` can wipe it.
 - Config: paths (with **Browse** and **Auto-detect**, and a live ✓/✗ that tells
   you the path is really a server before you save), watchdog thresholds,
   schedules, Discord — all entered in the UI — plus a one-click **Export
