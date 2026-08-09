@@ -205,8 +205,23 @@ kind of number), so palctl just checks both rather than making you get the "righ
 kind." Pick whichever fits:
 
 **Option A — leave it empty (simplest).** With the field set to `0`/blank, palctl
-falls back to allowing anyone with the Discord **Manage Server** permission. As the
-owner, that's already you. Nothing else to do.
+falls back to allowing anyone with the Discord **Manage Server** permission *in
+your own guild*. As the owner, that's already you. Nothing else to do.
+
+> **Why "in your own guild" matters.** Slash commands are registered globally, so
+> they appear in every guild the bot has been added to — and a Discord
+> application is created with **Public Bot** switched **on**, meaning anyone who
+> has your client ID can invite your bot to a guild of their own. There they hold
+> Manage Server by definition, which is exactly what Option A falls back to.
+>
+> palctl therefore only accepts commands from **one** guild: `guild_id` if you
+> set it, otherwise whichever guild owns your notification channel. Commands from
+> anywhere else are refused and logged. If you have a channel ID configured (Step
+> 4) this is already handled and there is nothing to do.
+>
+> Belt and braces, and worth 20 seconds: in the [Developer
+> Portal](https://discord.com/developers/applications) → **Bot**, turn **Public
+> Bot** *off*. Then only you can invite it anywhere at all.
 
 **Option B — a dedicated role** (best when more than one person should have access).
 1. Discord → **Server Settings** → **Roles** → create a role (e.g. "Palworld Admin").
@@ -259,6 +274,7 @@ and all default to sensible values, so you only touch them to customize.
   "enabled": false,
   "channel_id": 0,
   "admin_role_id": 0,
+  "guild_id": 0,
   "notify_join_leave": true,
   "notify_level_up": true,
   "notify_watchdog": true,
@@ -273,7 +289,8 @@ and all default to sensible values, so you only touch them to customize.
 |---|---|---|
 | `enabled` | bool | Master on/off for the bot. |
 | `channel_id` | int | Channel the bot posts notifications to. `0` = nowhere. |
-| `admin_role_id` | int | Role **or** user ID allowed to run admin commands. `0` = fall back to Manage Server. |
+| `admin_role_id` | int | Role **or** user ID allowed to run admin commands. `0` = fall back to Manage Server (in the home guild only — see `guild_id`). |
+| `guild_id` | int | The one Discord server allowed to drive this Palworld server. `0` = infer it from `channel_id`'s guild; commands from anywhere else are refused. Only if there is no channel either does the bot accept commands from any guild. |
 | `notify_join_leave` | bool | Post player join and leave alerts. |
 | `notify_level_up` | bool | Post level-up alerts. |
 | `notify_watchdog` | bool | Post memory-watchdog alerts (hold-off, restart, recovery). |

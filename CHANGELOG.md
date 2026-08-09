@@ -10,6 +10,64 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+## [1.2.5.7] — 2026-08-09
+
+A second audit pass, looking for the same shape of problem as 1.2.5.6 — places
+where palctl's own machinery works against it. Found one that made the daemon
+restart itself at the worst possible moment, one that could permanently lock
+you out of your own daemon, and one that let a stranger drive your server from
+Discord.
+
+### Security
+- **The Discord bot now only takes commands from your own server.** Slash
+  commands are registered globally, so they appear in *every* guild the bot has
+  been added to — and a Discord application is created with **Public Bot**
+  switched **on**, so anyone holding the client ID (it's in the invite URL, and
+  on the bot's profile) could add your bot to a guild of their own. There they
+  hold Manage Server by definition, which is exactly what admin access falls
+  back to when `admin_role_id` is unset — the default, and the setup the docs
+  recommended. That was a working path to `/stop`, `/restore`, `/update` and
+  `/ban` on a stranger's Palworld server. The bot now accepts commands from one
+  guild only: `discord.guild_id` if set, otherwise whichever guild owns your
+  notification channel; anything else is refused and logged. The check sits in
+  front of the whole command tree rather than on each handler, so commands added
+  later are covered automatically. If you have a channel configured there is
+  nothing to do. The Discord guide now also says to turn Public Bot off.
+
+### Fixed
+- **The daemon no longer restarts itself whenever the game server goes down.**
+  `/healthz` is meant to answer "is this daemon alive", and the only thing that
+  acts on it — the Windows health task — responds by restarting the daemon. But
+  its liveness clock was stamped only on polls where the *Palworld REST API
+  answered*, so a down game server was indistinguishable from a wedged daemon:
+  60 seconds into any outage `/healthz` went 503, and ~15 minutes in the health
+  task restarted a completely healthy daemon. That is the worst possible moment
+  — auto-recovery is mid-flight, and the restart kills it, wipes the
+  `crash_restart_max_per_hour` budget that exists to stop restart loops, and can
+  leave the game server stopped between the stop and start of a restart cycle.
+  The clock is now stamped on every completed poll cycle, whatever the outcome.
+  Game-server reachability is still reported, as `alive`, and still acted on by
+  the watchdog and auto-recovery — where it belongs.
+- **An outage that spans a daemon restart is recoverable again.** Auto-recovery
+  refuses to touch a server it has never seen up — a sound guard, but the flag
+  lived only in memory, so a daemon that restarted *during* an outage came back
+  believing the server had never worked and would never recover it. It stayed
+  down until a human noticed. The flag is now persisted next to the Stop intent.
+- **An empty `daemon_token` file no longer locks you out permanently.** A
+  zero-byte token file made every caller mint a fresh random token that was
+  never written, so the daemon and the GUI could never agree again — 401s that
+  no restart fixes, reported by the GUI as a config-directory mismatch, which
+  sends you chasing a completely unrelated fix. Getting there took nothing
+  exotic: a crash or a full disk between creating the file and writing it, and
+  the write failure was swallowed by design, leaving the empty file behind. An
+  empty or whitespace-only token file is now treated as no token and replaced,
+  and a failed write cleans up after itself instead of poisoning every later run.
+- **Event history is pruned (30 days), like metrics already were.** Nothing ever
+  read this table back, and it grew forever — inside `sessions.db`, which is
+  snapshotted into *every* backup and mirrored off-site, so the bloat multiplied
+  across every retained copy. The durable audit trail is the rotating file log,
+  which every event is also written to.
+
 ## [1.2.5.6] — 2026-08-09
 
 A hang-hunting pass. Every place palctl waited on something external without a

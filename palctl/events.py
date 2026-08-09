@@ -28,7 +28,7 @@ import threading
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -371,12 +371,24 @@ class SessionStore:
         keys = ("at", "fps", "frame_time", "players", "memory_mb", "cpu")
         return [dict(zip(keys, r, strict=True)) for r in reversed(rows)]
 
+    # Events get retention for the same reason metrics do, and one more: this
+    # database is snapshotted into *every* backup (palctl-config.zip) and
+    # mirrored off-site, so an unbounded table inflates every retained copy, not
+    # just the live file. A month is generous for a history nothing currently
+    # reads back — the durable audit trail is the rotating file log, which every
+    # event is also written to.
+    EVENTS_RETAIN_DAYS = 30
+
     def log_event(self, e: Event) -> None:
         with self._lock:
             self._db.execute(
                 "INSERT INTO events (at, kind, message, data) VALUES (?,?,?,?)",
                 (e.at.isoformat(), e.kind, e.message, json.dumps(e.data)),
             )
+            # Timestamps are ISO-8601 UTC written by one writer, so they sort
+            # lexicographically and a string comparison is a valid prune.
+            cutoff = datetime.now(UTC) - timedelta(days=self.EVENTS_RETAIN_DAYS)
+            self._db.execute("DELETE FROM events WHERE at < ?", (cutoff.isoformat(),))
             self._db.commit()
 
     def close(self) -> None:

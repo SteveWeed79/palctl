@@ -860,3 +860,108 @@ def test_startup_side_effects_do_not_block_the_event_loop():
     assert calls == [("firewall", "0.0.0.0"), ("mirror",)]
     # ...and the loop kept running throughout, instead of freezing for ~1s.
     assert ticks > 10, f"event loop was blocked (only {ticks} ticks in ~1s)"
+
+
+# ---------------- /healthz is about THIS DAEMON, not the game server ----------
+#
+# The only consumer that acts on /healthz is the scheduled health task, and its
+# remedy is restarting the daemon. Stamping the liveness clock only on a
+# *successful* poll made an unreachable game server read as a wedged daemon, so
+# the task restarted a perfectly healthy daemon about a quarter of an hour into
+# every outage — killing the auto-recovery that was working the problem, and
+# resetting the crash-restart budget that exists to stop restart loops.
+
+
+def test_poll_loop_is_live_while_starting_up():
+    ok, age = daemon_mod.poll_loop_is_live(last_poll_at=0.0, now=1000.0, poll_seconds=10)
+    assert ok is True and age is None
+
+
+def test_poll_loop_is_live_on_a_recent_cycle():
+    ok, age = daemon_mod.poll_loop_is_live(
+        last_poll_at=1000.0, now=1005.0, poll_seconds=10
+    )
+    assert ok is True and age == 5.0
+
+
+def test_poll_loop_is_not_live_once_cycles_stop():
+    """The case the probe exists for: a wedged loop or a dead poller."""
+    ok, age = daemon_mod.poll_loop_is_live(
+        last_poll_at=1000.0, now=1100.0, poll_seconds=10
+    )
+    assert ok is False and age == 100.0
+
+
+def test_poll_loop_liveness_floor_protects_a_fast_poll_interval():
+    """poll_seconds * 6 would be 6s at a 1s interval — far too tight to survive
+    an ordinary hiccup. The 30s floor is what stops that being a restart loop."""
+    ok, _ = daemon_mod.poll_loop_is_live(last_poll_at=1000.0, now=1020.0, poll_seconds=1)
+    assert ok is True
+
+
+def test_poll_loop_stamps_liveness_even_when_the_poll_fails():
+    """The regression: a poll that couldn't reach the game server is still a
+    completed cycle, so it must refresh the liveness clock."""
+
+    class _Stub:
+        cfg = types.SimpleNamespace(poll_seconds=1)
+        _last_poll_at = 0.0
+        emitted: list = []
+
+        class bus:
+            @staticmethod
+            async def emit(e):
+                _Stub.emitted.append(e)
+
+        async def _poll(self):
+            raise RuntimeError("Palworld REST API unreachable")
+
+    stub = _Stub()
+
+    async def main():
+        task = asyncio.create_task(daemon_mod.Daemon._poll_loop(stub))
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+    assert stub._last_poll_at > 0.0, "a failed poll must still count as a cycle"
+    assert _Stub.emitted, "the failure should still be reported as an event"
+
+
+# ---------------- ever_alive survives a daemon restart ----------------
+
+
+def test_ever_alive_is_persisted_so_an_outage_can_span_a_restart(tmp_path, monkeypatch):
+    """Auto-recovery refuses to touch a server it has never seen up. Losing that
+    flag on restart meant a daemon that bounced *during* an outage would never
+    recover the server — it just stayed down."""
+    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
+
+    assert daemon_mod._load_ever_alive() is False
+    daemon_mod._save_ever_alive(True)
+    assert daemon_mod._load_ever_alive() is True
+
+
+def test_state_file_keeps_both_keys(tmp_path, monkeypatch):
+    """The two flags share one file; writing either must not drop the other."""
+    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
+
+    daemon_mod._save_desired_running(False)
+    daemon_mod._save_ever_alive(True)
+    assert daemon_mod._load_desired_running() is False
+    assert daemon_mod._load_ever_alive() is True
+
+    daemon_mod._save_desired_running(True)
+    assert daemon_mod._load_ever_alive() is True  # not clobbered
+
+
+def test_unreadable_state_falls_back_to_safe_defaults(tmp_path, monkeypatch):
+    path = tmp_path / "daemon_state.json"
+    path.write_text("{ not json", encoding="utf-8")
+    monkeypatch.setattr(daemon_mod, "_STATE_PATH", path)
+    # desired_running defaults True (normal behaviour); ever_alive defaults
+    # False (never auto-recover a server we have no evidence ever worked).
+    assert daemon_mod._load_desired_running() is True
+    assert daemon_mod._load_ever_alive() is False

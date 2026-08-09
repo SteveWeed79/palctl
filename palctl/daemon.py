@@ -71,24 +71,60 @@ def sd_notify(state: str) -> None:
 # wrapper restart, a palctl upgrade, a manual service bounce). Without this the
 # in-memory flag resets to True and the daily restart / auto-update schedule
 # would resurrect a server that was deliberately taken down for maintenance.
+#
+# `ever_alive` rides in the same file for the opposite reason: it is the guard
+# that stops auto-recovery restarting a server palctl has never seen working,
+# and losing it across a restart is what turns a recoverable outage into a
+# permanent one. See _load_ever_alive.
 _STATE_PATH = config_dir() / "daemon_state.json"
 
 
-def _load_desired_running() -> bool:
+def _read_state() -> dict:
     try:
         state = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
-        return bool(state["desired_running"])
-    except (OSError, ValueError, KeyError, TypeError):
-        return True  # no/unreadable state (e.g. first run) = normal behavior
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _write_state(**changes: object) -> None:
+    """Merge `changes` into the state file. Read-modify-write so one key's
+    setter can't drop the other's value — both are written from the same
+    single-threaded event loop, so there's no lost-update race between them."""
+    state = _read_state()
+    state.update(changes)
+    try:
+        tmp = _STATE_PATH.with_name(_STATE_PATH.name + ".tmp")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        os.replace(tmp, _STATE_PATH)
+    except OSError:
+        pass  # best effort — worst case is the old resets-to-default behavior
+
+
+def _load_desired_running() -> bool:
+    value = _read_state().get("desired_running")
+    return True if value is None else bool(value)  # no state (first run) = normal
 
 
 def _save_desired_running(value: bool) -> None:
-    try:
-        tmp = _STATE_PATH.with_name(_STATE_PATH.name + ".tmp")
-        tmp.write_text(json.dumps({"desired_running": value}), encoding="utf-8")
-        os.replace(tmp, _STATE_PATH)
-    except OSError:
-        pass  # best effort — worst case is the old resets-to-True behavior
+    _write_state(desired_running=value)
+
+
+def _load_ever_alive() -> bool:
+    """Whether palctl has ever seen this server answering.
+
+    Persisted because auto-recovery refuses to touch a server it has never seen
+    up — a sane guard against restart-looping a box with no server installed,
+    but one that inverts badly when the flag is lost. A daemon that restarts
+    *during* an outage (a crash, an upgrade, the health task) came back with
+    ever_alive=False and so would never recover the server, which then stayed
+    down until a human noticed. Remembering it means an outage that spans a
+    daemon restart still gets recovered."""
+    return bool(_read_state().get("ever_alive", False))
+
+
+def _save_ever_alive(value: bool) -> None:
+    _write_state(ever_alive=value)
 
 
 def _tail_log_file(n: int) -> str:
@@ -105,6 +141,31 @@ def _tail_log_file(n: int) -> str:
 def _within_window(times: list[float], now: float, window: float = 3600.0) -> list[float]:
     """Timestamps from the last `window` seconds. Used to rate-limit auto-recovery."""
     return [t for t in times if t >= now - window]
+
+
+def poll_loop_is_live(
+    *, last_poll_at: float, now: float, poll_seconds: int
+) -> tuple[bool, float | None]:
+    """The /healthz verdict: (is the poll loop still turning, age of its last
+    cycle). Pure, because getting it wrong is expensive in both directions —
+    too strict and the health task restarts a healthy daemon, too loose and a
+    genuinely wedged one is never healed.
+
+    `last_poll_at` must be stamped on every *completed* cycle, not every
+    successful one. The distinction is the whole bug this function documents:
+    stamping it only when the game server answered made "the game server is
+    down" indistinguishable from "this daemon is wedged", and the only consumer
+    that acts on the verdict responds by restarting the daemon — which does
+    nothing for a down game server, and kills the auto-recovery that was
+    handling it.
+
+    A daemon that has not completed its first cycle yet reads as live: it is
+    starting up, not stuck.
+    """
+    if not last_poll_at:
+        return True, None
+    age = now - last_poll_at
+    return age <= max(30.0, poll_seconds * 6), age
 
 
 def autorecover_phase(
@@ -292,7 +353,9 @@ class Daemon:
 
         # Crash/hang auto-recovery bookkeeping. ("palctl is doing this on
         # purpose" now lives in the ServerController's operation lock.)
-        self._ever_alive = False           # only recover a server that WAS up
+        # Only recover a server that WAS up — persisted, so an outage that
+        # spans a daemon restart is still recoverable (see _load_ever_alive).
+        self.__ever_alive = _load_ever_alive()
         # User "Stop" flips this off. Loaded from disk so a daemon restart
         # can't forget an intentional stop (the setter persists changes).
         self._desired_running = _load_desired_running()
@@ -469,6 +532,21 @@ class Daemon:
         self.__desired_running = value
         _save_desired_running(value)
 
+    @property
+    def _ever_alive(self) -> bool:
+        return self.__ever_alive
+
+    @_ever_alive.setter
+    def _ever_alive(self, value: bool) -> None:
+        # Only ever flips False -> True, and only on a poll that got an answer,
+        # so this writes the state file exactly once in the daemon's life
+        # rather than on every poll.
+        if value and not self.__ever_alive:
+            self.__ever_alive = True
+            _save_ever_alive(True)
+        else:
+            self.__ever_alive = value
+
     def _spawn(self, coro) -> asyncio.Task:
         # asyncio holds only weak refs to tasks; keep one or it can be GC'd mid-run.
         t = asyncio.create_task(coro)
@@ -522,6 +600,15 @@ class Daemon:
                 await self._poll()
             except Exception as e:
                 await self.bus.emit(Event("error", f"Poll failed: {e}"))
+            # Stamped here, on every completed cycle, and NOT inside _poll() —
+            # /healthz asks "is this daemon alive", and the daemon is alive
+            # whether or not the game server answered. Stamping it only on a
+            # successful poll made an unreachable *game server* read as a wedged
+            # *daemon*: /healthz went 503, and the Windows health task then
+            # restarted a perfectly healthy daemon roughly a quarter of an hour
+            # into every outage — precisely while auto-recovery was working the
+            # problem. See the handler for what the probe is actually for.
+            self._last_poll_at = time.time()
             # Clamp: a hand-edited 0/negative poll_seconds would tight-loop the
             # REST API and process enumeration (the scheduler clamps likewise).
             await asyncio.sleep(max(1, self.cfg.poll_seconds))
@@ -586,7 +673,6 @@ class Daemon:
 
         stats = await asyncio.to_thread(procs.proc_stats)  # psutil enumeration off the loop
         self._last_metrics = metrics
-        self._last_poll_at = time.time()
 
         if first_poll:
             # Daemon (re)started while the server was already up: `_history` was
@@ -802,9 +888,18 @@ class Daemon:
             # Liveness/readiness for an external monitor. No token (no data), so
             # exempt in the auth middleware. 503 when the poll loop hasn't
             # completed a cycle in a while — a wedged event loop or a dead poller.
-            age = time.time() - self._last_poll_at if self._last_poll_at else None
-            stale = age is not None and age > max(30, self.cfg.poll_seconds * 6)
-            ok = self._last_poll_at == 0.0 or not stale  # starting up counts as ok
+            #
+            # This is strictly about THIS PROCESS. It must never go 503 because
+            # the game server is down: the only consumer that acts on it is the
+            # health task, whose remedy is restarting the daemon, and that does
+            # nothing for a down game server — it just kills the thing that was
+            # about to recover it. Game-server reachability is reported by
+            # `alive` below, and acted on by the watchdog and auto-recovery.
+            ok, age = poll_loop_is_live(
+                last_poll_at=self._last_poll_at,
+                now=time.time(),
+                poll_seconds=self.cfg.poll_seconds,
+            )
             return web.json_response(
                 {
                     "status": "ok" if ok else "stale",
