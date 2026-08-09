@@ -131,3 +131,90 @@ def test_read_admin_password_missing_or_blank(tmp_path: Path):
     blank = tmp_path / "blank.ini"
     blank.write_text("", encoding="utf-8")
     assert read_admin_password(blank) == ""
+
+
+# ---------------- the file is more than the OptionSettings line ----------------
+#
+# Finding the end of the block by regex ("everything up to the last ')' at end
+# of file") broke on two shapes of real file. Both matter because this module
+# writes the file the game actually boots from.
+
+
+def test_a_trailing_comment_does_not_hide_the_whole_block():
+    """A line after the block used to make the anchored regex fail outright, so
+    a perfectly good ini read as 'no OptionSettings block' — which the user is
+    told means the file is blank and should be re-seeded from the default. That
+    advice would have destroyed the settings palctl had just failed to read."""
+    text = (
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        'OptionSettings=(Difficulty=None,MaxPlayers=32)\n'
+        "; remember to raise ExpRate later\n"
+    )
+    s = PalSettings.parse(text)
+    assert s.get("MaxPlayers") == 32
+    assert "; remember to raise ExpRate later" in s.render()
+
+
+def test_admin_password_survives_a_trailing_comment(tmp_path):
+    """The quiet consequence of the above: read_admin_password swallows the
+    parse error and returns '', so the daemon can't authenticate to the REST API
+    and reports the server as up-but-unauthorised, for a one-line comment."""
+    from palctl.inifile import read_admin_password
+
+    ini = tmp_path / "PalWorldSettings.ini"
+    ini.write_text(
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        'OptionSettings=(AdminPassword="hunter2")\n'
+        "; a note\n",
+        encoding="utf-8",
+    )
+    assert read_admin_password(ini) == "hunter2"
+
+
+def test_a_second_section_is_neither_swallowed_nor_rewritten():
+    """The greedy match reached past the block to the last ')' in the file, so
+    another section landed *inside* the final option's value — and writing back
+    mangled both. Content outside the block must round-trip untouched."""
+    text = (
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        'OptionSettings=(Difficulty=None,MaxPlayers=32)\n'
+        "\n"
+        "[/Script/Pal.SomethingElse]\n"
+        "Foo=(1,2)\n"
+    )
+    s = PalSettings.parse(text)
+    assert s.get("MaxPlayers") == 32, "the last option must not absorb the next section"
+    assert s.render() == text, "everything outside the block must survive verbatim"
+
+
+def test_editing_a_value_keeps_the_rest_of_the_file():
+    text = (
+        "; palctl notes\n"
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        'OptionSettings=(Difficulty=None,MaxPlayers=32)\n'
+        "\n[/Script/Pal.Other]\nFoo=(1,2)\n"
+    )
+    s = PalSettings.parse(text)
+    s.set("MaxPlayers", 64)
+    out = s.render()
+    assert "MaxPlayers=64" in out
+    assert out.startswith("; palctl notes\n")
+    assert out.endswith("\n[/Script/Pal.Other]\nFoo=(1,2)\n")
+
+
+def test_a_closing_paren_inside_a_quoted_string_does_not_end_the_block():
+    text = (
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        'OptionSettings=(ServerDescription="closing ) paren",MaxPlayers=32)\n'
+    )
+    s = PalSettings.parse(text)
+    assert s.get("MaxPlayers") == 32
+    assert s.get("ServerDescription") == "closing ) paren"
+
+
+def test_a_truncated_block_still_yields_what_survived():
+    """A half-written file (killed mid-save) should give back the options that
+    made it, not raise — the caller can still show and re-save them."""
+    text = "[/Script/Pal.PalGameWorldSettings]\nOptionSettings=(Difficulty=None,MaxPlay"
+    s = PalSettings.parse(text)
+    assert s.get("Difficulty") == "None"

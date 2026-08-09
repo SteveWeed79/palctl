@@ -311,7 +311,12 @@ class SettingsEditor(QWidget):
 
     def _group(self, title: str, keys: list[str]) -> QGroupBox:
         assert self._settings is not None
-        box = QGroupBox(title)
+        # Qt reads "&" in a title as a mnemonic marker: it swallows the "&" and
+        # underlines whatever follows, so "Difficulty & rates" rendered as
+        # "Difficulty _rates". Doubling it asks for a literal ampersand. Done
+        # here rather than in GROUPS so the table stays readable and a new
+        # heading can't reintroduce it.
+        box = QGroupBox(title.replace("&", "&&"))
         form = QFormLayout(box)
 
         for key in keys:

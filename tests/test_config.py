@@ -157,3 +157,29 @@ def test_config_dir_linux_fallback_stays_dot_config(tmp_path, monkeypatch):
     monkeypatch.setattr(config_mod.sys, "platform", "linux")
     monkeypatch.setattr(config_mod.Path, "home", staticmethod(lambda: tmp_path))
     assert config_mod.config_dir() == tmp_path / ".config" / "palctl"
+
+
+def test_a_corrupt_config_survives_a_failed_quarantine(tmp_path, monkeypatch):
+    """Quarantining the bad file is a courtesy; coming back with defaults is the
+    point. The rename can fail on its own — a Windows AV scanner or the search
+    indexer holding config.json open raises PermissionError — and letting that
+    escape kills the daemon *before* asyncio.run, in the very recovery path
+    written to stop it crash-looping under the service wrapper."""
+    from pathlib import Path
+
+    path = tmp_path / "config.json"
+    path.write_text("{ not json", encoding="utf-8")
+    monkeypatch.setattr(config_mod, "CONFIG_PATH", path)
+
+    real_replace = Path.replace
+
+    def refuse(self, target):
+        if self.name == "config.json":
+            raise PermissionError(13, "The process cannot access the file")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", refuse)
+
+    cfg = Config.load()
+    assert isinstance(cfg, Config)  # defaults, not a crash
+    assert path.exists(), "the unreadable file is left in place for the user"

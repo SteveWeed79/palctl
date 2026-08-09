@@ -10,6 +10,54 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+## [1.2.5.8] — 2026-08-09
+
+A third audit pass, this one through the settings editor, the ini parser, and
+the GUI's own lifecycle — the parts a user touches directly. Getting Qt running
+headless in CI made two of these observable for the first time.
+
+### Fixed
+- **A comment in `PalWorldSettings.ini` no longer hides the whole file.** The
+  parser looked for the block's closing paren with a regex anchored to the end
+  of the file, so a single trailing line — a comment, a note to self — made a
+  perfectly good ini read as *"no OptionSettings block found"*. The settings
+  editor then told you the file was blank and offered to re-seed it from the
+  default, which would have destroyed the settings it had just failed to read.
+  Quieter and worse: `read_admin_password` swallows that same parse error and
+  returns empty, so the daemon couldn't authenticate to the REST API and
+  reported the server as up-but-unauthorised — for one comment line.
+- **A second `[Section]` in the ini is no longer silently corrupted.** The same
+  greedy match reached past the block to the last `)` anywhere in the file, so
+  another section landed *inside* the final option's value — and saving wrote
+  both back mangled. The block's end is now found by matching parens (honouring
+  quotes), and everything outside it — other sections, header comments, trailing
+  notes — round-trips byte-for-byte. A truncated file now yields the options
+  that survived instead of refusing outright.
+- **Quitting the GUI no longer crashes it.** Qt aborts the process when a
+  QThread is destroyed while still running, the tray's Quit went straight to
+  `QApplication.quit`, and the state poller loops forever by design — so it was
+  *always* running at quit time. Every exit ended in an abort (a "palctl-gui.exe
+  has stopped working" dialog on Windows), which is the last thing a user sees.
+  Worker threads now register themselves and are drained on `aboutToQuit`;
+  anything still busy after a short grace — an `/action/stop` can legitimately
+  be in a long call — is terminated rather than allowed to abort the app. The
+  poller also sleeps in slices so quit is immediate instead of waiting out the
+  poll interval.
+- **Settings-editor group headings show their ampersand.** Qt reads `&` in a
+  title as a mnemonic marker, so "Difficulty & rates" rendered as
+  "Difficulty _rates" (and likewise "Base & building", "Pals & eggs").
+- **A corrupt `config.json` can't crash-loop the daemon after all.** The
+  recovery path renames the bad file aside and carries on with defaults — but
+  the rename itself can fail (a Windows AV scanner or the search indexer holding
+  the file open is a `PermissionError`), and that escaped, killing the daemon
+  *before* `asyncio.run`, in the code written to prevent exactly that crash
+  loop. The quarantine is now best-effort, as it always claimed to be.
+
+### Changed
+- CI now runs the GUI's thread-lifecycle tests in the import-smoke job, which
+  already has a headless Qt. They need a real `QApplication`, so nothing else
+  could have caught the crash-on-quit above.
+
 ## [1.2.5.7] — 2026-08-09
 
 A second audit pass, looking for the same shape of problem as 1.2.5.6 — places

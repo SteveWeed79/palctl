@@ -277,7 +277,19 @@ class Config:
                 "config.json was unreadable — set aside as config.json.broken; "
                 "running with built-in defaults until it is fixed or re-saved"
             )
-            CONFIG_PATH.replace(CONFIG_PATH.with_suffix(".json.broken"))
+            # Setting it aside is a courtesy, not the point — the point is to
+            # come back with defaults instead of dying. The rename can fail on
+            # its own (a Windows AV scanner or the search indexer holding the
+            # file open is a PermissionError), and letting that escape would
+            # crash the daemon *before* asyncio.run, in the recovery path
+            # written to prevent exactly that crash loop.
+            try:
+                CONFIG_PATH.replace(CONFIG_PATH.with_suffix(".json.broken"))
+            except OSError:
+                logging.getLogger("palctl.config").warning(
+                    "could not rename config.json aside (%s) — leaving it in "
+                    "place and continuing on defaults", CONFIG_PATH,
+                )
             return cls()
 
     def save(self) -> None:
