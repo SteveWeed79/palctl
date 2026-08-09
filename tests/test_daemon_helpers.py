@@ -1030,3 +1030,35 @@ def test_no_notice_for_a_server_palctl_has_never_seen_working():
     d = _daemon_for_recovery_notice(enabled=False, alive=False, ever_alive=False)
     asyncio.run(d._warn_recovery_is_off(d.cfg.watchdog))
     assert _notices(d) == []
+
+
+def test_an_inconclusive_account_check_does_not_burn_the_one_shot():
+    """The regression: the flag was latched before the check ran, so one poll
+    where the process wasn't readable suppressed the warning for the whole
+    daemon run — on exactly the boxes where the split makes it unreadable."""
+    d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+    d._account_warned = False
+    d.log = types.SimpleNamespace(warning=lambda *a, **k: None)
+    d.emitted = []
+
+    class _Bus:
+        @staticmethod
+        async def emit(e):
+            d.emitted.append(e)
+
+    d.bus = _Bus()
+
+    results = iter([(False, None), (True, "the server runs as SYSTEM")])
+    daemon_mod.procs.server_account_check = lambda user: next(results)
+    try:
+        asyncio.run(d._maybe_warn_account_mismatch())
+        assert d._account_warned is False, "an inconclusive check must not latch"
+        assert d.emitted == []
+
+        asyncio.run(d._maybe_warn_account_mismatch())
+        assert d._account_warned is True
+        assert len(d.emitted) == 1, "the real answer still gets reported once"
+    finally:
+        import importlib
+
+        importlib.reload(daemon_mod.procs)

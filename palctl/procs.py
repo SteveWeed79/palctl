@@ -153,15 +153,36 @@ def account_mismatch_warning(server_owner: str | None, daemon_user: str) -> str 
     )
 
 
-def server_account_mismatch(daemon_user: str) -> str | None:
-    """Find the server process, read its owner, and return
-    account_mismatch_warning(...) or None. Blocking (psutil enumeration) — the
-    daemon calls this once via to_thread to warn if its account can't see the
-    server it's supposed to watch."""
+def server_account_check(daemon_user: str) -> tuple[bool, str | None]:
+    """(did we get a definitive answer, warning-or-None).
+
+    The caller warns at most once per daemon run, so it needs to know the
+    difference between "checked, the accounts match" and "couldn't check". They
+    are not the same, and conflating them is a trap: the account split is
+    *itself* a reason psutil struggles here — it can fail to read the Shipping
+    process's name across a privilege boundary — so the check most likely to be
+    needed is also the one most likely to come back inconclusive. Latching a
+    one-shot warning on an inconclusive result silences the only protection
+    against a blind leak watchdog for the rest of the daemon's life.
+
+    Blocking (psutil enumeration) — call via to_thread.
+    """
     proc = find_process()
     if proc is None:
-        return None
-    return account_mismatch_warning(process_owner(proc), daemon_user)
+        return False, None  # nothing to compare against yet; ask again later
+    owner = process_owner(proc)
+    if owner is None:
+        return False, None  # found it, couldn't read who owns it
+    return True, account_mismatch_warning(owner, daemon_user)
+
+
+def server_account_mismatch(daemon_user: str) -> str | None:
+    """Find the server process, read its owner, and return
+    account_mismatch_warning(...) or None. Blocking (psutil enumeration).
+
+    Prefer server_account_check when the caller only reports once — this form
+    can't tell "no mismatch" from "couldn't tell"."""
+    return server_account_check(daemon_user)[1]
 
 
 # How long proc_stats() samples CPU for. cpu_percent measures work done over a

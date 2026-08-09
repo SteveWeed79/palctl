@@ -149,6 +149,11 @@ HELP: dict[str, str] = {
     "CrossplayPlatforms": (
         "Which platforms may connect. Uncheck all but Steam for a PC-only server."
     ),
+    "bEnableInvaderEnemy": (
+        "Raids on player bases. Turning this OFF is the most widely-recommended "
+        "companion to scheduled restarts for Palworld's memory leak — the two "
+        "together hold a server steady far better than restarts alone."
+    ),
     "bHardcore": "Permadeath: a player who dies can't respawn on this server.",
     "bPalLost": (
         "In hardcore, a player's Pals are gone for good on death — not just "

@@ -707,15 +707,22 @@ class Daemon:
         psutil enumeration runs off the event loop."""
         if self._account_warned:
             return
-        self._account_warned = True
         import getpass
 
         try:
-            warning = await asyncio.to_thread(
-                procs.server_account_mismatch, getpass.getuser()
+            checked, warning = await asyncio.to_thread(
+                procs.server_account_check, getpass.getuser()
             )
         except Exception:
-            warning = None
+            checked, warning = False, None
+        if not checked:
+            # Inconclusive — don't burn the one-shot on it. This used to latch
+            # before the check even ran, so a single poll where the process
+            # wasn't readable suppressed the warning permanently. That is
+            # exactly backwards: an account split is a reason the read fails, so
+            # the servers that most need telling were the ones told least.
+            return
+        self._account_warned = True
         if warning:
             self.log.warning("%s", warning)
             await self.bus.emit(Event("error", "⚠️ " + warning))

@@ -396,3 +396,39 @@ def test_wait_for_tolerates_a_transient_unknown(monkeypatch):
 def test_wait_for_returns_true_as_soon_as_the_target_is_reached(monkeypatch):
     _states(monkeypatch, ["RUNNING"])
     assert asyncio.run(procs._wait_for("palworld", "RUNNING", timeout=120)) is True
+
+
+# ---------------- account check: "no mismatch" vs "couldn't tell" ------------
+#
+# The daemon warns at most once per run, so these two must not be conflated. An
+# account split is itself a reason psutil can't read the process, so treating
+# "couldn't tell" as "fine" silences the only protection against a blind leak
+# watchdog for the life of the daemon — on exactly the boxes that need it.
+
+
+def test_account_check_is_inconclusive_when_no_process_is_visible(monkeypatch):
+    monkeypatch.setattr(procs, "find_process", lambda: None)
+    checked, warning = procs.server_account_check("me")
+    assert checked is False and warning is None
+
+
+def test_account_check_is_inconclusive_when_the_owner_cannot_be_read(monkeypatch):
+    monkeypatch.setattr(procs, "find_process", lambda: object())
+    monkeypatch.setattr(procs, "process_owner", lambda p: None)
+    checked, warning = procs.server_account_check("me")
+    assert checked is False and warning is None
+
+
+def test_account_check_is_conclusive_when_the_accounts_match(monkeypatch):
+    monkeypatch.setattr(procs, "find_process", lambda: object())
+    monkeypatch.setattr(procs, "process_owner", lambda p: "DESKTOP\\me")
+    checked, warning = procs.server_account_check("me")
+    assert checked is True and warning is None
+
+
+def test_account_check_is_conclusive_and_warns_on_a_split(monkeypatch):
+    monkeypatch.setattr(procs, "find_process", lambda: object())
+    monkeypatch.setattr(procs, "process_owner", lambda p: "NT AUTHORITY\\SYSTEM")
+    checked, warning = procs.server_account_check("me")
+    assert checked is True
+    assert warning and "SYSTEM" in warning

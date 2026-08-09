@@ -285,23 +285,38 @@ def delete(backup_root: Path, name: str) -> None:
     shutil.rmtree(target)
 
 
+# How many `-pre-restore` safety copies to keep. These are full copies of the
+# world, taken automatically every time a restore runs, and they used to be
+# exempt from retention entirely — "never touched", which reads as safe and is
+# not: a few restores leave several multi-GB worlds sitting on the same disk as
+# the live one, forever. palctl warns about low disk precisely because a full
+# disk corrupts saves, so an unbounded pile of them is itself a data-safety
+# problem. Keeping the newest few preserves what the exemption was actually
+# for — being able to undo a restore, including the one before last.
+PRE_RESTORE_RETAIN = 3
+
+
 def prune(backup_root: Path, retain: int) -> list[str]:
-    """Keep the newest `retain`. Never touches -pre-restore safety copies.
+    """Keep the newest `retain` backups, and the newest few -pre-restore copies.
 
     `retain` is clamped to at least 1: a hand-edited (or future-version)
     config with backup_retain <= 0 must read as "keep the latest", never as
     "delete every backup ever taken" — prune runs right after each create.
+
+    `-pre-restore` copies are counted separately, so an ordinary retention
+    setting can never delete the safety copy a restore just made in order to
+    stay under its own limit — that would defeat the point of taking it.
 
     Only directories named like palctl's own backups are counted or deleted, so
     a mirror pointed at a populated location (another disk's root, a shared
     network folder) can never lose the user's unrelated data to retention.
     """
     retain = max(1, retain)
-    prunable = [
-        b for b in listing(backup_root)
-        if BACKUP_NAME_RE.match(b.name) and not b.name.endswith("-pre-restore")
-    ]
-    doomed = prunable[retain:]
+    ours = [b for b in listing(backup_root) if BACKUP_NAME_RE.match(b.name)]
+    scheduled = [b for b in ours if not b.name.endswith("-pre-restore")]
+    pre_restore = [b for b in ours if b.name.endswith("-pre-restore")]
+
+    doomed = scheduled[retain:] + pre_restore[PRE_RESTORE_RETAIN:]
     for b in doomed:
         shutil.rmtree(b.path)
     return [b.name for b in doomed]

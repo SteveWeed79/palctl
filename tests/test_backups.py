@@ -353,3 +353,58 @@ def test_restore_excludes_the_config_snapshot(tmp_path: Path, monkeypatch):
     backups.restore(root, b.name, sg)
     assert not (sg / backups.CONFIG_SNAPSHOT_NAME).exists()
     assert (sg / "0" / "world" / "Level.sav").exists()  # the world came back
+
+
+def _mkbackup(root: Path, name: str) -> Path:
+    d = root / name
+    d.mkdir(parents=True)
+    (d / "Level.sav").write_bytes(b"world")
+    return d
+
+
+def test_pre_restore_copies_are_bounded_not_unlimited(tmp_path):
+    """They used to be exempt from retention entirely. That reads as safe and
+    isn't: each one is a full copy of the world, taken automatically on every
+    restore, piling up on the same disk as the live one — and a full disk
+    corrupts saves, which is why palctl warns about low space at all."""
+    root = tmp_path / "backups"
+    for i in range(6):
+        _mkbackup(root, f"2026-08-0{i + 1}_10-00-00-pre-restore")
+    _mkbackup(root, "2026-08-09_10-00-00-scheduled")
+
+    backups.prune(root, retain=5)
+
+    left = sorted(p.name for p in root.iterdir())
+    kept = [n for n in left if n.endswith("-pre-restore")]
+    assert len(kept) == backups.PRE_RESTORE_RETAIN
+    # The newest ones survive — undoing the most recent restore still works.
+    assert kept == sorted(kept, reverse=True)[::-1]
+    assert "2026-08-06_10-00-00-pre-restore" in kept
+    assert "2026-08-01_10-00-00-pre-restore" not in kept
+
+
+def test_pre_restore_copies_do_not_eat_the_ordinary_retention_budget(tmp_path):
+    """Counted separately, so a restore's safety copy can never push a real
+    backup out — nor be pushed out by one."""
+    root = tmp_path / "backups"
+    for i in range(3):
+        _mkbackup(root, f"2026-08-0{i + 1}_10-00-00-scheduled")
+    _mkbackup(root, "2026-08-04_10-00-00-pre-restore")
+
+    backups.prune(root, retain=3)
+
+    left = sorted(p.name for p in root.iterdir())
+    assert len([n for n in left if n.endswith("-scheduled")]) == 3
+    assert "2026-08-04_10-00-00-pre-restore" in left
+
+
+def test_prune_still_ignores_directories_that_are_not_ours(tmp_path):
+    root = tmp_path / "backups"
+    _mkbackup(root, "2026-08-01_10-00-00-scheduled")
+    _mkbackup(root, "2026-08-02_10-00-00-scheduled")
+    mine = root / "my important folder"
+    mine.mkdir(parents=True)
+
+    backups.prune(root, retain=1)
+
+    assert mine.exists(), "a populated backup root must never lose the user's data"

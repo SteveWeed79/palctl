@@ -126,17 +126,19 @@ companion to restarts, not an alternative to them.
 strictly better than a fixed timer and is the right call. `bEnableInvaderEnemy`
 is already editable in the settings editor.
 
-**Still open:** palctl doesn't *recommend* disabling invaders anywhere, and it is
-a memory-leak-focused tool. A hint next to that setting, or in the leak-forecast
-warning, would put the second half of the accepted mitigation in front of the
-person who needs it. Not done — it is a content decision, not a bug.
+The settings editor now says so, on `bEnableInvaderEnemy` itself — a
+memory-leak-focused tool had nowhere that mentioned the other half of the
+accepted mitigation.
 
-**Also still open:** the watchdog is blind if the server process runs under a
-different Windows account than palctl (server as SYSTEM, palctl as you) — psutil
-can't read the memory of another account's process, so it lands on the idle
-launcher and the leak watchdog never fires. palctl detects and warns about this,
-and the installer's "Path A" registers both under one account. Worth checking
-first on any box where the leak seems unmanaged.
+**The account split matters more than the restart cadence.** If the server runs
+under a different Windows account than palctl (server as SYSTEM, palctl as you),
+psutil can't read the server's memory: it lands on the idle ~7 MB launcher, the
+leak watchdog never fires, and the box climbs until it thrashes. palctl warns
+about this — but the warning used to be suppressible by a single unreadable
+poll, which is now fixed (the split is itself a reason the read fails, so the
+boxes that needed the warning were the least likely to get it). The installer's
+"Path A" registers both services under one account. Check this first on any box
+where the leak seems unmanaged.
 
 ---
 

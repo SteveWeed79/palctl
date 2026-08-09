@@ -64,6 +64,29 @@ default (see **Changed**). Neither was reachable by reading files.
   person doesn't re-derive it.
 
 ### Fixed
+- **The account-split warning could be silenced permanently by one bad look.**
+  If the Palworld server runs under a different Windows account than palctl,
+  palctl can't read its memory — it lands on the idle launcher, and the leak
+  watchdog can never fire, so the box climbs until it thrashes. A one-shot
+  warning is the only protection against that, and its "already warned" flag was
+  set *before* the check ran, unconditionally. A single poll where the process
+  wasn't readable therefore suppressed the warning for the rest of the daemon's
+  life — and an account split is itself a reason psutil can't read the process,
+  so the servers that most needed telling were the ones told least. "Couldn't
+  tell" and "no mismatch" are now distinct, and only a definitive answer latches.
+- **`-pre-restore` safety copies are now bounded (newest 3) instead of never
+  pruned.** They're full copies of the world, taken automatically on every
+  restore, and being exempt from retention entirely reads as safe but isn't —
+  a few restores leave several multi-GB worlds on the same disk as the live one,
+  forever, and a full disk corrupts saves. They're counted separately from
+  ordinary backups, so a restore's safety copy can never push a real backup out
+  or be pushed out by one.
+
+### Changed
+- The settings editor now explains `bEnableInvaderEnemy`. Turning raids off is
+  the most widely-recommended companion to scheduled restarts for the memory
+  leak — the two together hold a server steady far better than restarts alone —
+  and a memory-leak-focused tool had nowhere that said so.
 - **The settings editor now tells you when `WorldOption.sav` is silently
   overriding the file you're editing.** This is the single most common reason
   Palworld settings "don't apply", and it fails without any error:
