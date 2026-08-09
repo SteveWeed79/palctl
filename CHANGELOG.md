@@ -23,12 +23,14 @@ made the daemon restart itself at the worst possible moment, one let a stranger
 drive your server from Discord, and one turned a single comment in
 `PalWorldSettings.ini` into a file palctl couldn't read.
 
-The last pass stopped reading code and instead drove palctl from the outside
-against a simulated server that hangs — accepting connections and never
-answering, which is what a wedged PalServer actually does. That found something
-none of the code reading did, and it wasn't a bug: with auto-recovery off (the
-default) palctl says the server is down and then never mentions it again, which
-looks exactly like palctl being broken. See **Changed**.
+Later passes stopped reading code and drove palctl from the outside instead —
+against a server that hangs (accepting connections and never answering, which
+is what a wedged PalServer actually does), and against a Steam update that
+resets `PalWorldSettings.ini`. Those found the two failures most likely to read
+as "palctl is broken": an update that leaves palctl permanently unable to see
+a server that is running fine (top of **Fixed**), and a down server that palctl
+reports once and then never mentions again because auto-recovery is off by
+default (see **Changed**). Neither was reachable by reading files.
 
 ### Security
 - **The Discord bot now only takes commands from your own server.** Slash
@@ -55,6 +57,23 @@ looks exactly like palctl being broken. See **Changed**.
   would think to look.
 
 ### Fixed
+- **A server update could leave palctl permanently blind, and silently wipe your
+  settings.** This is the one that looks like "palctl is broken": after a
+  SteamCMD update the dashboard shows nothing, the server can't be connected to,
+  and restarting the service changes nothing — because nothing is wrong with the
+  process. palctl took a backup of `PalWorldSettings.ini` before every update and
+  then only ever restored it `if is_blank(...)` — only when the file came back
+  *completely empty*. An update that leaves a **valid** ini full of Palworld's
+  defaults sailed straight past that check, and those defaults carry
+  `RESTAPIEnabled=False` and an empty `AdminPassword` — the exact two settings
+  palctl needs to see the server at all. Every tuned rate, the server name and
+  the player cap went with them. The backup was sitting on disk, unused and
+  unmentioned. Now: a blank ini is restored wholesale as before, a *reset* ini
+  has the admin's own values merged back over it (settings a genuine game patch
+  added keep their new defaults; settings it removed stay removed), and the REST
+  API settings are re-asserted after every update — the same idempotent call
+  setup makes, which until now was never made again for the life of the install.
+  palctl also says which settings it put back, and where the pre-update copy is.
 - **A stalled SteamCMD no longer wedges palctl permanently.** This was the worst
   one. An update stops the game server *first*, then runs SteamCMD while holding
   the single server-operation lock. SteamCMD had no timeout — so a download that

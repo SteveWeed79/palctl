@@ -890,3 +890,67 @@ def test_update_server_records_up_intent(tmp_path, monkeypatch):
         sched_mod.Scheduler(cfg, FakeApi(), EventBus(), set_intent=intent.append).update_server()
     )
     assert True in intent  # parity with the daemon's HTTP /action/update-server
+
+
+def test_update_that_resets_the_ini_restores_it_and_keeps_palctl_able_to_see(
+    tmp_path, monkeypatch
+):
+    """The whole failure, end to end.
+
+    A server update can leave PalWorldSettings.ini holding Palworld's defaults —
+    a valid file, so the blank check never fires and the pre-update backup was
+    never used. Because those defaults carry RESTAPIEnabled=False and no
+    AdminPassword, palctl went permanently blind to a server that was up the
+    whole time: nothing on the dashboard, and restarting fixed nothing because
+    the process was never the problem.
+    """
+    from palctl.inifile import PalSettings
+
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path / "server")
+    cfg.backup_root = str(tmp_path / "backups")
+    cfg.api_port = 8212
+
+    tuned = (
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        'OptionSettings=(ExpRate=3.000000,ServerName="mine",'
+        'AdminPassword="hunter2",RESTAPIEnabled=True,RESTAPIPort=8212)\n'
+    )
+    defaults = (
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        'OptionSettings=(ExpRate=1.000000,ServerName="Default Palworld Server",'
+        'AdminPassword="",RESTAPIEnabled=False,RESTAPIPort=8212)\n'
+    )
+    ini = cfg.live_ini
+    ini.parent.mkdir(parents=True, exist_ok=True)
+    ini.write_text(tuned, encoding="utf-8")
+    cfg.default_ini.parent.mkdir(parents=True, exist_ok=True)
+    cfg.default_ini.write_text(defaults, encoding="utf-8")
+
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line=None):
+        ini.write_text(defaults, encoding="utf-8")  # a VALID ini, just reset
+        return 0
+
+    monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
+    # No keyring in tests; the admin's password has to come back from the ini.
+    monkeypatch.setattr("palctl.config.get_admin_password", lambda: "")
+
+    bus = EventBus()
+    events = _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+
+    after = PalSettings.load(ini)
+    assert after.get("RESTAPIEnabled") is True, "palctl must still be able to see it"
+    assert after.get("AdminPassword") == "hunter2", "and still authenticate"
+    assert after.get("ExpRate") == 3.0, "the admin's tuning must survive an update"
+    assert after.get("ServerName") == "mine"
+    assert any(
+        "reset" in e.message and "PalWorldSettings.ini" in e.message
+        for e in events
+    ), "and the admin has to be told it happened"

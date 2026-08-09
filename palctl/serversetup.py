@@ -43,3 +43,41 @@ def ensure_rest_api(
     if password:
         settings.set("AdminPassword", password)
     settings.save(live_ini)
+
+
+def restore_user_settings(live_ini: Path, backup_ini: Path) -> list[str]:
+    """Put the user's pre-update values back over a live ini that a server
+    update reset, and return the keys restored (empty when nothing changed).
+
+    A SteamCMD run can leave PalWorldSettings.ini holding Palworld's *defaults*
+    — a perfectly valid file, so the "is it blank?" check that guards the
+    pre-update backup never fires and the backup is never used. The result is
+    silent: every tuned rate back to 1.0, the server renamed, and — because the
+    defaults have ``RESTAPIEnabled=False`` and no ``AdminPassword`` — palctl
+    permanently blind to a server it can no longer authenticate to. Restarting
+    doesn't help, because nothing is wrong with the process.
+
+    This merges rather than overwrites, so a genuine game update isn't undone:
+    keys the update *added* stay at their new defaults, keys the update
+    *removed* stay removed, and only the values the user already had are put
+    back. An untouched ini produces no changes at all, so the normal update path
+    is unaffected.
+    """
+    try:
+        live = PalSettings.load(live_ini)
+        before = PalSettings.load(backup_ini)
+    except (OSError, ValueError):
+        return []  # nothing safe to say; the caller falls back to ensure_rest_api
+
+    restored: list[str] = []
+    for key in before.keys():
+        if key not in live:
+            continue  # the update dropped this setting; don't resurrect it
+        old, new = before.option(key), live.option(key)
+        if old.raw != new.raw:
+            new.raw = old.raw  # raw text, so the value round-trips exactly
+            restored.append(key)
+
+    if restored:
+        live.save(live_ini)
+    return restored
