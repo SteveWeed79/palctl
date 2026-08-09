@@ -82,6 +82,16 @@ default (see **Changed**). Neither was reachable by reading files.
   ordinary backups, so a restore's safety copy can never push a real backup out
   or be pushed out by one.
 
+### Added
+- **The first-run wizard now has a "Raids and the memory leak" section.** It's
+  the only choice in setup that changes how the *game* plays rather than how
+  palctl is installed, so it gets its own section and its own explanation:
+  what the raid waves do to memory, how much difference turning them off
+  makes, and why palctl leaves the decision to you. **Unticked by default** —
+  leave it alone and Palworld behaves exactly as it ships. Ticking it is the
+  only thing that writes `bEnableInvaderEnemy=False`; an admin who already
+  turned raids off never has setup turn them back on.
+
 ### Changed
 - **palctl now points at raids when memory is climbing.** Palworld's scripted
   invader waves spawn enemies the server never cleans up; operators

@@ -175,6 +175,36 @@ class SetupWizard(QDialog):
             sf.addWidget(cb)
         form.addWidget(steps)
 
+        # Raids get their own section rather than a fourth line in "Do now",
+        # because it is the only choice here that changes how the *game* plays
+        # rather than how palctl is installed — and because the reason is the
+        # whole point. Left UNTICKED: palctl ships Palworld's behaviour
+        # unchanged, and this is the admin being told, at the one moment they
+        # are making server decisions, that the lever exists.
+        raids = QGroupBox("Raids and the memory leak")
+        rf = QVBoxLayout(raids)
+        self.disable_raids = QCheckBox(
+            "Turn raids off (bEnableInvaderEnemy = False)"
+        )
+        self.disable_raids.setChecked(False)
+        rf.addWidget(self.disable_raids)
+        raid_help = QLabel(
+            "Palworld's dedicated server leaks memory, and the scripted raid "
+            "waves are the part with no cleanup — the server spawns them and "
+            "never gives the memory back. Operators consistently report RAM "
+            "climbing at <b>roughly half the rate</b> with raids disabled, which "
+            "makes this the single most effective setting you can change. "
+            "palctl's memory watchdog handles the rest, restarting on the "
+            "symptom rather than on a timer.<br><br>"
+            "Left off by default because raids are part of the game and that's "
+            "your call, not palctl's — and because this is operator experience, "
+            "not something Pocketpair has published. Leave it unticked and "
+            "nothing changes. You can flip it any time in Settings → Combat."
+        )
+        raid_help.setWordWrap(True)
+        rf.addWidget(raid_help)
+        form.addWidget(raids)
+
         # ONE background mode, on or off. palctl and the game server run as
         # Windows services under the same user account — that's what makes the
         # memory watchdog able to read the server, keeps the Discord bot's
@@ -545,6 +575,7 @@ class SetupWizard(QDialog):
             discord_token=discord_token,
             discord_channel_id=channel_id,
             discord_admin_id=admin_id,
+            disable_raids=self.disable_raids.isChecked(),
         )
         # Kept so the completion dialog can describe what actually ran.
         self._plan = plan

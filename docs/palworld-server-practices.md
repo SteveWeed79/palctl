@@ -132,15 +132,20 @@ RAM climbing at roughly half the rate with them off. Independent hosting
 providers agree on this; Pocketpair has not published anything on it, so treat
 the "halves it" figure as operator experience rather than a measurement.
 
-**palctl surfaces it, and deliberately does not act on it.** The settings editor
-explains it on `bEnableInvaderEnemy` itself, and the leak forecast — the one
-moment an admin is definitely thinking about memory — appends the suggestion
-*when raids are actually on*. palctl does **not** turn raids off by itself, at
-setup or anywhere else: raids are game content, the evidence is operator
-report rather than vendor guidance, and a server manager that silently changes
-how someone's game plays is the same class of mistake as a config editor that
-drops keys it didn't recognise. Surfacing it puts the decision where it
-belongs.
+**palctl surfaces it in three places and acts on it in none.** The first-run
+wizard gives it a section of its own — the only setup choice that changes how
+the *game* plays rather than how palctl is installed — with the reasoning next
+to the checkbox, left unticked. The settings editor explains it on
+`bEnableInvaderEnemy` itself. The leak forecast, the one moment an admin is
+definitely thinking about memory, appends the suggestion *when raids are
+actually on*.
+
+What palctl never does is change it on its own. Raids are game content, the
+evidence is operator report rather than vendor guidance, and a server manager
+that silently alters how someone's game plays is the same class of mistake as a
+config editor that drops keys it didn't recognise. Ticking the box is the only
+thing that writes the setting — and leaving it unticked writes nothing at all,
+so an admin who already disabled raids never has setup turn them back on.
 
 **The account split matters more than the restart cadence.** If the server runs
 under a different Windows account than palctl (server as SYSTEM, palctl as you),
