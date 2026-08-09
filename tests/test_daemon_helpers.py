@@ -816,3 +816,47 @@ def test_lowest_free_gb_takes_the_tighter_volume(monkeypatch):
 
     monkeypatch.setattr(shutil, "disk_usage", fake_usage)
     assert d._lowest_free_gb() == 3.0  # the backup volume is the tighter one
+
+
+# ---------------- startup side effects stay off the event loop ----------------
+#
+# These two chores shell out (netsh; rclone version) and run *after* the HTTP
+# site is bound. Doing them on the loop meant a daemon whose port accepted
+# connections and then answered nothing at all — the worst shape of hang,
+# because every "is the port open?" check says yes while the app is dead. netsh
+# against a sick Windows Firewall service is exactly the slow case.
+
+
+def test_startup_side_effects_do_not_block_the_event_loop():
+    import time as _time
+
+    calls = []
+
+    class _Stub:
+        def _sync_dashboard_firewall(self, host):
+            calls.append(("firewall", host))
+            _time.sleep(0.5)  # a slow netsh
+
+        def _warn_if_cloud_mirror_broken(self):
+            calls.append(("mirror",))
+            _time.sleep(0.5)  # a slow rclone
+
+    async def main():
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        t = asyncio.create_task(ticker())
+        await daemon_mod.Daemon._startup_side_effects(_Stub(), "0.0.0.0")
+        t.cancel()
+        return ticks
+
+    ticks = asyncio.run(main())
+    # Both chores ran...
+    assert calls == [("firewall", "0.0.0.0"), ("mirror",)]
+    # ...and the loop kept running throughout, instead of freezing for ~1s.
+    assert ticks > 10, f"event loop was blocked (only {ticks} ticks in ~1s)"

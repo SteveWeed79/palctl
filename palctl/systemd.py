@@ -52,8 +52,23 @@ def unit_file(
     return "\n".join(lines)
 
 
+# systemctl blocks on the systemd job it queues; a unit whose start or stop
+# jobs are stuck holds the call open indefinitely. Bounded so installing or
+# removing palctl's own service can't hang the CLI with no way out.
+SYSTEMCTL_TIMEOUT = 60.0
+
+
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True)
+    """Run a systemctl command, bounded. A timeout is reported as a non-zero
+    result rather than an exception, so callers checking `returncode` keep
+    working — TimeoutExpired is a SubprocessError, not an OSError."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=SYSTEMCTL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            cmd, returncode=1, stdout="",
+            stderr=f"systemctl timed out after {SYSTEMCTL_TIMEOUT:.0f}s",
+        )
 
 
 def install_service(

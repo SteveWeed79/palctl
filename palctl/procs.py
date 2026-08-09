@@ -11,6 +11,8 @@ process is sitting at 14GB and about to fall over. Only psutil does.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import subprocess
 import sys
 import time
@@ -328,12 +330,42 @@ def service_diagnostics(service_name: str) -> str:
 # control API all at once.
 
 
+# How many consecutive UNKNOWN readings mean "the service manager has never
+# heard of this service" rather than a momentary blip. UNKNOWN is what
+# service_state reports for a name the SCM/systemd doesn't know — but also for a
+# query that timed out or a box with no systemd — so we want a few in a row
+# before acting on it, not the first one.
+_UNKNOWN_STREAK_LIMIT = 5
+
+
 async def _wait_for(service_name: str, target: str, timeout: float = 120.0) -> bool:
+    """Poll until the service reaches `target`, or give up. False on give-up.
+
+    Bails out early on a sustained UNKNOWN. A service name that the SCM/systemd
+    doesn't know never becomes RUNNING or STOPPED, so waiting the full timeout
+    for it just burns two minutes and then returns the same False — during which
+    the server-operation lock is held and the Start/Stop button, the GUI, the
+    dashboard and the bot all sit there looking hung. A misconfigured
+    `service_name` is an ordinary mistake (a rename, a hand-edited config, a
+    service that was never installed), so it should fail in seconds.
+    """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
+    unknown_streak = 0
     while loop.time() < deadline:
-        if await asyncio.to_thread(service_state, service_name) == target:
+        state = await asyncio.to_thread(service_state, service_name)
+        if state == target:
             return True
+        unknown_streak = unknown_streak + 1 if state == "UNKNOWN" else 0
+        if unknown_streak >= _UNKNOWN_STREAK_LIMIT:
+            logging.getLogger("palctl.procs").warning(
+                "service '%s' reads UNKNOWN %d times running while waiting for "
+                "%s — the service manager doesn't know that name. Giving up now "
+                "instead of waiting out the %.0fs timeout. Check `service_name` "
+                "in your config, and that the service is installed.",
+                service_name, unknown_streak, target, timeout,
+            )
+            return False
         await asyncio.sleep(2)
     return False
 
@@ -394,6 +426,56 @@ def _signal_and_wait(proc: psutil.Process, *, hard: bool, timeout: float) -> boo
         return not proc.is_running()
     except psutil.Error:
         return False
+
+
+def kill_descendants(pid: int, timeout: float = 10.0) -> bool:
+    """Kill every descendant of `pid`, leaving `pid` itself alone. Returns True
+    if they are all gone. Never raises — a process that already exited, or one
+    we may not signal, is reported honestly rather than thrown.
+
+    This exists for killing a hung external tool. Signalling only the process we
+    launched is not enough when we also need its stdout pipe released: a child
+    that inherited that pipe holds it open after its parent dies, so our reader
+    never sees EOF and ``Popen.wait()`` / ``asyncio.Process.wait()`` block
+    forever — turning "kill the hung tool" into the very hang it was meant to
+    escape. SteamCMD is exactly this shape: a launcher that re-execs the real
+    binary and spawns helpers beside it.
+
+    The parent is deliberately left to whoever launched it (Popen, asyncio),
+    because that owner has to be the one to reap it. Reaping someone else's
+    child out from under them makes ``Popen.wait()`` report a bogus exit 0 and
+    makes asyncio log "Unknown child process pid …, will report returncode 255".
+    """
+    try:
+        family = psutil.Process(pid).children(recursive=True)
+    except psutil.Error:
+        return True  # parent already gone, so its descendants are orphans we can't map
+    for p in family:
+        with contextlib.suppress(psutil.Error):
+            p.kill()
+    _, alive = psutil.wait_procs(family, timeout=timeout)
+    # A killed grandchild stays in the process table as a zombie until the
+    # process between us and it reaps it — which may be never, if that one is
+    # hung. It counts as gone here: a zombie has already released every file
+    # descriptor it held, including the stdout pipe this function exists to
+    # free. Treating it as alive would report failure for a job actually done.
+    return not [p for p in alive if not _is_zombie(p)]
+
+
+def _is_zombie(proc: psutil.Process) -> bool:
+    """Whether a process is dead-but-unreaped. Always False on Windows, which
+    has no such state."""
+    try:
+        return proc.status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True  # gone entirely, which is even better
+    except psutil.Error:
+        return False
+
+
+async def kill_descendants_async(pid: int, timeout: float = 10.0) -> bool:
+    """kill_descendants off the event loop — the waits in it are blocking."""
+    return await asyncio.to_thread(kill_descendants, pid, timeout)
 
 
 async def terminate_process(proc: psutil.Process, timeout: float = 10.0) -> bool:

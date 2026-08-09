@@ -3,6 +3,9 @@ systemd. The parsers and command builders are pure, so both platforms' logic is
 checked on whatever OS runs the tests."""
 
 import asyncio
+import subprocess
+import sys
+import time
 import types
 
 import psutil
@@ -315,3 +318,81 @@ def test_signal_treats_an_already_gone_process_as_success():
             return False
 
     assert asyncio.run(procs.terminate_process(_Gone(), timeout=0.01)) is True
+
+
+# ---------------- kill_descendants ----------------
+
+
+def test_kill_descendants_kills_children_but_not_the_parent():
+    """The parent is deliberately spared: whoever launched it (Popen, asyncio)
+    has to be the one to reap it, or their wait() reports a bogus result."""
+    parent = subprocess.Popen(
+        [sys.executable, "-c",
+         "import subprocess, sys, time;"
+         "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']);"
+         "time.sleep(60)"],
+    )
+    try:
+        # Give the child a moment to spawn its own child.
+        deadline = time.time() + 15
+        while time.time() < deadline and not psutil.Process(parent.pid).children():
+            time.sleep(0.1)
+        assert psutil.Process(parent.pid).children(), "grandchild never started"
+
+        assert procs.kill_descendants(parent.pid, timeout=10) is True
+        # The grandchild may linger as a zombie (its parent is still hung and
+        # hasn't reaped it) — what matters is that it is no longer running, so
+        # the pipe it inherited is closed.
+        assert all(
+            p.status() == psutil.STATUS_ZOMBIE
+            for p in psutil.Process(parent.pid).children()
+        )
+        assert parent.poll() is None, "kill_descendants must leave the parent alone"
+    finally:
+        parent.kill()
+        parent.wait(timeout=10)
+
+
+def test_kill_descendants_on_a_dead_process_is_success():
+    assert procs.kill_descendants(2**31 - 1, timeout=0.1) is True
+
+
+# ---------------- _wait_for early bail ----------------
+#
+# A service name the SCM/systemd has never heard of never reaches RUNNING or
+# STOPPED. Waiting the full 120s for it just holds the server-operation lock
+# while the GUI, dashboard and bot all sit there looking hung, and then returns
+# the same False anyway.
+
+
+def _states(monkeypatch, sequence):
+    """Feed service_state a canned sequence (last value repeats)."""
+    seen = []
+
+    def fake_state(name):
+        seen.append(name)
+        return sequence[min(len(seen) - 1, len(sequence) - 1)]
+
+    monkeypatch.setattr(procs, "service_state", fake_state)
+    return seen
+
+
+def test_wait_for_gives_up_early_on_a_service_the_manager_does_not_know(monkeypatch):
+    seen = _states(monkeypatch, ["UNKNOWN"])
+    start = time.monotonic()
+    assert asyncio.run(procs._wait_for("no-such-service", "STOPPED", timeout=120)) is False
+    # Bailed on the UNKNOWN streak, nowhere near the 120s timeout.
+    assert time.monotonic() - start < 30
+    assert len(seen) == procs._UNKNOWN_STREAK_LIMIT
+
+
+def test_wait_for_tolerates_a_transient_unknown(monkeypatch):
+    """One blip (a timed-out sc.exe query) must not be read as 'no such
+    service' — the streak has to reset when a real state comes back."""
+    _states(monkeypatch, ["UNKNOWN", "UNKNOWN", "STOP_PENDING", "STOPPED"])
+    assert asyncio.run(procs._wait_for("palworld", "STOPPED", timeout=120)) is True
+
+
+def test_wait_for_returns_true_as_soon_as_the_target_is_reached(monkeypatch):
+    _states(monkeypatch, ["RUNNING"])
+    assert asyncio.run(procs._wait_for("palworld", "RUNNING", timeout=120)) is True

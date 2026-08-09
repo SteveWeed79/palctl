@@ -167,10 +167,28 @@ def wrapper_paths(cache_dir: Path, name: str) -> tuple[Path, Path]:
 # ---------------- runners (Windows) ----------------
 
 
+# WinSW's install/uninstall/start/stop drive the SCM, which can sit in
+# START_PENDING or STOP_PENDING for a long time on a sick service. Bounded so a
+# wedged SCM shows up as a failed step the caller can report, rather than a
+# setup wizard or CLI that never comes back.
+WINSW_TIMEOUT = 120.0
+
+
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        cmd, capture_output=True, text=True, creationflags=_NO_WINDOW
-    )
+    """Run a WinSW/sc command, bounded. A timeout is reported as a non-zero
+    result rather than an exception, so it flows into the existing failure
+    handling — TimeoutExpired is a SubprocessError, not an OSError, so the
+    callers' `except OSError` would not have caught it."""
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, creationflags=_NO_WINDOW,
+            timeout=WINSW_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            cmd, returncode=1, stdout="",
+            stderr=f"the service command timed out after {WINSW_TIMEOUT:.0f}s",
+        )
 
 
 def service_exists(name: str) -> bool:

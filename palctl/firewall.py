@@ -24,6 +24,15 @@ from __future__ import annotations
 import subprocess
 import sys
 
+# netsh talks to the Windows Firewall service (MpsSvc) and its policy store,
+# and it can sit there for a long time — or forever — when that service is
+# stopped, starved, or the store is corrupt. This runs on the daemon's startup
+# path, so an unbounded wait there is a daemon that binds its port and then
+# never answers a single request. Bound it and treat a timeout as "couldn't do
+# it", which is already a first-class outcome for every function here (the
+# caller logs the manual command).
+NETSH_TIMEOUT = 20.0
+
 # Stable rule name so ensure/remove/show all refer to the same rule.
 RULE_NAME = "palctl dashboard"
 # Private = home/work networks; Domain = a corporate-joined box. Never Public.
@@ -69,11 +78,26 @@ def _on_windows() -> bool:
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True, creationflags=_NO_WINDOW)
+    """Run a netsh command, bounded. A timeout is reported as a non-zero result
+    rather than an exception, so it lands in the same "failed" branch the
+    not-elevated case already uses (TimeoutExpired is a SubprocessError, not an
+    OSError, so it would otherwise escape the callers' except clauses)."""
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, creationflags=_NO_WINDOW,
+            timeout=NETSH_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            cmd, returncode=1, stdout="",
+            stderr=f"netsh timed out after {NETSH_TIMEOUT:.0f}s",
+        )
 
 
 def rule_present(*, name: str = RULE_NAME) -> bool:
-    """Whether a dashboard firewall rule already exists. False off Windows."""
+    """Whether a dashboard firewall rule already exists. False off Windows, and
+    False on a netsh that times out — "I can't tell" has to read as "not there",
+    so ensure_rule() still tries and reports its own outcome."""
     if not _on_windows():
         return False
     try:

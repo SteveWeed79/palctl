@@ -1,11 +1,19 @@
 """The argv order here is load-bearing (force_install_dir before app_update) and
 the ini backup is what saves people's tuning from a validate, so both are
-pinned by tests even though the network/subprocess parts aren't."""
+pinned by tests. The download isn't exercised, but the process runners are: a
+SteamCMD that stops responding used to wedge the daemon permanently, so the
+stall guard at the bottom of this file drives real child processes."""
 
+import asyncio
 import io
+import sys
 import tarfile
+import time
 import zipfile
 from pathlib import Path
+
+import psutil
+import pytest
 
 from palctl import steamcmd
 
@@ -118,3 +126,179 @@ def test_parse_latest_buildid_reads_public_branch():
     assert steamcmd.parse_latest_buildid(txt) == "999"
     # No public branch -> no answer, rather than guessing the wrong branch.
     assert steamcmd.parse_latest_buildid('"branches" { "beta" { "buildid" "1" } }') is None
+
+
+# ---------------- stall guard ----------------
+#
+# A SteamCMD that never exits used to hang the daemon permanently: the update
+# holds the one server-operation lock and stops the game server *before*
+# running SteamCMD, so a wedged run leaves the server down and every
+# start/stop/restart/backup/restore answering "busy: update is in progress"
+# until someone restarts the daemon by hand.
+#
+# These drive real child processes rather than fakes, because the two bugs
+# worth pinning are both about real process/pipe behaviour: killing only our
+# direct child leaves a grandchild holding the stdout pipe, and asyncio's
+# Process.wait() then never returns.
+
+# A fake steamcmd: print a line, then sit forever. Written as a Python script so
+# it behaves the same on Windows and Linux.
+_STALL_SCRIPT = (
+    "import sys, time\n"
+    "print(' Update state (0x61) downloading, progress: 12.34', flush=True)\n"
+    "time.sleep(600)\n"
+)
+
+# The same, but it first spawns a child that inherits stdout and outlives it,
+# and reports that child's pid so the test can check on it. This is the shape of
+# the real thing (steamcmd.sh re-execs linux32/steamcmd; the Windows build
+# spawns helpers) and the case that makes a naive kill useless.
+_STALL_WITH_CHILD_SCRIPT = (
+    "import subprocess, sys, time\n"
+    "kid = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+    "print('CHILDPID %d' % kid.pid, flush=True)\n"
+    "print(' Update state (0x61) downloading, progress: 12.34', flush=True)\n"
+    "time.sleep(600)\n"
+)
+
+_OK_SCRIPT = (
+    "import sys\n"
+    "print('Update state (0x61) downloading, progress: 50.00', flush=True)\n"
+    "print(\"Success! App '2394010' fully installed.\", flush=True)\n"
+    "sys.exit(0)\n"
+)
+
+
+def _fake_steamcmd(tmp_path: Path, script: str) -> Path:
+    """A stand-in steamcmd. update_command() puts its own args after the binary;
+    the script ignores them, which is what we want."""
+    p = tmp_path / "fake_steamcmd.py"
+    p.write_text(script)
+    return p
+
+
+def _patch_argv(monkeypatch, script_path: Path):
+    """Run the fake through the current interpreter, ignoring SteamCMD's argv."""
+    monkeypatch.setattr(
+        steamcmd, "update_command",
+        lambda *a, **k: [sys.executable, str(script_path)],
+    )
+
+
+def test_run_update_async_raises_when_steamcmd_goes_silent(tmp_path, monkeypatch):
+    _patch_argv(monkeypatch, _fake_steamcmd(tmp_path, _STALL_SCRIPT))
+    t0 = time.monotonic()
+    with pytest.raises(steamcmd.SteamCmdStalled):
+        asyncio.run(
+            steamcmd.run_update_async(
+                "steamcmd", tmp_path / "srv", stall_timeout=2.0
+            )
+        )
+    # It must actually give up on the stall timer, not wait out the process.
+    assert time.monotonic() - t0 < 30
+
+
+def _child_pid_from(lines: list[str]) -> int:
+    for line in lines:
+        if line.startswith("CHILDPID "):
+            return int(line.split()[1])
+    raise AssertionError(f"fake steamcmd never reported its child pid: {lines}")
+
+
+def test_run_update_async_stall_kill_reaches_the_whole_process_tree(
+    tmp_path, monkeypatch
+):
+    """The regression that matters: kill the descendants, not just our child.
+
+    A grandchild that inherited the stdout pipe holds it open after its parent
+    dies, so the reader never sees EOF and asyncio's `proc.wait()` blocks for as
+    long as that orphan lives — re-creating the permanent hang the stall timeout
+    exists to prevent. Leaving it running also means SteamCMD is still writing
+    into the install directory while the daemon restarts the server on top of it.
+    """
+    _patch_argv(monkeypatch, _fake_steamcmd(tmp_path, _STALL_WITH_CHILD_SCRIPT))
+    lines: list[str] = []
+    t0 = time.monotonic()
+    with pytest.raises(steamcmd.SteamCmdStalled):
+        asyncio.run(
+            steamcmd.run_update_async(
+                "steamcmd", tmp_path / "srv", stall_timeout=2.0, on_line=lines.append
+            )
+        )
+    assert time.monotonic() - t0 < 30
+
+    kid = _child_pid_from(lines)
+    # The orphan must be gone (a zombie counts: its file descriptors, and so the
+    # inherited pipe, are already released).
+    assert not psutil.pid_exists(kid) or psutil.Process(kid).status() == psutil.STATUS_ZOMBIE
+
+
+def test_run_update_async_still_returns_the_exit_code_on_a_normal_run(
+    tmp_path, monkeypatch
+):
+    """The stall guard must not disturb the happy path — every line still
+    reaches on_line, and the real exit code comes back."""
+    _patch_argv(monkeypatch, _fake_steamcmd(tmp_path, _OK_SCRIPT))
+    lines: list[str] = []
+    code = asyncio.run(
+        steamcmd.run_update_async(
+            "steamcmd", tmp_path / "srv", stall_timeout=30.0, on_line=lines.append
+        )
+    )
+    assert code == 0
+    assert any("fully installed" in line for line in lines)
+
+
+def test_run_update_sync_raises_when_steamcmd_goes_silent(tmp_path, monkeypatch):
+    """Same guard on the blocking runner the setup wizard uses — without it the
+    wizard sits on 'Installing the server…' with no way out but killing the app."""
+    _patch_argv(monkeypatch, _fake_steamcmd(tmp_path, _STALL_WITH_CHILD_SCRIPT))
+    t0 = time.monotonic()
+    with pytest.raises(steamcmd.SteamCmdStalled):
+        steamcmd.run_update(
+            "steamcmd", tmp_path / "srv", stall_timeout=2.0
+        )
+    assert time.monotonic() - t0 < 30
+
+
+def test_run_update_sync_still_returns_the_exit_code_on_a_normal_run(
+    tmp_path, monkeypatch
+):
+    _patch_argv(monkeypatch, _fake_steamcmd(tmp_path, _OK_SCRIPT))
+    lines: list[str] = []
+    assert steamcmd.run_update(
+        "steamcmd", tmp_path / "srv", stall_timeout=30.0, on_line=lines.append
+    ) == 0
+    assert any("fully installed" in line for line in lines)
+
+
+def _hanging_executable(tmp_path: Path) -> Path:
+    """An executable that ignores its arguments and hangs. latest_buildid()
+    invokes the steamcmd path directly (not through the interpreter), so this
+    has to be something the OS can exec on its own."""
+    inner = tmp_path / "hang.py"
+    inner.write_text("import time; time.sleep(600)\n")
+    if sys.platform.startswith("win"):
+        launcher = tmp_path / "hang.bat"
+        launcher.write_text(f'@echo off\r\n"{sys.executable}" "{inner}"\r\n')
+    else:
+        launcher = tmp_path / "hang.sh"
+        launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{inner}"\n')
+        launcher.chmod(0o755)
+    return launcher
+
+
+def test_latest_buildid_gives_up_on_a_hung_query(tmp_path):
+    """The six-hourly update check must not park a child process forever: an
+    unbounded metadata query leaks a process and stops that loop ticking again.
+    A timeout reads as "don't know", the same as every other failure here."""
+    t0 = time.monotonic()
+    assert asyncio.run(
+        steamcmd.latest_buildid(_hanging_executable(tmp_path), timeout=2.0)
+    ) is None
+    assert time.monotonic() - t0 < 30
+
+
+def test_stall_duration_reads_naturally():
+    assert steamcmd._stall_duration(600) == "10 minutes"
+    assert steamcmd._stall_duration(45) == "45 seconds"

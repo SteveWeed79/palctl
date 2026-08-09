@@ -67,3 +67,39 @@ def test_remove_rule_absent_and_removed(monkeypatch):
     present["v"] = True
     monkeypatch.setattr(firewall, "_run", lambda cmd: _Result(0))
     assert firewall.remove_rule() == "removed"
+
+
+# ---------------- bounded netsh ----------------
+#
+# netsh talks to the Windows Firewall service and can sit there indefinitely
+# when that service is sick. This runs on the daemon's startup path, so an
+# unbounded call means a daemon that binds its port and then answers nothing.
+
+
+def test_run_passes_a_timeout_to_subprocess(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        return _Result(0)
+
+    monkeypatch.setattr(firewall.subprocess, "run", fake_run)
+    firewall._run(["netsh", "whatever"])
+    assert seen.get("timeout") == firewall.NETSH_TIMEOUT
+
+
+def test_a_hung_netsh_reads_as_failure_not_an_exception(monkeypatch):
+    """TimeoutExpired is a SubprocessError, not an OSError, so it would sail
+    straight past every caller's except clause. _run absorbs it into a non-zero
+    result instead."""
+    import subprocess as sp
+
+    def fake_run(cmd, **kwargs):
+        raise sp.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(firewall.subprocess, "run", fake_run)
+    monkeypatch.setattr(firewall, "_on_windows", lambda: True)
+
+    assert firewall._run(["netsh"]).returncode != 0
+    assert firewall.rule_present() is False
+    assert firewall.ensure_rule(8830) == "failed"

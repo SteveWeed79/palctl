@@ -422,3 +422,17 @@ def test_ensure_winsw_refuses_a_tampered_download(tmp_path: Path, monkeypatch):
         winservice.ensure_winsw(cache, sha256="f" * 64)
     # Nothing unverified was left on disk as the usable binary.
     assert not (cache / "winsw.exe").exists()
+
+
+def test_a_hung_service_command_reads_as_failure_not_an_exception(monkeypatch):
+    """WinSW's install/start/stop drive the SCM, which can sit in START_PENDING
+    or STOP_PENDING for a long time on a sick service. A timeout must become a
+    reportable failed step, not an exception the callers don't catch."""
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        assert kwargs.get("timeout") == winservice.WINSW_TIMEOUT
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert winservice._run(["winsw", "start"]).returncode != 0

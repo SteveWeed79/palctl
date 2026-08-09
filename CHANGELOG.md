@@ -10,6 +10,71 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+## [1.2.5.6] — 2026-08-09
+
+A hang-hunting pass. Every place palctl waited on something external without a
+bound is now bounded, and the two that could park the whole app indefinitely are
+fixed at the source. The theme throughout: palctl drives external tools
+(SteamCMD, `sc.exe`/`systemctl`, `netsh`, `schtasks`) that can stop responding,
+and "wait forever" was the default in each case.
+
+### Fixed
+- **A stalled SteamCMD no longer wedges palctl permanently.** This was the worst
+  one. An update stops the game server *first*, then runs SteamCMD while holding
+  the single server-operation lock. SteamCMD had no timeout — so a download that
+  stalled, or a SteamCMD sitting on a login/Steam Guard prompt, left the server
+  **down** and the lock **held forever**: the memory watchdog, crash
+  auto-recovery, scheduled restarts, and every Start/Stop/Restart/Backup/Restore
+  in the GUI, dashboard and Discord bot all answered *"busy: update is in
+  progress"* until someone restarted the daemon by hand. `/healthz` still
+  reported **ok** the whole time, because the poll loop was fine — so nothing
+  monitoring the box would ever tell you. SteamCMD is now killed if it prints
+  nothing for 10 minutes (silence is the signal: it's continuously chatty while
+  it actually works, and a total time cap would either kill legitimate multi-GB
+  installs or be too loose to catch anything). The failure is reported as an
+  event, the ini is restored, the server is started again, and the lock is
+  released — the same path as any other failed update.
+- **Killing a hung SteamCMD now kills its children too.** SteamCMD is a launcher
+  (`steamcmd.sh` re-execs the real binary; the Windows build spawns helpers).
+  Signalling only the process palctl launched leaves a child holding the
+  inherited stdout pipe open, so the reader never sees EOF and the wait after
+  the kill blocks for as long as that orphan lives — which would have recreated
+  the exact hang above, from inside the recovery path. It also meant SteamCMD
+  could still be writing into the install directory while the server restarted
+  on top of it.
+- **The daemon no longer goes deaf during startup on Windows.** The dashboard
+  firewall sync (`netsh`) and the cloud-mirror check ran on the event loop,
+  *after* the control API's port was bound. `netsh` against a stopped or sick
+  Windows Firewall service can take tens of seconds, and during that window the
+  daemon accepted TCP connections and answered **nothing** — the GUI showed
+  "Can't reach the palctl daemon", the dashboard hung, and no port check could
+  see anything wrong. Both now run off the loop and out of the startup path, so
+  they delay only their own log line — not polling, not the control API, and not
+  the READY signal the service manager waits on.
+- **A wrong or missing `service_name` now fails in seconds instead of two
+  minutes.** A service name the SCM/systemd doesn't recognise never reaches
+  RUNNING or STOPPED, so every Start and Stop waited out the full 120-second
+  timeout, held the server lock for all of it, and then failed anyway — with no
+  hint as to why. palctl now recognises a sustained UNKNOWN as "the service
+  manager has never heard of this name", gives up after about ten seconds, and
+  logs the actual problem and how to fix it. A single blip (a query that timed
+  out) is still tolerated.
+- **Bounded every remaining external command.** `netsh` (firewall), `schtasks`
+  (the health task), `systemctl` (the Linux unit), WinSW/`sc` (service
+  install/start/stop) and the silent Visual C++ runtime install all ran with no
+  timeout, so a wedged service manager or a competing installer could hang the
+  setup wizard or the CLI with no output and no way out but killing the app.
+  Each now has a timeout and reports a normal failure — these all already had a
+  best-effort failure path; they just never reached it.
+- **SteamCMD's build-id check is bounded too**, so a hung metadata query can't
+  leak a process and silently stop the six-hourly update check from ever
+  running again.
+- **Daemon shutdown can no longer overrun the service manager's stop timeout.**
+  Cancelling a task that is parked in a worker thread is a request, not a
+  guarantee; teardown now waits a bounded time for those to unwind rather than
+  blocking on the slowest external tool and being killed mid-teardown — which
+  skipped closing the event store, the one step that writes to disk.
+
 ## [1.2.5.5] — 2026-07-19
 
 An install-, daemon-, and desktop-GUI reliability pass, done after a full

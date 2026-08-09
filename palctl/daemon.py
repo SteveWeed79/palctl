@@ -40,6 +40,11 @@ from .watchdog import Watchdog
 
 SERVICE_NAME = "palctl-daemon"  # the Windows service name palctl registers
 
+# How long shutdown waits for cancelled background tasks to unwind before
+# finishing without them. Comfortably inside WinSW's and systemd's own stop
+# timeouts — see _graceful_shutdown for why this can't be unbounded.
+SHUTDOWN_TASK_GRACE = 10.0
+
 
 def sd_notify(state: str) -> None:
     """Send a notification to systemd over $NOTIFY_SOCKET, if we're running under
@@ -335,7 +340,14 @@ class Daemon:
         devices on the LAN can't reach the dashboard — so binding 0.0.0.0 alone
         is a silent no-op. Open the port (private networks) when LAN access is
         on, and close it again when off. Best-effort: a non-elevated daemon can't
-        touch the firewall, so log the one-line manual command instead."""
+        touch the firewall, so log the one-line manual command instead.
+
+        Blocking (up to three netsh invocations) — the caller runs it via
+        to_thread. It must never sit on the event loop: netsh against a sick
+        MpsSvc can take tens of seconds, and this happens *after* the HTTP site
+        is bound, so a blocked loop means a daemon whose port accepts
+        connections and then answers nothing at all. That looks like a hung app
+        from every client, and no "is the port open?" check can see it."""
         if not sys.platform.startswith("win"):
             return
         from . import firewall
@@ -359,6 +371,15 @@ class Daemon:
                 )
         except Exception as e:  # firewall trouble must never break startup
             self.log.warning("dashboard firewall setup failed: %s", e)
+
+    async def _startup_side_effects(self, host: str) -> None:
+        """The two startup chores that shell out, moved off the event loop and
+        out of the startup critical path. Neither gates anything, so a slow
+        netsh or rclone now delays only its own log line — not the poll loop,
+        not the control API, and not the READY signal the service manager is
+        waiting on."""
+        await asyncio.to_thread(self._sync_dashboard_firewall, host)
+        await asyncio.to_thread(self._warn_if_cloud_mirror_broken)
 
     def _warn_if_cloud_mirror_broken(self) -> None:
         """If the backup mirror is an rclone remote that's misconfigured — no
@@ -986,8 +1007,11 @@ class Daemon:
         warning = lan_exposure_warning(host)
         if warning:
             self.log.warning("%s", warning)
-        self._sync_dashboard_firewall(host)
-        self._warn_if_cloud_mirror_broken()
+        # Both shell out (netsh; rclone version) and both are pure diagnostics —
+        # nothing below depends on them, so they run off the loop and, more
+        # importantly, must not delay the workers or READY=1 behind a slow
+        # external tool. Spawned rather than awaited for the same reason.
+        self._spawn(self._supervised("startup checks", self._startup_side_effects(host)))
 
         self._install_signal_handlers()
 
@@ -1045,8 +1069,18 @@ class Daemon:
                 await asyncio.wait_for(self.api.save(), timeout=10)
         for t in list(self._tasks):
             t.cancel()
+        # Cancelling is a request, not a guarantee: a task parked in
+        # asyncio.to_thread (a service query, a psutil sweep, a disk stat) can't
+        # be interrupted and only unwinds when its worker thread returns. Give
+        # them a moment and then move on, or "stop the daemon" waits on the
+        # slowest external tool and the service manager kills us mid-teardown
+        # instead — losing the event-store close below, which is the one step
+        # here that touches a file.
         with contextlib.suppress(Exception):
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(*self._tasks, return_exceptions=True),
+                timeout=SHUTDOWN_TASK_GRACE,
+            )
         with contextlib.suppress(Exception):
             await runner.cleanup()
         with contextlib.suppress(Exception):
