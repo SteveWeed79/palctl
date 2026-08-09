@@ -120,3 +120,29 @@ def test_detect_server_roots_prefers_running_process(tmp_path: Path, monkeypatch
         monkeypatch.setattr(discovery, attr, (str(common),))
 
     assert detect_server_roots()[0] == proc_root  # process root wins
+
+
+# ---------- updating one install while the service runs another ----------
+
+
+def test_root_mismatch_warning_flags_two_different_installs(tmp_path):
+    configured = tmp_path / "steamcmd" / "steamapps" / "common" / "PalServer"
+    running = tmp_path / "PalServerOld"
+    configured.mkdir(parents=True)
+    running.mkdir()
+
+    warning = discovery.root_mismatch_warning(configured, running)
+    assert warning and str(running) in warning and "version mismatch" in warning
+
+
+def test_root_mismatch_warning_silent_when_they_agree(tmp_path):
+    root = tmp_path / "PalServer"
+    root.mkdir()
+    assert discovery.root_mismatch_warning(root, root) is None
+    assert discovery.root_mismatch_warning(str(root) + "/", root) is None
+
+
+def test_root_mismatch_warning_silent_when_running_root_unknown(tmp_path):
+    # No running server (or an unreadable image path) is not a mismatch.
+    assert discovery.root_mismatch_warning(tmp_path / "PalServer", None) is None
+    assert discovery.root_mismatch_warning("", tmp_path) is None

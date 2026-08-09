@@ -10,6 +10,56 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+## [1.2.5.6] — 2026-07-29
+
+A server-update honesty pass. Every fix here targets the same end state: the
+server left running an old build while palctl reports success, which players
+only ever meet as **"version mismatch"** on the join screen.
+
+### Fixed
+- **The update check no longer goes silently blind on Steam-client installs.**
+  palctl read the installed build id from `<server root>/steamapps/
+  appmanifest_2394010.acf` — correct for its own SteamCMD installs
+  (`+force_install_dir`), but *wrong* for anyone who installed the dedicated
+  server through the Steam client, where the game sits in
+  `<library>/steamapps/common/PalServer` and the manifest lives two levels up.
+  Those installs read as "build unknown", and because the check needs both ids
+  to compare, it quietly answered "no updates" forever — so the first sign of a
+  patch was players being refused. Both layouts are now read, and a build id
+  that genuinely can't be found says so once instead of passing for "you're up
+  to date".
+- **An update that didn't actually apply is no longer announced as a success.**
+  SteamCMD's exit code was taken as proof, and it isn't: it exits 0 for
+  "nothing to do", and a blocked overwrite (a locked file, a full disk, a
+  `force_install_dir` that landed somewhere else) can still finish tidily.
+  palctl now compares the build id on disk with Steam's latest *after* the
+  update and, when they don't match, says the update did not land and lists the
+  usual causes — instead of restarting the server onto its old binaries and
+  reporting "✅ back up".
+- **Updates abort when something still holds the install open.** A hung
+  shutdown or a leftover second server service can leave `PalServer` running
+  after the service manager reports STOPPED. SteamCMD cannot replace files a
+  live process holds and, on Windows, fails that overwrite quietly — the old
+  binaries survive the "successful" update. palctl now checks for a server
+  process running out of the install directory before rewriting it, and aborts
+  with the PID and the fix rather than half-applying a patch. (A process whose
+  path can't be read — the server-as-SYSTEM split — is never blamed; the
+  post-update build check covers that case instead.)
+- **palctl now warns when it is updating an install nobody runs.** `Server root`
+  (what SteamCMD rewrites) and `Service name` (what palctl starts) are separate
+  settings, so they can point at two different copies of the server — the usual
+  result of a second install, or of adopting palctl onto a box that already had
+  a service. Every update then lands on the unused copy: the console says
+  success, the live server never changes build, and no amount of re-updating
+  fixes the version mismatch. The daemon now compares the running server's own
+  image path against the configured root and reports the discrepancy once at
+  startup, naming both paths.
+- **The update-available notice explains what's at stake.** It now says that
+  players whose game client has already updated will be refused with a version
+  mismatch until the server is on the same build, and update events carry the
+  build id they moved from and to (`Build 100 → 200`) so the event feed shows
+  what actually changed.
+
 ## [1.2.5.5] — 2026-07-19
 
 An install-, daemon-, and desktop-GUI reliability pass, done after a full

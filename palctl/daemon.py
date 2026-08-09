@@ -301,6 +301,9 @@ class Daemon:
         # One-shot: warn if the server process runs under a different account
         # than the daemon (the watchdog-blinding split — see _maybe_warn_account_mismatch).
         self._account_warned = False
+        # One-shot: warn if the running server was started from a different
+        # install than the one updates rewrite (see _maybe_warn_wrong_server_root).
+        self._root_warned = False
         # Wall-clock of the last completed poll, for the /healthz liveness probe.
         self._last_poll_at = 0.0
         # Set by a SIGTERM/SIGINT handler to unblock run() into graceful shutdown.
@@ -560,6 +563,7 @@ class Daemon:
         self._api_fail_streak = 0
         self._auth_warned = False  # a good poll re-arms the password warning
         await self._maybe_warn_account_mismatch()
+        await self._maybe_warn_wrong_server_root()
 
         await self.tracker.update(players)
 
@@ -603,6 +607,26 @@ class Daemon:
             warning = await asyncio.to_thread(
                 procs.server_account_mismatch, getpass.getuser()
             )
+        except Exception:
+            warning = None
+        if warning:
+            self.log.warning("%s", warning)
+            await self.bus.emit(Event("error", "⚠️ " + warning))
+
+    async def _maybe_warn_wrong_server_root(self) -> None:
+        """Once per daemon run: if the running server was started from a
+        different folder than the one palctl updates, say so. That split makes
+        every update land on a copy nobody runs — the update reports success and
+        the live server stays on its old build, which players meet as a version
+        mismatch. psutil enumeration runs off the event loop."""
+        if self._root_warned:
+            return
+        self._root_warned = True
+        from . import discovery
+
+        try:
+            running = await asyncio.to_thread(discovery.server_root_from_process)
+            warning = discovery.root_mismatch_warning(self.cfg.server_root, running)
         except Exception:
             warning = None
         if warning:
