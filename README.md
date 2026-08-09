@@ -86,7 +86,11 @@ PC, which is the situation most people are trying to get out of.
   restores, and crash recovery can't fire into the middle of each other
 - Notifies when a newer server build is available, or a newer palctl release
 - Opt-in crash/hang auto-recovery: if the API stops answering while palctl didn't
-  stop the server, it brings it back — rate-limited so a crash-loop isn't hammered
+  stop the server, it brings it back — rate-limited so a crash-loop isn't hammered.
+  **Off by default**, because restarting your server unasked shouldn't be a
+  default — so if you want a hang fixed rather than just reported, turn on
+  *Auto-restart on crash/hang* in Config. With it off, palctl says so once per
+  outage rather than leaving you to wonder why nothing happened
 - Join / leave / level-up events, synthesised by diffing the player list
 - Session + playtime tracking in SQLite (Palworld remembers none of this)
 - Metrics history in SQLite too, so the graphs survive a daemon restart

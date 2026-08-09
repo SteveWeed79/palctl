@@ -47,9 +47,17 @@ _STEAMCMD_BINARIES = ("steamcmd.exe", "steamcmd.sh")
 # enough for that is too generous to be a useful hang detector. But SteamCMD is
 # extremely chatty while it works — it reprints its "Update state (0x61)
 # downloading, progress: …" line continuously — so *silence* is the reliable
-# signal. Ten minutes of it means the run is wedged (the classic ones: a depot
+# signal. Sustained silence means the run is wedged (the classic ones: a depot
 # server that accepted the connection and stopped sending, or steamcmd blocking
 # on a Steam Guard / login prompt nobody will ever answer).
+#
+# Twenty minutes, not ten, because the two errors are not symmetric. A real
+# wedge is permanent, so waiting an extra ten minutes to notice costs ten
+# minutes, once. Killing a *healthy* run costs the user a failed install — and
+# SteamCMD does have a legitimately quiet stretch: the commit/verify phase after
+# a large depot downloads can sit without printing while it moves files, which
+# on a slow disk is minutes. Erring long keeps the hang protection while making
+# a false positive on a slow first install unlikely.
 #
 # This matters far more than a tidy error message. The daemon runs updates while
 # holding the one server-operation lock, and it stops the game server *before*
@@ -57,7 +65,7 @@ _STEAMCMD_BINARIES = ("steamcmd.exe", "steamcmd.sh")
 # the lock held forever: the watchdog, auto-recovery, scheduled restarts and
 # every Start button in the GUI, dashboard and Discord bot all answer "busy:
 # update is in progress" until someone restarts the daemon by hand.
-STEAMCMD_STALL_SECONDS = 600.0
+STEAMCMD_STALL_SECONDS = 1200.0
 
 # Metadata queries (app_info_print) are a small round-trip to Steam, so they get
 # a plain overall cap rather than a stall timer.

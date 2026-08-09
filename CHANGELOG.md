@@ -12,7 +12,7 @@ Installers for every release are on the
 
 ## [1.2.5.6] — 2026-08-09
 
-Three audit passes over the reliability of palctl's own machinery, prompted by a
+Four audit passes over the reliability of palctl's own machinery, prompted by a
 report of the app or the server "hanging up badly".
 
 The through-line: palctl drives things that can stop responding — SteamCMD,
@@ -22,6 +22,13 @@ conclusion when they went quiet. Two could park the whole app indefinitely, one
 made the daemon restart itself at the worst possible moment, one let a stranger
 drive your server from Discord, and one turned a single comment in
 `PalWorldSettings.ini` into a file palctl couldn't read.
+
+The last pass stopped reading code and instead drove palctl from the outside
+against a simulated server that hangs — accepting connections and never
+answering, which is what a wedged PalServer actually does. That found something
+none of the code reading did, and it wasn't a bug: with auto-recovery off (the
+default) palctl says the server is down and then never mentions it again, which
+looks exactly like palctl being broken. See **Changed**.
 
 ### Security
 - **The Discord bot now only takes commands from your own server.** Slash
@@ -39,6 +46,14 @@ drive your server from Discord, and one turned a single comment in
   later are covered automatically. If you have a channel configured there is
   nothing to do. The Discord guide now also says to turn Public Bot off.
 
+- **A failed service registration no longer leaves your Windows account password
+  on disk.** WinSW needs the password in its config XML for the single `install`
+  command, after which the SCM holds it and palctl scrubs the file. The scrub
+  wasn't in a `finally`, and `install` can raise rather than return non-zero (a
+  quarantined or locked wrapper exe is an `OSError`) — on that path the password
+  stayed in plaintext indefinitely, while setup reported failure, so nobody
+  would think to look.
+
 ### Fixed
 - **A stalled SteamCMD no longer wedges palctl permanently.** This was the worst
   one. An update stops the game server *first*, then runs SteamCMD while holding
@@ -49,8 +64,8 @@ drive your server from Discord, and one turned a single comment in
   in the GUI, dashboard and Discord bot all answered *"busy: update is in
   progress"* until someone restarted the daemon by hand. `/healthz` still
   reported **ok** the whole time, because the poll loop was fine — so nothing
-  monitoring the box would ever tell you. SteamCMD is now killed if it prints
-  nothing for 10 minutes (silence is the signal: it's continuously chatty while
+  monitoring the box would ever tell you. SteamCMD is now killed if it goes
+  silent for 20 minutes (silence is the signal: it's continuously chatty while
   it actually works, and a total time cap would either kill legitimate multi-GB
   installs or be too loose to catch anything). The failure is reported as an
   event, the ini is restored, the server is started again, and the lock is
@@ -164,6 +179,20 @@ drive your server from Discord, and one turned a single comment in
   loop. The quarantine is now best-effort, as it always claimed to be.
 
 ### Changed
+- **A down server no longer fails silently when auto-recovery is off.** Watching
+  a real hang from outside, the entire output was one *"🔴 Server is down."* and
+  then nothing, ever — which is indistinguishable from palctl itself being
+  broken, and is the likeliest reason anyone concludes that it is. The recovery
+  that would have fixed it (`watchdog.auto_restart_on_crash`) is **off by
+  default**, deliberately: restarting your server unasked shouldn't be a
+  default. But nothing said so. palctl now reports, once per outage, that the
+  server is down and it has been told not to restart it — naming the setting to
+  change. Turned on, behaviour is unchanged.
+- The SteamCMD stall timeout is 20 minutes rather than 10. The two errors aren't
+  symmetric: a real wedge is permanent, so noticing ten minutes later costs ten
+  minutes once, while killing a healthy run costs a failed install — and
+  SteamCMD's commit phase after a large depot download is legitimately quiet for
+  minutes on a slow disk.
 - CI now runs the GUI's thread-lifecycle tests in the import-smoke job, which
   already has a headless Qt. They need a real `QApplication`, so nothing else
   could have caught the crash-on-quit above.

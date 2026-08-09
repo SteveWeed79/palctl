@@ -305,20 +305,31 @@ def install_service(
         ),
         encoding="utf-8",
     )
-    _run([str(svc_exe), "install"])
-    if user and password:
-        # Registration is done; the SCM now holds the password (encrypted, in
-        # LSA). Rewrite the config without it so no plaintext account password
-        # outlives the one command that needed it. WinSW reads <serviceaccount>
-        # only at install, so the scrubbed file stays fully functional.
-        svc_xml.write_text(
-            winsw_config_xml(
-                name, exe, args, app_dir,
-                user=user, password=None, appdata=appdata,
-                stop_timeout=stop_timeout,
-            ),
-            encoding="utf-8",
-        )
+    try:
+        _run([str(svc_exe), "install"])
+    finally:
+        if user and password:
+            # Registration is done (or failed); either way the password's one
+            # job is over — the SCM holds it from here, encrypted in LSA.
+            # Rewrite the config without it so no plaintext account password
+            # outlives the single command that needed it. WinSW reads
+            # <serviceaccount> only at install, so the scrubbed file stays
+            # fully functional.
+            #
+            # In a `finally` because the failure path is the one that matters:
+            # `install` can raise rather than return non-zero (a quarantined or
+            # locked wrapper exe is an OSError), and on that path the scrub was
+            # skipped entirely — leaving a Windows account password sitting in
+            # a plaintext file indefinitely, with setup reporting failure so
+            # nobody would think to look.
+            svc_xml.write_text(
+                winsw_config_xml(
+                    name, exe, args, app_dir,
+                    user=user, password=None, appdata=appdata,
+                    stop_timeout=stop_timeout,
+                ),
+                encoding="utf-8",
+            )
     if start:
         _run([str(svc_exe), "start"])
 

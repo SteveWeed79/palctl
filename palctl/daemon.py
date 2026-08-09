@@ -366,6 +366,9 @@ class Daemon:
         # is wrong (rotated out from under us, say) — NOT an outage. Warn once,
         # not every poll, and never let it drive down-detection/auto-recovery.
         self._auth_warned = False
+        # One-shot per outage: the server is down and palctl has been told
+        # not to restart it. Re-armed by a good poll, like the 401 warning.
+        self._recovery_off_warned = False
         # One-shot: warn if the server process runs under a different account
         # than the daemon (the watchdog-blinding split — see _maybe_warn_account_mismatch).
         self._account_warned = False
@@ -667,6 +670,7 @@ class Daemon:
         self._down_polls = 0
         self._api_fail_streak = 0
         self._auth_warned = False  # a good poll re-arms the password warning
+        self._recovery_off_warned = False  # ...and the recovery-is-off notice
         await self._maybe_warn_account_mismatch()
 
         await self.tracker.update(players)
@@ -718,6 +722,39 @@ class Daemon:
 
     # ---------- crash / hang auto-recovery ----------
 
+    async def _warn_recovery_is_off(self, wd) -> None:
+        """Say — once per outage — that the server is down and palctl has been
+        told not to fix it.
+
+        `auto_restart_on_crash` is opt-in, and deliberately so: restarting
+        someone's server unasked is not a default to take lightly. But the
+        silence around it is the problem. Watching a real hang from the outside,
+        the entire output is one "🔴 Server is down." and then nothing, forever
+        — identical to palctl being broken, and the single most likely reason
+        someone concludes it is. The feature that would have fixed it is one
+        unticked box away, and nothing ever mentions it.
+
+        Only fires once the outage is confirmed (`_alive is False`, same
+        threshold as the down announcement) and only for a server palctl has
+        actually seen working, so a box with no server installed stays quiet.
+        Re-armed when the server comes back, so each outage says it once."""
+        if wd.auto_restart_on_crash or self._recovery_off_warned:
+            return
+        if self._alive is not False or not self._ever_alive:
+            return
+        self._recovery_off_warned = True
+        await self.bus.emit(
+            Event(
+                "error",
+                "⚠️ The server is down and **auto-recovery is turned off**, so "
+                "palctl will not restart it — it is only reporting. Turn on "
+                "*Auto-restart on crash/hang* in Config (or set "
+                "`watchdog.auto_restart_on_crash` to `true`) and reload, and "
+                "palctl will bring the server back on its own next time.",
+                {"action": "recovery_disabled"},
+            )
+        )
+
     async def _maybe_autorecover(self) -> None:
         """
         Called on every poll where the REST API is unreachable. Brings the server
@@ -725,6 +762,7 @@ class Daemon:
         already restarted too many times this hour.
         """
         wd = self.cfg.watchdog
+        await self._warn_recovery_is_off(wd)
         phase = autorecover_phase(
             enabled=wd.auto_restart_on_crash,
             ever_alive=self._ever_alive,

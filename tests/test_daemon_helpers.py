@@ -965,3 +965,68 @@ def test_unreadable_state_falls_back_to_safe_defaults(tmp_path, monkeypatch):
     # False (never auto-recover a server we have no evidence ever worked).
     assert daemon_mod._load_desired_running() is True
     assert daemon_mod._load_ever_alive() is False
+
+
+# ---------------- "down, and I'm not allowed to fix it" ----------------
+#
+# auto_restart_on_crash is opt-in on purpose — restarting someone's server
+# unasked isn't a default to take lightly. The silence around it is the problem:
+# watched from outside, a real hang produces one "🔴 Server is down." and then
+# nothing, ever. That is indistinguishable from palctl being broken, and it is
+# the likeliest reason someone concludes that it is.
+
+
+def _daemon_for_recovery_notice(*, enabled: bool, alive, ever_alive: bool):
+    d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+    d.cfg = daemon_mod.Config()
+    d.cfg.watchdog.auto_restart_on_crash = enabled
+    d._alive = alive
+    d.__dict__["_Daemon__ever_alive"] = ever_alive
+    d._recovery_off_warned = False
+    d.emitted = []
+
+    class _Bus:
+        @staticmethod
+        async def emit(e):
+            d.emitted.append(e)
+
+    d.bus = _Bus()
+    return d
+
+
+def _notices(d):
+    return [e for e in d.emitted if e.data.get("action") == "recovery_disabled"]
+
+
+def test_a_confirmed_outage_says_recovery_is_off():
+    d = _daemon_for_recovery_notice(enabled=False, alive=False, ever_alive=True)
+    asyncio.run(d._warn_recovery_is_off(d.cfg.watchdog))
+    assert len(_notices(d)) == 1
+    assert "auto_restart_on_crash" in _notices(d)[0].message
+
+
+def test_the_notice_is_once_per_outage_not_once_per_poll():
+    d = _daemon_for_recovery_notice(enabled=False, alive=False, ever_alive=True)
+    for _ in range(5):
+        asyncio.run(d._warn_recovery_is_off(d.cfg.watchdog))
+    assert len(_notices(d)) == 1
+
+
+def test_no_notice_while_auto_recovery_is_doing_its_job():
+    d = _daemon_for_recovery_notice(enabled=True, alive=False, ever_alive=True)
+    asyncio.run(d._warn_recovery_is_off(d.cfg.watchdog))
+    assert _notices(d) == []
+
+
+def test_no_notice_before_the_outage_is_confirmed():
+    """Same threshold as the down announcement — one slow poll isn't an outage."""
+    d = _daemon_for_recovery_notice(enabled=False, alive=True, ever_alive=True)
+    asyncio.run(d._warn_recovery_is_off(d.cfg.watchdog))
+    assert _notices(d) == []
+
+
+def test_no_notice_for_a_server_palctl_has_never_seen_working():
+    """A box with no server installed shouldn't be nagged about recovering it."""
+    d = _daemon_for_recovery_notice(enabled=False, alive=False, ever_alive=False)
+    asyncio.run(d._warn_recovery_is_off(d.cfg.watchdog))
+    assert _notices(d) == []

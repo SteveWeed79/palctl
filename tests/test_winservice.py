@@ -436,3 +436,30 @@ def test_a_hung_service_command_reads_as_failure_not_an_exception(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert winservice._run(["winsw", "start"]).returncode != 0
+
+
+def test_the_account_password_is_scrubbed_even_when_install_fails(tmp_path, monkeypatch):
+    """The password is in the XML only because WinSW needs it there for the one
+    `install` command; the SCM holds it from then on. The scrub therefore has to
+    happen on the failure path too — `install` can raise rather than return
+    non-zero (a quarantined or locked wrapper exe is an OSError), and skipping
+    the scrub there leaves a Windows account password in a plaintext file
+    indefinitely, while setup reports failure so nobody thinks to look."""
+    winsw = tmp_path / "winsw.exe"
+    winsw.write_bytes(b"MZ")
+
+    monkeypatch.setattr(winservice, "service_exists", lambda name: False)
+
+    def refuse(cmd):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(winservice, "_run", refuse)
+
+    with pytest.raises(PermissionError):
+        winservice.install_service(
+            winsw, "PalServer", r"C:\srv\PalServer.exe", "-args", r"C:\srv",
+            user=".\\steve", password="MyWindowsPassword123", start=False,
+        )
+
+    _, xml = winservice.wrapper_paths(tmp_path, "PalServer")
+    assert "MyWindowsPassword123" not in xml.read_text(encoding="utf-8")
