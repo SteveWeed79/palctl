@@ -1094,7 +1094,9 @@ class Main(QMainWindow):
         self.dash = Dashboard()
         self.players = Players()
         self.console = Console()
-        self.editor = SettingsEditor(self.cfg.live_ini, self.cfg.default_ini)
+        self.editor = SettingsEditor(
+            self.cfg.live_ini, self.cfg.default_ini, self.cfg.savegames_dir
+        )
         self.config = ConfigTab(self.cfg)
 
         self._tab_icons = [
@@ -1170,7 +1172,9 @@ class Main(QMainWindow):
         old server root's ini."""
         current = self.tabs.currentIndex()
         old_editor, old_config = self.editor, self.config
-        self.editor = SettingsEditor(self.cfg.live_ini, self.cfg.default_ini)
+        self.editor = SettingsEditor(
+            self.cfg.live_ini, self.cfg.default_ini, self.cfg.savegames_dir
+        )
         self.config = ConfigTab(self.cfg)
         for index, widget, icon, label in (
             (3, self.editor, "tab-settings", "Settings"),

@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..inifile import PalSettings, ValueKind, is_blank, seed_from_default
+from ..serversetup import find_world_option, world_option_shadows
 from .widgets import NoScrollDoubleSpinBox, NoScrollSpinBox
 
 # Grouping is cosmetic but it's the difference between usable and a wall of 200
@@ -199,10 +200,20 @@ class MultiSelect(QWidget):
 class SettingsEditor(QWidget):
     saved = Signal()
 
-    def __init__(self, live_ini: Path, default_ini: Path) -> None:
+    def __init__(
+        self,
+        live_ini: Path,
+        default_ini: Path,
+        savegames_dir: Path | None = None,
+    ) -> None:
         super().__init__()
         self._live = live_ini
         self._default = default_ini
+        # Needed to spot a WorldOption.sav — see _advice. Derived from the ini's
+        # own location by default (…/Pal/Saved/Config/<OS>Server/ →
+        # …/Pal/Saved/SaveGames), so existing callers don't have to thread it
+        # through, and overridable for anyone who already holds the Config.
+        self._savegames = savegames_dir or self._savegames_from(live_ini)
         self._settings: PalSettings | None = None
         self._widgets: dict[str, QWidget] = {}
 
@@ -232,6 +243,16 @@ class SettingsEditor(QWidget):
 
         self.reload()
 
+    @staticmethod
+    def _savegames_from(live_ini: Path) -> Path:
+        """…/Pal/Saved/Config/<OS>Server/PalWorldSettings.ini → …/Pal/Saved/SaveGames.
+        Falls back to a path that simply won't exist if the ini is somewhere
+        unexpected, which reads as "no WorldOption.sav" — the quiet answer."""
+        parents = live_ini.resolve().parents
+        if len(parents) < 3:
+            return live_ini.with_name("SaveGames")
+        return parents[2] / "SaveGames"
+
     # ---------- load ----------
 
     def reload(self) -> None:
@@ -245,15 +266,38 @@ class SettingsEditor(QWidget):
             self._note.setText(f"Couldn't parse {self._live}: {e}")
             return
 
-        self._note.setText(
+        self._note.setText(self._advice())
+        self._build()
+
+    def _advice(self) -> str:
+        """The banner above the form. The WorldOption.sav half is only shown
+        when that file is actually there — it used to be printed to everyone as
+        a hedge, which is noise for the servers it doesn't apply to and far too
+        easy to skim past on the ones it does. It is the single most common
+        reason Palworld settings 'don't apply', and it fails silently: the edit
+        saves fine and the server ignores it."""
+        base = (
             "⚠️ Changes take effect on the next server restart — the game reads this "
             "file only at startup. Every save takes a timestamped .bak, because a "
-            "SteamCMD validate can wipe this file. Note: once a world exists, the game "
-            "copies most of these into that world's WorldOption.sav and reads them from "
-            "there — server name, ports and player caps still come from here, but a "
-            "changed rate may not apply until WorldOption.sav is removed."
+            "SteamCMD validate can wipe this file."
         )
-        self._build()
+        world_option = find_world_option(self._savegames)
+        if world_option is None:
+            return base
+
+        shadowed = world_option_shadows(
+            self._settings.keys() if self._settings else []
+        )
+        names = ", ".join(shadowed[:6])
+        more = f" (+{len(shadowed) - 6} more)" if len(shadowed) > 6 else ""
+        return (
+            base + "\n\n"
+            "🛑 This world has a WorldOption.sav, so the game reads its gameplay "
+            "settings from there and IGNORES this file for them — silently. "
+            f"Server name, ports, player cap and the REST API still come from here, "
+            f"but changes to {names}{more} will not apply until that file is "
+            f"removed or rebuilt from these values.\n{world_option}"
+        )
 
     def _offer_seed(self) -> None:
         if not self._default.exists():

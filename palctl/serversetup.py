@@ -45,6 +45,47 @@ def ensure_rest_api(
     settings.save(live_ini)
 
 
+# Gameplay settings the server copies into WorldOption.sav when a world is
+# created, and reads from there afterwards. Server-infrastructure settings
+# (ports, passwords, the REST API, the server name) keep coming from the ini.
+# Used only to say *which* edits a present WorldOption.sav will swallow, so the
+# warning is specific instead of "some settings might not apply".
+_WORLD_OPTION_PREFIXES = (
+    "Exp", "Pal", "Player", "Death", "Collection", "Enemy", "Build", "Drop",
+    "Guild", "BaseCamp", "Day", "Night", "Difficulty", "Randomizer",
+)
+
+
+def find_world_option(savegames_dir: Path) -> Path | None:
+    """The world's ``WorldOption.sav``, if one exists.
+
+    This is the single most common reason Palworld server settings "don't
+    apply". ``PalWorldSettings.ini`` is read when a world is first *created*;
+    after that the server copies the gameplay settings into ``WorldOption.sav``
+    inside the save folder and reads them from there. A world imported from
+    co-op or single-player always brings one along. Editing the ini then changes
+    nothing, with no error anywhere — the edit saves fine, the server just
+    ignores it.
+
+    Returns the first one found (a dedicated server has one world), or None.
+    """
+    try:
+        return next(iter(sorted(savegames_dir.rglob("WorldOption.sav"))), None)
+    except OSError:
+        return None
+
+
+def world_option_shadows(keys: list[str]) -> list[str]:
+    """Which of `keys` a present WorldOption.sav is likely to override.
+
+    Deliberately a heuristic on the name, not a hardcoded list: Palworld adds
+    settings every patch, and a stale list would quietly under-report. Wrong in
+    the safe direction — naming a setting that turns out to still work costs a
+    needless mention, missing one costs a user hours of "why won't this apply".
+    """
+    return [k for k in keys if k.startswith(_WORLD_OPTION_PREFIXES)]
+
+
 def restore_user_settings(live_ini: Path, backup_ini: Path) -> list[str]:
     """Put the user's pre-update values back over a live ini that a server
     update reset, and return the keys restored (empty when nothing changed).

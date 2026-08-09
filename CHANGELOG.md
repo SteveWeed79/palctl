@@ -56,7 +56,25 @@ default (see **Changed**). Neither was reachable by reading files.
   stayed in plaintext indefinitely, while setup reported failure, so nobody
   would think to look.
 
+### Added
+- **[Palworld server practices](docs/palworld-server-practices.md)** — the
+  documented behaviour of Palworld and SteamCMD that this release's fixes come
+  from, with sources, and where palctl agrees or deviates. Written so the
+  deviations are a choice on the record rather than an accident, and so the next
+  person doesn't re-derive it.
+
 ### Fixed
+- **The settings editor now tells you when `WorldOption.sav` is silently
+  overriding the file you're editing.** This is the single most common reason
+  Palworld settings "don't apply", and it fails without any error:
+  `PalWorldSettings.ini` is read when a world is *created*, after which the
+  server copies the gameplay settings into `WorldOption.sav` and reads them from
+  there — and a world imported from co-op or single-player always brings one
+  along. palctl used to mention this in a sentence shown to everybody, which is
+  noise on the servers it doesn't affect and easy to skim past on the ones where
+  it discards every edit. It now looks for the file and, only when one exists,
+  names the settings that will be ignored, the ones that still work (server
+  name, ports, player cap, the REST API), and the path.
 - **Updates no longer run `validate`, which is what was resetting your ini.**
   Every update path — the schedule, the GUI button, Discord `/update` — ran
   `app_update … validate`. `validate` is not an update: it is a full checksum of

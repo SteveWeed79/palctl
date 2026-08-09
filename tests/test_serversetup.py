@@ -155,3 +155,45 @@ def test_an_unreadable_backup_is_survivable(tmp_path):
     started again afterwards."""
     live = _write(tmp_path / "live.ini", _DEFAULTS)
     assert restore_user_settings(live, tmp_path / "missing.bak") == []
+
+
+# ---------------- WorldOption.sav ----------------
+#
+# The single most common reason Palworld settings "don't apply", and it fails
+# silently: PalWorldSettings.ini is read when a world is CREATED; afterwards the
+# server copies the gameplay settings into WorldOption.sav and reads them from
+# there. Worlds imported from co-op or single-player always bring one along.
+
+from palctl.serversetup import find_world_option, world_option_shadows  # noqa: E402
+
+
+def test_no_world_option_is_the_quiet_answer(tmp_path):
+    (tmp_path / "SaveGames").mkdir()
+    assert find_world_option(tmp_path / "SaveGames") is None
+
+
+def test_a_world_option_is_found_wherever_the_world_folder_is(tmp_path):
+    """The world folder is a generated GUID, so it has to be searched for."""
+    world = tmp_path / "SaveGames" / "0" / "A1B2C3D4"
+    world.mkdir(parents=True)
+    wo = world / "WorldOption.sav"
+    wo.write_bytes(b"\x00")
+    assert find_world_option(tmp_path / "SaveGames") == wo
+
+
+def test_a_missing_savegames_dir_is_not_an_error(tmp_path):
+    assert find_world_option(tmp_path / "nope") is None
+
+
+def test_shadowed_keys_are_the_gameplay_ones_not_the_server_ones():
+    keys = [
+        "ExpRate", "PalCaptureRate", "DeathPenalty", "BaseCampMaxNum",
+        "ServerName", "RESTAPIEnabled", "RESTAPIPort", "AdminPassword",
+        "PublicPort",
+    ]
+    shadowed = world_option_shadows(keys)
+    assert "ExpRate" in shadowed and "PalCaptureRate" in shadowed
+    # The settings palctl itself depends on keep coming from the ini — if these
+    # were shadowed, palctl could never reach the server at all.
+    for infra in ("ServerName", "RESTAPIEnabled", "RESTAPIPort", "AdminPassword"):
+        assert infra not in shadowed

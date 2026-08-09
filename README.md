@@ -351,6 +351,11 @@ bot** section, if you'd rather do it there.)
 > refuses commands from any guild but yours (`guild_id`, or whichever guild your
 > notification channel is in), so this is belt and braces — but it's free.
 
+Server-side gotchas that bite everyone running Palworld — why a Steam update
+resets your ini, why `WorldOption.sav` makes settings silently not apply, and
+why `validate` shouldn't be part of a routine update — are collected with
+sources in **[Palworld server practices](docs/palworld-server-practices.md)**.
+
 For the full walkthrough — inviting with the right **channel permissions**, the
 **role-ID vs user-ID** gotcha behind `/announce` saying *"Not allowed"*, every
 notification toggle, headless-Linux config, and troubleshooting — see the

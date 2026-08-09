@@ -152,3 +152,36 @@ def test_the_settings_editor_opens_an_ini_with_a_trailing_comment(app, tmp_path)
     editor._settings.set("ExpRate", 2.0)
     editor._settings.save(live)
     assert "; a note" in live.read_text(encoding="utf-8")
+
+
+def test_the_editor_warns_only_when_a_world_option_actually_exists(app, tmp_path):
+    """The WorldOption.sav caveat used to be printed to everyone as a hedge —
+    noise on the servers it doesn't apply to, and far too easy to skim past on
+    the ones where it silently discards every edit."""
+    from palctl.gui.settings_editor import SettingsEditor
+
+    root = tmp_path / "server"
+    cfg_dir = root / "Pal" / "Saved" / "Config" / "LinuxServer"
+    cfg_dir.mkdir(parents=True)
+    live = cfg_dir / "PalWorldSettings.ini"
+    live.write_text(
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        'OptionSettings=(ExpRate=3.000000,ServerName="mine",RESTAPIEnabled=True)\n',
+        encoding="utf-8",
+    )
+    default = root / "DefaultPalWorldSettings.ini"
+
+    quiet = SettingsEditor(live, default)
+    quiet.reload()
+    assert "WorldOption" not in quiet._note.text()
+
+    world = root / "Pal" / "Saved" / "SaveGames" / "0" / "A1B2C3D4"
+    world.mkdir(parents=True)
+    (world / "WorldOption.sav").write_bytes(b"\x00")
+
+    loud = SettingsEditor(live, default)
+    loud.reload()
+    note = loud._note.text()
+    assert "WorldOption.sav" in note
+    assert "ExpRate" in note, "it should name the settings that will be ignored"
+    assert "WorldOption.sav" in note.split("\n")[-1], "and give the path"
