@@ -102,8 +102,10 @@ PC, which is the situation most people are trying to get out of.
   backup** (with a pre-restore safety copy), start/stop/restart, and **update the
   server** (SteamCMD, with the ini guarded across `validate`)
 - **Settings editor**: parses the one-line `OptionSettings=(...)` blob into a
-  searchable, grouped, typed form. Preserves unknown keys from future patches.
-  Backs up the ini on every save, because SteamCMD `validate` wipes it.
+  searchable, grouped, typed form. Preserves unknown keys from future patches —
+  and everything else in the file too: your comments and any other `[Section]`
+  survive a save byte-for-byte. Backs up the ini on every save, because SteamCMD
+  `validate` wipes it.
 - Config: paths (with **Browse** and **Auto-detect**, and a live ✓/✗ that tells
   you the path is really a server before you save), watchdog thresholds,
   schedules, Discord — all entered in the UI — plus a one-click **Export
@@ -335,6 +337,13 @@ invite it to your server with the `bot` and `applications.commands` scopes → p
 the token into the GUI's **Config → Discord bot** tab → Save & reload. (The
 first-run wizard has the same fields under its optional **Set up the Discord
 bot** section, if you'd rather do it there.)
+
+> **One thing worth 20 seconds:** in the Developer Portal → **Bot**, turn
+> **Public Bot** *off*. It ships **on**, which lets anyone holding your client ID
+> invite your bot to a server of their own — where they have Manage Server, which
+> is what admin access falls back to until you set an admin role. palctl already
+> refuses commands from any guild but yours (`guild_id`, or whichever guild your
+> notification channel is in), so this is belt and braces — but it's free.
 
 For the full walkthrough — inviting with the right **channel permissions**, the
 **role-ID vs user-ID** gotcha behind `/announce` saying *"Not allowed"*, every

@@ -10,61 +10,18 @@ Installers for every release are on the
 
 ## [Unreleased]
 
-## [1.2.5.8] — 2026-08-09
+## [1.2.5.6] — 2026-08-09
 
-A third audit pass, this one through the settings editor, the ini parser, and
-the GUI's own lifecycle — the parts a user touches directly. Getting Qt running
-headless in CI made two of these observable for the first time.
+Three audit passes over the reliability of palctl's own machinery, prompted by a
+report of the app or the server "hanging up badly".
 
-### Fixed
-- **A comment in `PalWorldSettings.ini` no longer hides the whole file.** The
-  parser looked for the block's closing paren with a regex anchored to the end
-  of the file, so a single trailing line — a comment, a note to self — made a
-  perfectly good ini read as *"no OptionSettings block found"*. The settings
-  editor then told you the file was blank and offered to re-seed it from the
-  default, which would have destroyed the settings it had just failed to read.
-  Quieter and worse: `read_admin_password` swallows that same parse error and
-  returns empty, so the daemon couldn't authenticate to the REST API and
-  reported the server as up-but-unauthorised — for one comment line.
-- **A second `[Section]` in the ini is no longer silently corrupted.** The same
-  greedy match reached past the block to the last `)` anywhere in the file, so
-  another section landed *inside* the final option's value — and saving wrote
-  both back mangled. The block's end is now found by matching parens (honouring
-  quotes), and everything outside it — other sections, header comments, trailing
-  notes — round-trips byte-for-byte. A truncated file now yields the options
-  that survived instead of refusing outright.
-- **Quitting the GUI no longer crashes it.** Qt aborts the process when a
-  QThread is destroyed while still running, the tray's Quit went straight to
-  `QApplication.quit`, and the state poller loops forever by design — so it was
-  *always* running at quit time. Every exit ended in an abort (a "palctl-gui.exe
-  has stopped working" dialog on Windows), which is the last thing a user sees.
-  Worker threads now register themselves and are drained on `aboutToQuit`;
-  anything still busy after a short grace — an `/action/stop` can legitimately
-  be in a long call — is terminated rather than allowed to abort the app. The
-  poller also sleeps in slices so quit is immediate instead of waiting out the
-  poll interval.
-- **Settings-editor group headings show their ampersand.** Qt reads `&` in a
-  title as a mnemonic marker, so "Difficulty & rates" rendered as
-  "Difficulty _rates" (and likewise "Base & building", "Pals & eggs").
-- **A corrupt `config.json` can't crash-loop the daemon after all.** The
-  recovery path renames the bad file aside and carries on with defaults — but
-  the rename itself can fail (a Windows AV scanner or the search indexer holding
-  the file open is a `PermissionError`), and that escaped, killing the daemon
-  *before* `asyncio.run`, in the code written to prevent exactly that crash
-  loop. The quarantine is now best-effort, as it always claimed to be.
-
-### Changed
-- CI now runs the GUI's thread-lifecycle tests in the import-smoke job, which
-  already has a headless Qt. They need a real `QApplication`, so nothing else
-  could have caught the crash-on-quit above.
-
-## [1.2.5.7] — 2026-08-09
-
-A second audit pass, looking for the same shape of problem as 1.2.5.6 — places
-where palctl's own machinery works against it. Found one that made the daemon
-restart itself at the worst possible moment, one that could permanently lock
-you out of your own daemon, and one that let a stranger drive your server from
-Discord.
+The through-line: palctl drives things that can stop responding — SteamCMD,
+`sc.exe`/`systemctl`, `netsh`, `schtasks`, the Palworld REST API, its own worker
+threads — and in a dozen places it waited on them forever, or drew the wrong
+conclusion when they went quiet. Two could park the whole app indefinitely, one
+made the daemon restart itself at the worst possible moment, one let a stranger
+drive your server from Discord, and one turned a single comment in
+`PalWorldSettings.ini` into a file palctl couldn't read.
 
 ### Security
 - **The Discord bot now only takes commands from your own server.** Slash
@@ -81,48 +38,6 @@ Discord.
   front of the whole command tree rather than on each handler, so commands added
   later are covered automatically. If you have a channel configured there is
   nothing to do. The Discord guide now also says to turn Public Bot off.
-
-### Fixed
-- **The daemon no longer restarts itself whenever the game server goes down.**
-  `/healthz` is meant to answer "is this daemon alive", and the only thing that
-  acts on it — the Windows health task — responds by restarting the daemon. But
-  its liveness clock was stamped only on polls where the *Palworld REST API
-  answered*, so a down game server was indistinguishable from a wedged daemon:
-  60 seconds into any outage `/healthz` went 503, and ~15 minutes in the health
-  task restarted a completely healthy daemon. That is the worst possible moment
-  — auto-recovery is mid-flight, and the restart kills it, wipes the
-  `crash_restart_max_per_hour` budget that exists to stop restart loops, and can
-  leave the game server stopped between the stop and start of a restart cycle.
-  The clock is now stamped on every completed poll cycle, whatever the outcome.
-  Game-server reachability is still reported, as `alive`, and still acted on by
-  the watchdog and auto-recovery — where it belongs.
-- **An outage that spans a daemon restart is recoverable again.** Auto-recovery
-  refuses to touch a server it has never seen up — a sound guard, but the flag
-  lived only in memory, so a daemon that restarted *during* an outage came back
-  believing the server had never worked and would never recover it. It stayed
-  down until a human noticed. The flag is now persisted next to the Stop intent.
-- **An empty `daemon_token` file no longer locks you out permanently.** A
-  zero-byte token file made every caller mint a fresh random token that was
-  never written, so the daemon and the GUI could never agree again — 401s that
-  no restart fixes, reported by the GUI as a config-directory mismatch, which
-  sends you chasing a completely unrelated fix. Getting there took nothing
-  exotic: a crash or a full disk between creating the file and writing it, and
-  the write failure was swallowed by design, leaving the empty file behind. An
-  empty or whitespace-only token file is now treated as no token and replaced,
-  and a failed write cleans up after itself instead of poisoning every later run.
-- **Event history is pruned (30 days), like metrics already were.** Nothing ever
-  read this table back, and it grew forever — inside `sessions.db`, which is
-  snapshotted into *every* backup and mirrored off-site, so the bloat multiplied
-  across every retained copy. The durable audit trail is the rotating file log,
-  which every event is also written to.
-
-## [1.2.5.6] — 2026-08-09
-
-A hang-hunting pass. Every place palctl waited on something external without a
-bound is now bounded, and the two that could park the whole app indefinitely are
-fixed at the source. The theme throughout: palctl drives external tools
-(SteamCMD, `sc.exe`/`systemctl`, `netsh`, `schtasks`) that can stop responding,
-and "wait forever" was the default in each case.
 
 ### Fixed
 - **A stalled SteamCMD no longer wedges palctl permanently.** This was the worst
@@ -180,6 +95,78 @@ and "wait forever" was the default in each case.
   guarantee; teardown now waits a bounded time for those to unwind rather than
   blocking on the slowest external tool and being killed mid-teardown — which
   skipped closing the event store, the one step that writes to disk.
+- **The daemon no longer restarts itself whenever the game server goes down.**
+  `/healthz` is meant to answer "is this daemon alive", and the only thing that
+  acts on it — the Windows health task — responds by restarting the daemon. But
+  its liveness clock was stamped only on polls where the *Palworld REST API
+  answered*, so a down game server was indistinguishable from a wedged daemon:
+  60 seconds into any outage `/healthz` went 503, and ~15 minutes in the health
+  task restarted a completely healthy daemon. That is the worst possible moment
+  — auto-recovery is mid-flight, and the restart kills it, wipes the
+  `crash_restart_max_per_hour` budget that exists to stop restart loops, and can
+  leave the game server stopped between the stop and start of a restart cycle.
+  The clock is now stamped on every completed poll cycle, whatever the outcome.
+  Game-server reachability is still reported, as `alive`, and still acted on by
+  the watchdog and auto-recovery — where it belongs.
+- **An outage that spans a daemon restart is recoverable again.** Auto-recovery
+  refuses to touch a server it has never seen up — a sound guard, but the flag
+  lived only in memory, so a daemon that restarted *during* an outage came back
+  believing the server had never worked and would never recover it. It stayed
+  down until a human noticed. The flag is now persisted next to the Stop intent.
+- **An empty `daemon_token` file no longer locks you out permanently.** A
+  zero-byte token file made every caller mint a fresh random token that was
+  never written, so the daemon and the GUI could never agree again — 401s that
+  no restart fixes, reported by the GUI as a config-directory mismatch, which
+  sends you chasing a completely unrelated fix. Getting there took nothing
+  exotic: a crash or a full disk between creating the file and writing it, and
+  the write failure was swallowed by design, leaving the empty file behind. An
+  empty or whitespace-only token file is now treated as no token and replaced,
+  and a failed write cleans up after itself instead of poisoning every later run.
+- **Event history is pruned (30 days), like metrics already were.** Nothing ever
+  read this table back, and it grew forever — inside `sessions.db`, which is
+  snapshotted into *every* backup and mirrored off-site, so the bloat multiplied
+  across every retained copy. The durable audit trail is the rotating file log,
+  which every event is also written to.
+- **A comment in `PalWorldSettings.ini` no longer hides the whole file.** The
+  parser looked for the block's closing paren with a regex anchored to the end
+  of the file, so a single trailing line — a comment, a note to self — made a
+  perfectly good ini read as *"no OptionSettings block found"*. The settings
+  editor then told you the file was blank and offered to re-seed it from the
+  default, which would have destroyed the settings it had just failed to read.
+  Quieter and worse: `read_admin_password` swallows that same parse error and
+  returns empty, so the daemon couldn't authenticate to the REST API and
+  reported the server as up-but-unauthorised — for one comment line.
+- **A second `[Section]` in the ini is no longer silently corrupted.** The same
+  greedy match reached past the block to the last `)` anywhere in the file, so
+  another section landed *inside* the final option's value — and saving wrote
+  both back mangled. The block's end is now found by matching parens (honouring
+  quotes), and everything outside it — other sections, header comments, trailing
+  notes — round-trips byte-for-byte. A truncated file now yields the options
+  that survived instead of refusing outright.
+- **Quitting the GUI no longer crashes it.** Qt aborts the process when a
+  QThread is destroyed while still running, the tray's Quit went straight to
+  `QApplication.quit`, and the state poller loops forever by design — so it was
+  *always* running at quit time. Every exit ended in an abort (a "palctl-gui.exe
+  has stopped working" dialog on Windows), which is the last thing a user sees.
+  Worker threads now register themselves and are drained on `aboutToQuit`;
+  anything still busy after a short grace — an `/action/stop` can legitimately
+  be in a long call — is terminated rather than allowed to abort the app. The
+  poller also sleeps in slices so quit is immediate instead of waiting out the
+  poll interval.
+- **Settings-editor group headings show their ampersand.** Qt reads `&` in a
+  title as a mnemonic marker, so "Difficulty & rates" rendered as
+  "Difficulty _rates" (and likewise "Base & building", "Pals & eggs").
+- **A corrupt `config.json` can't crash-loop the daemon after all.** The
+  recovery path renames the bad file aside and carries on with defaults — but
+  the rename itself can fail (a Windows AV scanner or the search indexer holding
+  the file open is a `PermissionError`), and that escaped, killing the daemon
+  *before* `asyncio.run`, in the code written to prevent exactly that crash
+  loop. The quarantine is now best-effort, as it always claimed to be.
+
+### Changed
+- CI now runs the GUI's thread-lifecycle tests in the import-smoke job, which
+  already has a headless Qt. They need a real `QApplication`, so nothing else
+  could have caught the crash-on-quit above.
 
 ## [1.2.5.5] — 2026-07-19
 

@@ -318,6 +318,18 @@ ID (see [Step 5](#step-5--set-who-can-run-admin-commands)). Fix: paste a role ID
 you actually hold, or your own user ID, or blank the field to fall back to Manage
 Server.
 
+**Any command replies `This bot is tied to a different Discord server and won't
+take commands here.`**
+A different check, and a deliberate one: palctl answers commands from **one**
+guild only, so that a bot invited elsewhere can't drive your server (see
+[Step 5](#step-5--set-who-can-run-admin-commands)). You're seeing this because
+the guild you typed in isn't the one palctl considers home — most often because
+your notification `channel_id` lives in a *different* guild than the one you're
+using for commands. Fix: set `guild_id` to the guild you want to run commands
+from (Developer Mode on → right-click the server name → **Copy Server ID**),
+save, reload. The daemon log records every rejection with the guild ID it saw,
+which is the quickest way to confirm which is which.
+
 **Slash commands work, but automatic notifications never appear.**
 Almost always one of these, all of which fail silently:
 1. **Channel permissions** — bot lacks View Channel / Send Messages / **Embed
