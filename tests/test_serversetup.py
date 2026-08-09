@@ -197,3 +197,40 @@ def test_shadowed_keys_are_the_gameplay_ones_not_the_server_ones():
     # were shadowed, palctl could never reach the server at all.
     for infra in ("ServerName", "RESTAPIEnabled", "RESTAPIPort", "AdminPassword"):
         assert infra not in shadowed
+
+
+# ---------------- raids and the memory leak ----------------
+
+
+def test_raids_enabled_reads_the_setting(tmp_path):
+    from palctl.serversetup import raids_enabled
+
+    on = tmp_path / "on.ini"
+    on.write_text(
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        "OptionSettings=(bEnableInvaderEnemy=True)\n",
+        encoding="utf-8",
+    )
+    off = tmp_path / "off.ini"
+    off.write_text(
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        "OptionSettings=(bEnableInvaderEnemy=False)\n",
+        encoding="utf-8",
+    )
+    assert raids_enabled(on) is True
+    assert raids_enabled(off) is False
+
+
+def test_raids_enabled_is_none_when_it_cannot_be_determined(tmp_path):
+    """Tri-state on purpose: "couldn't read the ini" must never be reported to
+    the admin as "raids are on" — that's advice based on nothing."""
+    from palctl.serversetup import raids_enabled
+
+    assert raids_enabled(tmp_path / "missing.ini") is None
+
+    no_key = tmp_path / "nokey.ini"
+    no_key.write_text(
+        "[/Script/Pal.PalGameWorldSettings]\nOptionSettings=(ExpRate=1.000000)\n",
+        encoding="utf-8",
+    )
+    assert raids_enabled(no_key) is None

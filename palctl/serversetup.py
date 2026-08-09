@@ -56,6 +56,35 @@ _WORLD_OPTION_PREFIXES = (
 )
 
 
+# Appended to memory warnings when raids are still on. Sourced, because it is
+# advice about someone else's game and should be traceable: multiple independent
+# hosting operators report that Palworld's scripted invader waves are the part
+# of the leak that never gets cleaned up, and that turning them off roughly
+# halves how fast RAM climbs. See docs/palworld-server-practices.md.
+RAIDS_HINT = (
+    " Raids (`bEnableInvaderEnemy`) are still enabled — their spawned waves are "
+    "widely reported as the biggest single contributor to Palworld's memory "
+    "leak, and turning them off roughly halves how fast memory climbs. It is a "
+    "gameplay change, so palctl won't make it for you: it's in the settings "
+    "editor under Combat."
+)
+
+
+def raids_enabled(live_ini: Path) -> bool | None:
+    """Is `bEnableInvaderEnemy` on? None when it can't be determined.
+
+    Deliberately tri-state: "we couldn't read the ini" must not be reported to
+    the admin as "raids are on", which would be advice based on nothing.
+    """
+    try:
+        value = PalSettings.load(live_ini).get("bEnableInvaderEnemy")
+    except (OSError, ValueError):
+        return None
+    if value is None:
+        return None
+    return bool(value)
+
+
 def find_world_option(savegames_dir: Path) -> Path | None:
     """The world's ``WorldOption.sav``, if one exists.
 

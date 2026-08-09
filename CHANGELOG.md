@@ -83,10 +83,16 @@ default (see **Changed**). Neither was reachable by reading files.
   or be pushed out by one.
 
 ### Changed
-- The settings editor now explains `bEnableInvaderEnemy`. Turning raids off is
-  the most widely-recommended companion to scheduled restarts for the memory
-  leak — the two together hold a server steady far better than restarts alone —
-  and a memory-leak-focused tool had nowhere that said so.
+- **palctl now points at raids when memory is climbing.** Palworld's scripted
+  invader waves spawn enemies the server never cleans up; operators
+  consistently report RAM climbing at roughly half the rate with
+  `bEnableInvaderEnemy=False`, making it the most-recommended companion to
+  scheduled restarts. A memory-leak-focused tool had nowhere that said so. The
+  settings editor now explains it, and the leak forecast — the moment you're
+  actually thinking about memory — appends the suggestion, but only when raids
+  are on and only when palctl could genuinely read the setting. palctl does not
+  change it for you: raids are game content, and the evidence is operator
+  experience rather than vendor guidance.
 - **The settings editor now tells you when `WorldOption.sav` is silently
   overriding the file you're editing.** This is the single most common reason
   Palworld settings "don't apply", and it fails without any error:

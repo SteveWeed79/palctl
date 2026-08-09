@@ -126,9 +126,21 @@ companion to restarts, not an alternative to them.
 strictly better than a fixed timer and is the right call. `bEnableInvaderEnemy`
 is already editable in the settings editor.
 
-The settings editor now says so, on `bEnableInvaderEnemy` itself — a
-memory-leak-focused tool had nowhere that mentioned the other half of the
-accepted mitigation.
+The reported mechanism is specific rather than folklore: the scripted invader
+waves spawn enemies the server holds and never cleans up, and operators report
+RAM climbing at roughly half the rate with them off. Independent hosting
+providers agree on this; Pocketpair has not published anything on it, so treat
+the "halves it" figure as operator experience rather than a measurement.
+
+**palctl surfaces it, and deliberately does not act on it.** The settings editor
+explains it on `bEnableInvaderEnemy` itself, and the leak forecast — the one
+moment an admin is definitely thinking about memory — appends the suggestion
+*when raids are actually on*. palctl does **not** turn raids off by itself, at
+setup or anywhere else: raids are game content, the evidence is operator
+report rather than vendor guidance, and a server manager that silently changes
+how someone's game plays is the same class of mistake as a config editor that
+drops keys it didn't recognise. Surfacing it puts the decision where it
+belongs.
 
 **The account split matters more than the restart cadence.** If the server runs
 under a different Windows account than palctl (server as SYSTEM, palctl as you),

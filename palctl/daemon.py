@@ -886,16 +886,33 @@ class Daemon:
             )
         elif wd.predict_notify and not self._predict_warned:
             self._predict_warned = True
+            # The forecast is the one moment the admin is definitely thinking
+            # about the leak, so it's where the other half of the accepted
+            # mitigation belongs — not buried in a tooltip they'd have to go
+            # looking for. Only mentioned when raids are actually on.
             await self.bus.emit(
                 Event(
                     "watchdog",
                     f"🔮 On the current pace, memory hits the watchdog limit "
                     f"({wd.memory_limit_mb:,} MB) in {leak.fmt_minutes(ttl)}. "
                     "The watchdog will handle it — but now would be a good "
-                    "moment for a restart on your terms.",
+                    "moment for a restart on your terms."
+                    + await self._raids_hint(),
                     {"action": "forecast", "minutes_to_limit": round(ttl)},
                 )
             )
+
+    async def _raids_hint(self) -> str:
+        """RAIDS_HINT when raids are on, empty otherwise. Never raises and never
+        guesses: an unreadable ini says nothing rather than giving the admin
+        advice about a setting palctl couldn't actually read."""
+        from .serversetup import RAIDS_HINT, raids_enabled
+
+        try:
+            on = await asyncio.to_thread(raids_enabled, self.cfg.live_ini)
+        except Exception:
+            return ""
+        return RAIDS_HINT if on else ""
 
     # ---------- localhost API for the GUI ----------
 

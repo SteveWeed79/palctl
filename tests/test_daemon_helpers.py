@@ -1062,3 +1062,31 @@ def test_an_inconclusive_account_check_does_not_burn_the_one_shot():
         import importlib
 
         importlib.reload(daemon_mod.procs)
+
+
+def test_the_raids_hint_appears_only_when_raids_are_on(tmp_path):
+    """It's advice about someone's gameplay, attached to the leak forecast —
+    the one moment they're definitely thinking about memory. It must not fire
+    when raids are already off, or when palctl couldn't read the ini."""
+    d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+    d.cfg = daemon_mod.Config()
+    d.cfg.server_root = str(tmp_path)
+    ini = d.cfg.live_ini
+    ini.parent.mkdir(parents=True, exist_ok=True)
+
+    ini.write_text(
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        "OptionSettings=(bEnableInvaderEnemy=True)\n",
+        encoding="utf-8",
+    )
+    assert "bEnableInvaderEnemy" in asyncio.run(d._raids_hint())
+
+    ini.write_text(
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        "OptionSettings=(bEnableInvaderEnemy=False)\n",
+        encoding="utf-8",
+    )
+    assert asyncio.run(d._raids_hint()) == ""
+
+    ini.unlink()
+    assert asyncio.run(d._raids_hint()) == "", "an unreadable ini must say nothing"
