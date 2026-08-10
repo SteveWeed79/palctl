@@ -241,6 +241,10 @@ def test_service_mode_with_password_registers_both_under_the_user(env):
     assert env.server_service_kwargs.get("user")  # .\<username>
     assert env.server_service_kwargs.get("password") == "hunter2"
     assert env.server_service_kwargs.get("stop_timeout") == "90 sec"
+    # ...and Manual, because a boot-service daemon is there to start it: the
+    # SCM starting PalServer regardless of intent is what made a deliberate
+    # Stop come back on its own after a reboot.
+    assert env.server_service_kwargs.get("start_mode") == "Manual"
 
 
 def test_rerun_leaves_an_already_correct_server_untouched(env, monkeypatch):
@@ -636,3 +640,31 @@ def test_an_unwritable_ini_does_not_sink_the_install(tmp_path):
     flow_mod._apply_raid_choice(cfg, plan, lines.append)
 
     assert any("Couldn't turn raids off" in line for line in lines)
+
+
+def test_server_service_start_mode_follows_the_daemon():
+    """Manual only when palctl itself starts at boot. A login-startup daemon
+    isn't there until somebody signs in, and with no background palctl at all
+    nothing would ever start a Manual service — both would strand the server."""
+    from palctl.setup_flow import server_service_start_mode
+
+    assert server_service_start_mode("service") == "Manual"
+    assert server_service_start_mode("login") == "Automatic"
+    assert server_service_start_mode("none") == "Automatic"
+    assert server_service_start_mode("") == "Automatic"
+
+
+def test_no_background_palctl_keeps_the_server_on_automatic(env):
+    """With no daemon running there is nothing to start a Manual service, so
+    the SCM has to keep doing it — the server must still come up after a
+    reboot."""
+    plan = _plan(
+        env.tmp_path, daemon_startup="none", register_server_service=True,
+    )
+    server_root = Path(plan.server_root)
+    server_root.mkdir(parents=True, exist_ok=True)
+    (server_root / "PalServer.exe").write_text("x", encoding="utf-8")
+
+    result, _ = env.run(plan)
+    assert result.ok is True
+    assert env.server_service_kwargs.get("start_mode") == "Automatic"

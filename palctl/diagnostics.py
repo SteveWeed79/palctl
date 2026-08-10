@@ -19,6 +19,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+from .client import DAEMON_PORT
 from .config import CONFIG_PATH, config_dir
 
 # The daemon's service name (see daemon.SERVICE_NAME) — inlined so this module
@@ -65,6 +66,39 @@ def _service_report() -> str:
     return "\n\n".join(blocks)
 
 
+def _decisions_report() -> str:
+    """What palctl decided, and why, straight from the running daemon.
+
+    The single most useful page in a bug report and the one a log tail buries:
+    an admin sending "it says my server is down and it isn't" is describing a
+    decision, not an event. Fetched over the local control API because only the
+    running daemon has it; a daemon that isn't running simply contributes a
+    note saying so, which is itself worth knowing.
+    """
+    try:
+        import httpx
+
+        from .localauth import TOKEN_HEADER, get_or_create_token
+
+        r = httpx.get(
+            f"http://127.0.0.1:{DAEMON_PORT}/decisions?n=200",
+            headers={TOKEN_HEADER: get_or_create_token()},
+            timeout=5.0,
+        )
+        r.raise_for_status()
+        rows = r.json().get("decisions", [])
+    except Exception as e:
+        return f"(the daemon did not answer, so no decisions could be read: {e})"
+    if not rows:
+        return "(the daemon has recorded no decisions yet)"
+    out = []
+    for d in rows:
+        when = datetime.fromtimestamp(d.get("last_at", 0)).isoformat(timespec="seconds")
+        times = f" x{d['count']}" if d.get("count", 1) > 1 else ""
+        out.append(f"{when}  {d.get('action', '?')}{times}: {d.get('why', '')}")
+    return "\n".join(out)
+
+
 def build_bundle(dest_zip: Path) -> Path:
     """Write a diagnostics zip to `dest_zip` and return it."""
     log_dir = config_dir() / "logs"
@@ -74,6 +108,8 @@ def build_bundle(dest_zip: Path) -> Path:
         # bundle from being written — the logs are the point.
         with contextlib.suppress(Exception):
             z.writestr("services.txt", _service_report())
+        with contextlib.suppress(Exception):
+            z.writestr("decisions.txt", _decisions_report())
         if CONFIG_PATH.exists():
             z.write(CONFIG_PATH, "config.json")
         if log_dir.is_dir():

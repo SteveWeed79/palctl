@@ -702,6 +702,60 @@ def test_update_available_quiet_when_current(tmp_path, monkeypatch):
     assert not any(e.kind == "update_available" for e in events)
 
 
+def test_the_build_comparison_is_kept_not_only_announced(tmp_path, monkeypatch):
+    """A version mismatch is the failure players hit before the admin does —
+    they're refused at the join screen while palctl correctly reports a healthy
+    server. An event scrolls away; /state has to be able to say "behind"."""
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path)
+    _patch_buildids(monkeypatch, installed="100", latest="200")
+
+    sched = sched_mod.Scheduler(cfg, FakeApi(), EventBus())
+    assert sched.update_status["state"] == "unknown"  # nothing checked yet
+    _run(sched.check_update_available())
+    assert sched.update_status["state"] == "behind"
+    assert sched.update_status["installed"] == "100"
+    assert sched.update_status["latest"] == "200"
+    assert sched.update_status["checked_at"]
+
+
+def test_a_current_server_records_current(tmp_path, monkeypatch):
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path)
+    _patch_buildids(monkeypatch, installed="100", latest="100")
+
+    sched = sched_mod.Scheduler(cfg, FakeApi(), EventBus())
+    _run(sched.check_update_available())
+    assert sched.update_status["state"] == "current"
+
+
+def test_a_blind_check_records_unknown_with_a_reason(tmp_path, monkeypatch):
+    """"Can't tell" must never render as "up to date" — that's how a server sits
+    on an old build for a week with nothing looking wrong."""
+    cfg = Config()
+    cfg.steamcmd_path = ""  # never configured
+    cfg.server_root = str(tmp_path)
+    sched = sched_mod.Scheduler(cfg, FakeApi(), EventBus())
+    _run(sched.check_update_available())
+    assert sched.update_status["state"] == "unknown"
+    assert sched.update_status["detail"]
+
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg.steamcmd_path = str(steam)
+    _patch_buildids(monkeypatch, installed=None, latest="200")
+    sched = sched_mod.Scheduler(cfg, FakeApi(), EventBus())
+    _run(sched.check_update_available())
+    assert sched.update_status["state"] == "unknown"
+    assert "appmanifest" in sched.update_status["detail"]
+
+
 # ---------------- manual start / stop (bot & GUI parity) ----------------
 
 

@@ -124,6 +124,8 @@
        color: var(--ink-2); }
   td:first-child { color: var(--ink); }
   th.num, td.num { text-align: right; }
+  .why { font-size: 13px; margin: 0 0 10px; }
+  .why.warn { color: var(--warn, #b45309); }
   .events { list-style: none; margin: 0; padding: 0; font-size: 13px; }
   .events li { padding: 4px 0; border-bottom: 1px solid var(--line);
                display: flex; gap: 10px; }
@@ -196,6 +198,11 @@
       <span class="op" id="op"></span></span>
   </header>
   <p id="err"></p>
+  <!-- What palctl decided, and why. The status badge says what *is*; this says
+       what palctl is doing about it — the half an admin can't infer, and the
+       reason "it says my server is down and it isn't" used to be a support
+       thread instead of a glance. -->
+  <p class="muted why" id="why" hidden></p>
 
   <section id="actions-sec" hidden>
     <h2>Actions</h2>
@@ -481,6 +488,20 @@ function render(state) {
   $("svc").textContent = (state.service || "UNKNOWN") +
     (alive ? " · REST API answering" : " · REST API not answering");
   $("op").textContent = state.operation ? `${state.operation} in progress…` : "";
+
+  // Only worth showing while something is off: with the server up and answering,
+  // "why" is noise. When it's down, it's the first thing anyone wants.
+  const why = $("why");
+  const behind = state.update && state.update.state === "behind";
+  const parts = [];
+  if (!alive && state.why) parts.push(state.why);
+  if (behind) parts.push(
+    `this server is on build ${state.update.installed}, Steam is serving ` +
+    `${state.update.latest} — players will be refused with a version mismatch ` +
+    "until it's updated");
+  why.hidden = parts.length === 0;
+  why.className = "muted why" + (behind ? " warn" : "");
+  why.textContent = parts.join(" · ");
 
   running = state.service === "RUNNING";
   $("actions-sec").hidden = false;

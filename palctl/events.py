@@ -40,7 +40,11 @@ from .config import config_dir
 
 @dataclass(frozen=True)
 class Event:
-    kind: str  # join | leave | levelup | server_up | server_down | watchdog | backup | error
+    # join | leave | levelup | server_up | server_down | watchdog | backup |
+    # info | error. "info" is an operator notice that isn't a problem yet (a
+    # settings file edited outside palctl): admins-only in /events, and
+    # deliberately not in DEFAULT_ALERT_KINDS — it must not wake anyone.
+    kind: str
     message: str
     data: dict[str, Any] = field(default_factory=dict)
     at: datetime = field(default_factory=lambda: datetime.now(UTC))

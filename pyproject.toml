@@ -58,3 +58,9 @@ testpaths = ["tests"]
 # sys.path and the in-tree `palctl` package can't be imported. Put it on the
 # path explicitly so the suite runs the same way everywhere.
 pythonpath = ["."]
+markers = [
+    # End-to-end scenarios against tests/sim: a real daemon subprocess driving a
+    # fake service manager and a fake Palworld server. Minutes, not seconds, so
+    # they're addressable on their own (`-m sim`) and skippable (`-m 'not sim'`).
+    "sim: end-to-end scenario against the simulated machine (slow)",
+]

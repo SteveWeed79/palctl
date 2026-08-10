@@ -79,6 +79,7 @@ def winsw_config_xml(
     appdata: str | None = None,
     description: str | None = None,
     stop_timeout: str = "30 sec",
+    start_mode: str = "Automatic",
 ) -> str:
     """
     The complete WinSW service definition. Pure — install just writes this file
@@ -99,6 +100,13 @@ def winsw_config_xml(
 
     <onfailure action="restart"> gives the same 'keep it up' behaviour the
     systemd unit's Restart=on-failure provides on Linux.
+
+    `start_mode` is Automatic for everything palctl owns of itself — the daemon
+    must be up before anyone signs in, or nothing watches the server. The game
+    server is the exception: when palctl runs as a boot service it registers
+    PalServer as **Manual** and starts it itself (daemon._restore_boot_intent),
+    so that a server somebody deliberately stopped stays stopped across a
+    reboot instead of the SCM bringing it back regardless of intent.
     """
     q = lambda s: escape(str(s), {'"': "&quot;"})  # noqa: E731  (tiny, local)
     lines = [
@@ -139,7 +147,7 @@ def winsw_config_xml(
     if appdata:
         lines.append(f'  <env name="APPDATA" value="{q(appdata)}"/>')
     lines += [
-        "  <startmode>Automatic</startmode>",
+        f"  <startmode>{escape(start_mode)}</startmode>",
         '  <onfailure action="restart" delay="5 sec"/>',
         # How long the wrapper waits on stop before killing the process. The
         # default suits the daemon; the GAME service gets longer (see
@@ -220,6 +228,7 @@ def config_is_current(
     user: str | None = None,
     appdata: str | None = None,
     stop_timeout: str = "30 sec",
+    start_mode: str = "Automatic",
 ) -> bool:
     """True when service ``name`` is already registered AND its on-disk WinSW
     config is byte-for-byte what we would write now — so a re-install would only
@@ -247,6 +256,7 @@ def config_is_current(
     desired = winsw_config_xml(
         name, exe, args, app_dir,
         user=user, password=None, appdata=appdata, stop_timeout=stop_timeout,
+        start_mode=start_mode,
     )
     return existing == desired
 
@@ -263,6 +273,7 @@ def install_service(
     appdata: str | None = None,
     start: bool = True,
     stop_timeout: str = "30 sec",
+    start_mode: str = "Automatic",
 ) -> None:
     """Register the service from a freshly written config, then optionally
     start it.
@@ -301,7 +312,7 @@ def install_service(
         winsw_config_xml(
             name, exe, args, app_dir,
             user=user, password=password, appdata=appdata,
-            stop_timeout=stop_timeout,
+            stop_timeout=stop_timeout, start_mode=start_mode,
         ),
         encoding="utf-8",
     )
@@ -326,7 +337,7 @@ def install_service(
                 winsw_config_xml(
                     name, exe, args, app_dir,
                     user=user, password=None, appdata=appdata,
-                    stop_timeout=stop_timeout,
+                    stop_timeout=stop_timeout, start_mode=start_mode,
                 ),
                 encoding="utf-8",
             )

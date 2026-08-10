@@ -10,6 +10,65 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+## [1.2.6.0] — 2026-08-10
+
+### Added
+- **palctl now records why it is doing nothing.** The event feed says what
+  happened; nothing said what palctl *decided* — and every hard-to-diagnose
+  report in this project has been palctl reasoning correctly and silently
+  (declining to recover a server it believed was meant to be stopped, holding
+  off during an operation, throttling after too many restarts). Each decision is
+  now kept with its reason and shown on `/state` (`why`, `decisions`) and a new
+  `/decisions` endpoint. Repeats collapse, so a five-hour outage reads as one
+  line with a count.
+- **A standing "is this server on Steam's current build?"** on `/state`, instead
+  of only a notification that scrolls away. A version mismatch is the failure
+  players hit before the admin does — refused at the join screen while every
+  palctl reading correctly says the server is healthy. "Couldn't tell" is
+  reported as its own state, never as "up to date".
+- **Drift detection for `PalWorldSettings.ini`.** palctl records what it wrote
+  and reports anything else — a Steam update putting defaults back, a hand edit,
+  a missing file — naming the settings that changed. The previous approach
+  guessed at the damage ("is the file blank?") and missed the variant that
+  actually happened. Losing the REST API settings is reported as urgent, because
+  the symptom (palctl reporting a healthy server as down) points nowhere near
+  that file. No values are stored, only hashes, so the snapshot can never leak
+  the admin password.
+
+### Fixed
+- **An externally stopped server could still be restarted, for up to two
+  seconds.** The decision "did somebody stop this?" was being made from the same
+  short-lived cache that backs the dashboard's status display. Stale is harmless
+  for *showing* a state and not for *deciding* one: with a short poll interval,
+  two consecutive polls could be served the same 2-second-old "RUNNING" reading
+  — long enough for palctl to conclude a server that had just been stopped by
+  hand was a crash, and restart it. The recovery path now always reads the
+  service manager fresh. Found by the new end-to-end scenarios, which is exactly
+  the class of bug they exist for.
+
+### Changed
+- **The 'what to do about a server that isn't answering' decision is now one
+  pure function** (`palctl/supervisor.py`) over one observation, instead of a
+  sequence of guard clauses reading eight flags on the daemon. Both recent bugs
+  in that area were ordering mistakes between those clauses. Same behaviour,
+  stated once, with the whole policy pinned as a table.
+- **End-to-end scenarios in CI.** `tests/sim` builds a fake machine — a Palworld
+  server that can hang (accept the connection and never answer), a service
+  manager that can be driven behind palctl's back or refuse to start, and a real
+  daemon subprocess driven through its own HTTP API. Nothing is patched. Every
+  failure this project has shipped was invisible to the unit suite and visible
+  here in minutes.
+- **The daemon's lifecycle CLI moved to its own module** (`palctl/daemoncli.py`):
+  installing, starting, healing and removing the daemon is a program that runs
+  once and exits, and it had been sharing a 2,200-line file with the one that
+  runs for weeks. No API change — every name is still reachable as
+  `daemon.install_service` and `python -m palctl.daemon` still runs the daemon,
+  both pinned by tests.
+- **A release whose CHANGELOG heading doesn't match its tag now fails**
+  (`scripts/check_changelog.py`, run before anything builds).
+  `docs/VERSIONING.md` has required that from the start; it drifted anyway,
+  because nothing checked.
+
 ## [1.2.5.7] — 2026-08-09
 
 Four audit passes over the reliability of palctl's own machinery, prompted by a
@@ -66,6 +125,33 @@ default (see **Changed**). Neither was reachable by reading files.
   person doesn't re-derive it.
 
 ### Fixed
+- **A stop palctl didn't make is now treated as a stop.** Auto-recovery decided
+  from a single signal — "the REST API stopped answering" — which cannot tell a
+  crash from an admin stopping the service. palctl only knew a stop was
+  deliberate when *it* did the stopping, so stopping the server any other way
+  (services.msc, `sc stop`, Task Manager) read as a crash and was undone within
+  seconds. The server behaved as though it could not be turned off; the only way
+  out was force-removing it. The service manager already knows the difference and
+  palctl already reads it: a crash leaves the service RUNNING with nothing
+  answering behind it, while a deliberate stop is the SCM reporting **STOPPED**.
+  palctl now recognises that (confirmed over several polls, since its own
+  restarts and the wrapper's `onfailure` both pass through STOPPED), records the
+  stop as the intent it is — so the daily restart and auto-update don't bring it
+  back later either — and says so. palctl's own Start undoes it.
+- **…and a reboot no longer undoes it.** The other half of the same complaint:
+  the game server was registered with the Windows startmode `Automatic`, so the
+  service manager started it at every boot regardless of what palctl — or the
+  admin — wanted. Stop the server on purpose, restart the machine, and it was
+  back. Setup now registers PalServer as **Manual** whenever palctl itself runs
+  as a boot service, and the daemon restores the recorded state at startup: a
+  server that should be running is started, a server you stopped stays stopped.
+  Nothing changes where palctl isn't there to do it — login startup, or no
+  background palctl, keeps `Automatic`, because the SCM is then the only thing
+  that can bring the server up. Restricted to actual boots, so the installer
+  bouncing the daemon on upgrade (or the health task restarting it mid-outage)
+  still can't start a server behind your back, and a server that *fails* to
+  start at boot is reported as that rather than mistaken for someone stopping
+  it. Existing installs pick this up the next time setup runs.
 - **The account-split warning could be silenced permanently by one bad look.**
   If the Palworld server runs under a different Windows account than palctl,
   palctl can't read its memory — it lands on the idle launcher, and the leak
