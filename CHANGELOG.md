@@ -56,6 +56,12 @@ Installers for every release are on the
   daemon subprocess driven through its own HTTP API. Nothing is patched. Every
   failure this project has shipped was invisible to the unit suite and visible
   here in minutes.
+- **The daemon's lifecycle CLI moved to its own module** (`palctl/daemoncli.py`):
+  installing, starting, healing and removing the daemon is a program that runs
+  once and exits, and it had been sharing a 2,200-line file with the one that
+  runs for weeks. No API change — every name is still reachable as
+  `daemon.install_service` and `python -m palctl.daemon` still runs the daemon,
+  both pinned by tests.
 - **A release whose CHANGELOG heading doesn't match its tag now fails**
   (`scripts/check_changelog.py`, run before anything builds).
   `docs/VERSIONING.md` has required that from the start; it drifted anyway,

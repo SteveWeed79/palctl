@@ -62,3 +62,36 @@ def test_bundle_ok_with_nothing_to_include(tmp_path, monkeypatch):
     out = diag.build_bundle(tmp_path / "d.zip")
     with zipfile.ZipFile(out) as z:
         assert "system.txt" in z.namelist()  # summary is always there
+
+
+def test_bundle_includes_the_decision_log(tmp_path, monkeypatch):
+    """The most useful page in a bug report: an admin writing "it says my
+    server is down and it isn't" is describing a decision, not an event."""
+    cfgdir = tmp_path / "palctl"
+    (cfgdir / "logs").mkdir(parents=True)
+    monkeypatch.setattr(diag, "config_dir", lambda: cfgdir)
+    monkeypatch.setattr(diag, "CONFIG_PATH", cfgdir / "config.json")
+
+    monkeypatch.setattr(
+        diag,
+        "_decisions_report",
+        lambda: "2026-08-10T10:00:00  ignore x812: auto-restart on crash is off",
+    )
+    out = diag.build_bundle(tmp_path / "d.zip")
+    with zipfile.ZipFile(out) as z:
+        assert "decisions.txt" in z.namelist()
+        assert "auto-restart on crash is off" in z.read("decisions.txt").decode("utf-8")
+
+
+def test_a_daemon_that_isnt_running_still_produces_a_bundle(tmp_path, monkeypatch):
+    """"Nobody answered" is itself worth knowing, and must never cost the
+    bundle — the logs are the point."""
+    cfgdir = tmp_path / "palctl"
+    (cfgdir / "logs").mkdir(parents=True)
+    monkeypatch.setattr(diag, "config_dir", lambda: cfgdir)
+    monkeypatch.setattr(diag, "CONFIG_PATH", cfgdir / "config.json")
+    monkeypatch.setattr(diag, "DAEMON_PORT", 1)  # nothing listens there
+
+    out = diag.build_bundle(tmp_path / "d.zip")
+    with zipfile.ZipFile(out) as z:
+        assert "did not answer" in z.read("decisions.txt").decode("utf-8")
