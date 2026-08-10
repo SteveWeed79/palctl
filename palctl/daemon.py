@@ -1604,8 +1604,15 @@ class Daemon:
 #
 # Imported last, and importing nothing from here at *its* module level, so there
 # is no cycle: by the time daemoncli runs, this module is fully defined.
+# `_stop_daemon_process` is underscore-private by convention and re-exported
+# anyway: the install-lifecycle CI job calls `daemon._stop_daemon_process()`
+# directly, and leaving it behind broke that job on the first push. A name with
+# a caller outside the package is part of the surface whatever it's spelled
+# like. tests/test_daemoncli.py reads ci.yml and checks every name it uses, so
+# the next move can't reopen this.
 from .daemoncli import (  # noqa: E402,F401  (re-exported on purpose)
     SERVICE_NAME,
+    _stop_daemon_process,
     disable_background_startup,
     install_service,
     install_startup,

@@ -36,6 +36,27 @@ def test_the_runtime_names_stay_importable_from_palctl_daemon():
         assert getattr(daemon_mod, name) is getattr(cli_mod, name), name
 
 
+def test_every_name_ci_calls_on_palctl_daemon_still_exists():
+    """Read the workflow and check what it actually calls.
+
+    The hand-written list above missed `_stop_daemon_process`, because it looks
+    private — and the install-lifecycle job calls it directly, so the split broke
+    that job on its first push. A name with a caller outside the package is part
+    of the surface whatever it is spelled like, and the only list that can't
+    drift is the one derived from the call sites."""
+    import re
+    from pathlib import Path
+
+    import palctl.daemon as daemon_mod
+
+    ci = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml"
+    calls = re.findall(r"\bdaemon\.([A-Za-z_][A-Za-z0-9_]*)\s*\(", ci.read_text(encoding="utf-8"))
+    used = set(calls)
+    assert used, "found no daemon.<name>() calls in ci.yml — has the pattern changed?"
+    missing = sorted(n for n in used if not hasattr(daemon_mod, n))
+    assert not missing, f"ci.yml calls daemon.{missing} but palctl.daemon has no such name"
+
+
 # ---------------- frozen service target ----------------
 
 
