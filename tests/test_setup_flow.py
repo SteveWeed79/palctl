@@ -540,3 +540,99 @@ def test_blanked_ini_is_restored_even_when_steamcmd_raises(env, monkeypatch):
     # The finally block restored the tuned ini from the pre-update backup.
     assert live_ini.read_text(encoding="utf-8") == "GOOD SETTINGS"
     assert any("restored it from the pre-update backup" in ln for ln in lines)
+
+
+# ---------------- raids ----------------
+#
+# The only wizard choice that changes how the GAME plays rather than how palctl
+# is installed, so it gets its own section, its own reasoning, and — crucially —
+# only ever acts when ticked.
+
+from palctl import setup_flow as flow_mod  # noqa: E402
+from palctl.inifile import PalSettings  # noqa: E402
+
+
+def _cfg_with_ini(tmp_path, raids: str) -> Config:
+    cfg = Config()
+    cfg.server_root = str(tmp_path / "server")
+    cfg.live_ini.parent.mkdir(parents=True, exist_ok=True)
+    cfg.live_ini.write_text(
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        f"OptionSettings=(bEnableInvaderEnemy={raids},RESTAPIEnabled=True)\n",
+        encoding="utf-8",
+    )
+    return cfg
+
+
+def _raids(cfg) -> object:
+    return PalSettings.load(cfg.live_ini).get("bEnableInvaderEnemy")
+
+
+def test_setup_plan_does_not_opt_you_into_disabling_raids():
+    assert SetupPlan.__dataclass_fields__["disable_raids"].default is False
+
+
+def test_raids_are_left_exactly_as_they_were_when_unticked(tmp_path):
+    """Unticked must mean "change nothing" — not "write True". An admin who had
+    already turned raids off must not have setup quietly turn them back on."""
+    cfg = _cfg_with_ini(tmp_path, "False")
+    plan = SetupPlan(
+        server_root=cfg.server_root, steamcmd_path="", api_port=8212,
+        password="x", install_server=False, install_vcredist=False,
+        register_server_service=False, daemon_startup="none",
+        service_name="PalServer",
+    )
+    assert plan.disable_raids is False
+
+    flow_mod._apply_raid_choice(cfg, plan, lambda line: None)
+
+    assert _raids(cfg) is False, "an existing choice must survive setup"
+
+
+def test_ticking_the_box_turns_raids_off_and_says_so(tmp_path):
+    cfg = _cfg_with_ini(tmp_path, "True")
+    plan = SetupPlan(
+        server_root=cfg.server_root, steamcmd_path="", api_port=8212,
+        password="x", install_server=False, install_vcredist=False,
+        register_server_service=False, daemon_startup="none",
+        service_name="PalServer",
+        disable_raids=True,
+    )
+    lines: list[str] = []
+
+    flow_mod._apply_raid_choice(cfg, plan, lines.append)
+
+    assert _raids(cfg) is False
+    assert any("Raids turned off" in line for line in lines)
+
+
+def test_other_settings_are_untouched_when_raids_are_disabled(tmp_path):
+    cfg = _cfg_with_ini(tmp_path, "True")
+    plan = SetupPlan(
+        server_root=cfg.server_root, steamcmd_path="", api_port=8212,
+        password="x", install_server=False, install_vcredist=False,
+        register_server_service=False, daemon_startup="none",
+        service_name="PalServer",
+        disable_raids=True,
+    )
+    flow_mod._apply_raid_choice(cfg, plan, lambda line: None)
+    assert PalSettings.load(cfg.live_ini).get("RESTAPIEnabled") is True
+
+
+def test_an_unwritable_ini_does_not_sink_the_install(tmp_path):
+    """Optional tuning must never fail setup — the server is perfectly usable
+    with raids on."""
+    cfg = Config()
+    cfg.server_root = str(tmp_path / "missing")
+    plan = SetupPlan(
+        server_root=cfg.server_root, steamcmd_path="", api_port=8212,
+        password="x", install_server=False, install_vcredist=False,
+        register_server_service=False, daemon_startup="none",
+        service_name="PalServer",
+        disable_raids=True,
+    )
+    lines: list[str] = []
+
+    flow_mod._apply_raid_choice(cfg, plan, lines.append)
+
+    assert any("Couldn't turn raids off" in line for line in lines)

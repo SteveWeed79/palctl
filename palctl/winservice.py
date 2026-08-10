@@ -167,10 +167,28 @@ def wrapper_paths(cache_dir: Path, name: str) -> tuple[Path, Path]:
 # ---------------- runners (Windows) ----------------
 
 
+# WinSW's install/uninstall/start/stop drive the SCM, which can sit in
+# START_PENDING or STOP_PENDING for a long time on a sick service. Bounded so a
+# wedged SCM shows up as a failed step the caller can report, rather than a
+# setup wizard or CLI that never comes back.
+WINSW_TIMEOUT = 120.0
+
+
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        cmd, capture_output=True, text=True, creationflags=_NO_WINDOW
-    )
+    """Run a WinSW/sc command, bounded. A timeout is reported as a non-zero
+    result rather than an exception, so it flows into the existing failure
+    handling — TimeoutExpired is a SubprocessError, not an OSError, so the
+    callers' `except OSError` would not have caught it."""
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, creationflags=_NO_WINDOW,
+            timeout=WINSW_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            cmd, returncode=1, stdout="",
+            stderr=f"the service command timed out after {WINSW_TIMEOUT:.0f}s",
+        )
 
 
 def service_exists(name: str) -> bool:
@@ -287,20 +305,31 @@ def install_service(
         ),
         encoding="utf-8",
     )
-    _run([str(svc_exe), "install"])
-    if user and password:
-        # Registration is done; the SCM now holds the password (encrypted, in
-        # LSA). Rewrite the config without it so no plaintext account password
-        # outlives the one command that needed it. WinSW reads <serviceaccount>
-        # only at install, so the scrubbed file stays fully functional.
-        svc_xml.write_text(
-            winsw_config_xml(
-                name, exe, args, app_dir,
-                user=user, password=None, appdata=appdata,
-                stop_timeout=stop_timeout,
-            ),
-            encoding="utf-8",
-        )
+    try:
+        _run([str(svc_exe), "install"])
+    finally:
+        if user and password:
+            # Registration is done (or failed); either way the password's one
+            # job is over — the SCM holds it from here, encrypted in LSA.
+            # Rewrite the config without it so no plaintext account password
+            # outlives the single command that needed it. WinSW reads
+            # <serviceaccount> only at install, so the scrubbed file stays
+            # fully functional.
+            #
+            # In a `finally` because the failure path is the one that matters:
+            # `install` can raise rather than return non-zero (a quarantined or
+            # locked wrapper exe is an OSError), and on that path the scrub was
+            # skipped entirely — leaving a Windows account password sitting in
+            # a plaintext file indefinitely, with setup reporting failure so
+            # nobody would think to look.
+            svc_xml.write_text(
+                winsw_config_xml(
+                    name, exe, args, app_dir,
+                    user=user, password=None, appdata=appdata,
+                    stop_timeout=stop_timeout,
+                ),
+                encoding="utf-8",
+            )
     if start:
         _run([str(svc_exe), "start"])
 

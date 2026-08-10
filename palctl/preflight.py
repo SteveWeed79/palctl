@@ -28,6 +28,8 @@ DEFAULT_NEED_GB = 10.0
 
 # Microsoft's evergreen link to the latest VC++ x64 redistributable.
 VCREDIST_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+# Cap on the silent vcredist install — see ensure_vcredist for why.
+VCREDIST_INSTALL_TIMEOUT = 300.0
 
 _ONE_GB = 1_073_741_824
 
@@ -270,8 +272,22 @@ def install_vcredist(on_line=None) -> int:
             )
         if on_line:
             on_line("Installing the Visual C++ runtime…")
-        return subprocess.run(
-            [str(path), "/install", "/quiet", "/norestart"]
-        ).returncode
+        try:
+            # Bounded: a quiet MSI that blocks on another installer holding the
+            # Windows Installer mutex would otherwise park the setup wizard on
+            # this line with no output and no way out but killing the app. Five
+            # minutes is far more than this package needs.
+            return subprocess.run(
+                [str(path), "/install", "/quiet", "/norestart"],
+                timeout=VCREDIST_INSTALL_TIMEOUT,
+            ).returncode
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                "The Visual C++ runtime installer did not finish within "
+                f"{VCREDIST_INSTALL_TIMEOUT / 60:.0f} minutes. Another install may "
+                "be running — finish or cancel it (check Windows Update too), then "
+                "retry. You can also install 'Microsoft Visual C++ Redistributable "
+                "(x64)' by hand and re-run setup."
+            ) from None
     finally:
         path.unlink(missing_ok=True)

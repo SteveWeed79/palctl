@@ -67,3 +67,17 @@ def test_install_without_start_does_not_touch_the_running_unit(tmp_path, monkeyp
 
     assert not any(c[:2] == ["systemctl", "restart"] for c in calls)
     assert not any(c[:2] == ["systemctl", "start"] for c in calls)
+
+
+def test_a_hung_systemctl_reads_as_failure_not_an_exception(monkeypatch):
+    """systemctl blocks on the job it queues; a unit with a stuck start/stop job
+    holds the call open indefinitely. A timeout has to surface as a non-zero
+    result, since callers check returncode and never catch SubprocessError."""
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        assert kwargs.get("timeout") == systemd.SYSTEMCTL_TIMEOUT
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert systemd._run(["systemctl", "start", "palctl"]).returncode != 0

@@ -15,12 +15,15 @@ download and the process runners are thin wrappers over them.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 import zipfile
 from collections.abc import Callable
 from datetime import datetime
@@ -35,6 +38,85 @@ LineSink = Callable[[str], None]
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _STEAMCMD_BINARIES = ("steamcmd.exe", "steamcmd.sh")
+
+# How long a SteamCMD run may go without printing ANYTHING before we call it
+# hung and kill it.
+#
+# A total time cap is the wrong tool here: a first install or a validate over a
+# multi-GB depot on a slow line is legitimately long, and any cap generous
+# enough for that is too generous to be a useful hang detector. But SteamCMD is
+# extremely chatty while it works — it reprints its "Update state (0x61)
+# downloading, progress: …" line continuously — so *silence* is the reliable
+# signal. Sustained silence means the run is wedged (the classic ones: a depot
+# server that accepted the connection and stopped sending, or steamcmd blocking
+# on a Steam Guard / login prompt nobody will ever answer).
+#
+# Twenty minutes, not ten, because the two errors are not symmetric. A real
+# wedge is permanent, so waiting an extra ten minutes to notice costs ten
+# minutes, once. Killing a *healthy* run costs the user a failed install — and
+# SteamCMD does have a legitimately quiet stretch: the commit/verify phase after
+# a large depot downloads can sit without printing while it moves files, which
+# on a slow disk is minutes. Erring long keeps the hang protection while making
+# a false positive on a slow first install unlikely.
+#
+# This matters far more than a tidy error message. The daemon runs updates while
+# holding the one server-operation lock, and it stops the game server *before*
+# the update. A SteamCMD that never exits therefore leaves the server down and
+# the lock held forever: the watchdog, auto-recovery, scheduled restarts and
+# every Start button in the GUI, dashboard and Discord bot all answer "busy:
+# update is in progress" until someone restarts the daemon by hand.
+STEAMCMD_STALL_SECONDS = 1200.0
+
+# Metadata queries (app_info_print) are a small round-trip to Steam, so they get
+# a plain overall cap rather than a stall timer.
+STEAMCMD_META_SECONDS = 120.0
+
+
+class SteamCmdStalled(RuntimeError):
+    """SteamCMD produced no output for the stall timeout and was killed."""
+
+
+def _stall_duration(seconds: float) -> str:
+    """'10 minutes' / '45 seconds' — so the message reads right for a short
+    timeout too (tests use one), instead of '0 minutes'."""
+    if seconds >= 120:
+        return f"{seconds / 60:.0f} minutes"
+    return f"{seconds:.0f} seconds"
+
+
+# How long to spend reaping a killed SteamCMD before giving up and moving on.
+# Bounded on purpose: see _kill_async.
+_REAP_SECONDS = 10.0
+
+
+async def _kill_async(proc: asyncio.subprocess.Process) -> None:
+    """Kill a hung SteamCMD — the whole tree — and reap it. Never raises and
+    never blocks indefinitely; both properties matter, because every caller is
+    on the recovery path out of a hang and must not acquire a new one.
+
+    Two traps here, and each on its own is enough to hang the daemon forever:
+
+    1. ``proc.kill()`` signals only the process we launched. SteamCMD is a
+       launcher: ``steamcmd.sh`` re-execs ``linux32/steamcmd``, and the Windows
+       build spawns helpers. Those children inherit our stdout pipe and keep it
+       open after the parent dies — so the reader never sees EOF.
+    2. asyncio's subprocess transport only completes ``wait()`` once the process
+       has exited *and* its pipes have closed. With (1) unfixed, ``await
+       proc.wait()`` after a kill blocks for as long as the orphan lives.
+
+    So: kill the descendants first (which releases the pipes), then our own
+    child, and bound the wait anyway in case something still holds on.
+    """
+    if proc.returncode is not None:
+        return
+    from . import procs
+
+    with contextlib.suppress(Exception):
+        await procs.kill_descendants_async(proc.pid, timeout=_REAP_SECONDS)
+    with contextlib.suppress(ProcessLookupError, OSError):
+        proc.kill()
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(proc.wait(), timeout=_REAP_SECONDS)
 
 
 def default_steamcmd_url() -> str:
@@ -119,8 +201,19 @@ def installed_buildid(server_root: str | Path, app_id: str = APP_ID) -> str | No
         return None
 
 
-async def latest_buildid(steamcmd: str | Path, app_id: str = APP_ID) -> str | None:
-    """Ask Steam for the latest public build id. Best-effort; None on any failure."""
+async def latest_buildid(
+    steamcmd: str | Path,
+    app_id: str = APP_ID,
+    *,
+    timeout: float = STEAMCMD_META_SECONDS,
+) -> str | None:
+    """Ask Steam for the latest public build id. Best-effort; None on any failure.
+
+    Bounded: this runs from the daemon's six-hourly update check, and a steamcmd
+    that hangs on the metadata query (Steam unreachable, or a login prompt) would
+    otherwise park a child process forever and stop that loop from ever ticking
+    again. On timeout we kill it and report "don't know", which is exactly how
+    every other failure here is already handled."""
     cmd = [
         str(steamcmd), "+login", "anonymous",
         "+app_info_update", "1", "+app_info_print", str(app_id), "+quit",
@@ -130,8 +223,12 @@ async def latest_buildid(steamcmd: str | Path, app_id: str = APP_ID) -> str | No
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             creationflags=_NO_WINDOW,
         )
-        out, _ = await proc.communicate()
     except OSError:
+        return None
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        await _kill_async(proc)
         return None
     return parse_latest_buildid(out.decode(errors="replace"))
 
@@ -231,10 +328,16 @@ def run_update(
     app_id: str = APP_ID,
     validate: bool = True,
     on_line: LineSink | None = None,
+    stall_timeout: float = STEAMCMD_STALL_SECONDS,
 ) -> int:
     """
     Run SteamCMD to completion, streaming stdout lines to ``on_line``. Returns
     the exit code. Blocking — call it off any UI thread (the GUI does).
+
+    Raises :class:`SteamCmdStalled` if SteamCMD prints nothing for
+    ``stall_timeout`` seconds. Without it the reading loop below blocks forever
+    on a wedged SteamCMD, and the setup wizard sits on "Installing the server…"
+    with no way forward but killing the app.
     """
     cmd = update_command(steamcmd, install_dir, app_id, validate=validate)
     with subprocess.Popen(
@@ -246,10 +349,49 @@ def run_update(
         creationflags=_NO_WINDOW,
     ) as proc:
         assert proc.stdout is not None
-        for line in proc.stdout:
-            if on_line:
-                on_line(line.rstrip())
-        return proc.wait()
+        # The readline() below can't be interrupted, so the stall guard is a
+        # side thread that kills the process — which closes stdout, which is
+        # what actually breaks the loop.
+        last_output = [time.monotonic()]
+        finished = threading.Event()
+        stalled = threading.Event()
+
+        def _guard() -> None:
+            while not finished.wait(min(5.0, stall_timeout / 4)):
+                if time.monotonic() - last_output[0] < stall_timeout:
+                    continue
+                stalled.set()
+                # Descendants first: one of them holding the inherited stdout
+                # pipe would keep the read loop below running forever, which is
+                # the hang this guard exists to break. See procs.kill_descendants.
+                from . import procs
+
+                with contextlib.suppress(Exception):
+                    procs.kill_descendants(proc.pid, timeout=_REAP_SECONDS)
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                return
+
+        watcher = threading.Thread(target=_guard, daemon=True)
+        watcher.start()
+        try:
+            for line in proc.stdout:
+                last_output[0] = time.monotonic()
+                if on_line:
+                    on_line(line.rstrip())
+            code = proc.wait()
+        finally:
+            finished.set()
+            watcher.join(timeout=5)
+
+        if stalled.is_set():
+            raise SteamCmdStalled(
+                f"SteamCMD printed nothing for {_stall_duration(stall_timeout)} "
+                "and was killed. It usually means the download stalled or "
+                "SteamCMD is waiting on a login/Steam Guard prompt. Try again, "
+                "or run SteamCMD by hand once to clear any prompt it's stuck on."
+            )
+        return code
 
 
 async def run_update_async(
@@ -259,8 +401,17 @@ async def run_update_async(
     app_id: str = APP_ID,
     validate: bool = True,
     on_line: LineSink | None = None,
+    stall_timeout: float = STEAMCMD_STALL_SECONDS,
 ) -> int:
-    """Async twin of :func:`run_update`, for the daemon's event loop."""
+    """Async twin of :func:`run_update`, for the daemon's event loop.
+
+    Raises :class:`SteamCmdStalled` if SteamCMD goes ``stall_timeout`` seconds
+    without printing a line — see the constant for why silence, not total
+    runtime, is the thing worth timing out on, and what it costs when nothing
+    does. The caller's ``finally`` still restores the ini and restarts the
+    server, so a stall lands in the same place as any other failed update
+    instead of parking the daemon.
+    """
     cmd = update_command(steamcmd, install_dir, app_id, validate=validate)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -269,7 +420,27 @@ async def run_update_async(
         creationflags=_NO_WINDOW,
     )
     assert proc.stdout is not None
-    async for raw in proc.stdout:
-        if on_line:
-            on_line(raw.decode(errors="replace").rstrip())
-    return await proc.wait()
+    try:
+        while True:
+            try:
+                raw = await asyncio.wait_for(
+                    proc.stdout.readline(), timeout=stall_timeout
+                )
+            except TimeoutError:
+                await _kill_async(proc)
+                raise SteamCmdStalled(
+                    f"SteamCMD printed nothing for {_stall_duration(stall_timeout)} "
+                    "and was killed. It usually means the download stalled or "
+                    "SteamCMD is waiting on a login/Steam Guard prompt. The server "
+                    "is being started again; re-run the update when you can watch it."
+                ) from None
+            if not raw:  # EOF — SteamCMD closed stdout, it's on its way out
+                break
+            if on_line:
+                on_line(raw.decode(errors="replace").rstrip())
+        return await proc.wait()
+    except asyncio.CancelledError:
+        # Daemon shutdown or an operator cancel: don't leave SteamCMD rewriting
+        # the install behind our back.
+        await _kill_async(proc)
+        raise

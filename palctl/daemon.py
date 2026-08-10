@@ -40,6 +40,11 @@ from .watchdog import Watchdog
 
 SERVICE_NAME = "palctl-daemon"  # the Windows service name palctl registers
 
+# How long shutdown waits for cancelled background tasks to unwind before
+# finishing without them. Comfortably inside WinSW's and systemd's own stop
+# timeouts — see _graceful_shutdown for why this can't be unbounded.
+SHUTDOWN_TASK_GRACE = 10.0
+
 
 def sd_notify(state: str) -> None:
     """Send a notification to systemd over $NOTIFY_SOCKET, if we're running under
@@ -66,24 +71,60 @@ def sd_notify(state: str) -> None:
 # wrapper restart, a palctl upgrade, a manual service bounce). Without this the
 # in-memory flag resets to True and the daily restart / auto-update schedule
 # would resurrect a server that was deliberately taken down for maintenance.
+#
+# `ever_alive` rides in the same file for the opposite reason: it is the guard
+# that stops auto-recovery restarting a server palctl has never seen working,
+# and losing it across a restart is what turns a recoverable outage into a
+# permanent one. See _load_ever_alive.
 _STATE_PATH = config_dir() / "daemon_state.json"
 
 
-def _load_desired_running() -> bool:
+def _read_state() -> dict:
     try:
         state = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
-        return bool(state["desired_running"])
-    except (OSError, ValueError, KeyError, TypeError):
-        return True  # no/unreadable state (e.g. first run) = normal behavior
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _write_state(**changes: object) -> None:
+    """Merge `changes` into the state file. Read-modify-write so one key's
+    setter can't drop the other's value — both are written from the same
+    single-threaded event loop, so there's no lost-update race between them."""
+    state = _read_state()
+    state.update(changes)
+    try:
+        tmp = _STATE_PATH.with_name(_STATE_PATH.name + ".tmp")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        os.replace(tmp, _STATE_PATH)
+    except OSError:
+        pass  # best effort — worst case is the old resets-to-default behavior
+
+
+def _load_desired_running() -> bool:
+    value = _read_state().get("desired_running")
+    return True if value is None else bool(value)  # no state (first run) = normal
 
 
 def _save_desired_running(value: bool) -> None:
-    try:
-        tmp = _STATE_PATH.with_name(_STATE_PATH.name + ".tmp")
-        tmp.write_text(json.dumps({"desired_running": value}), encoding="utf-8")
-        os.replace(tmp, _STATE_PATH)
-    except OSError:
-        pass  # best effort — worst case is the old resets-to-True behavior
+    _write_state(desired_running=value)
+
+
+def _load_ever_alive() -> bool:
+    """Whether palctl has ever seen this server answering.
+
+    Persisted because auto-recovery refuses to touch a server it has never seen
+    up — a sane guard against restart-looping a box with no server installed,
+    but one that inverts badly when the flag is lost. A daemon that restarts
+    *during* an outage (a crash, an upgrade, the health task) came back with
+    ever_alive=False and so would never recover the server, which then stayed
+    down until a human noticed. Remembering it means an outage that spans a
+    daemon restart still gets recovered."""
+    return bool(_read_state().get("ever_alive", False))
+
+
+def _save_ever_alive(value: bool) -> None:
+    _write_state(ever_alive=value)
 
 
 def _tail_log_file(n: int) -> str:
@@ -100,6 +141,31 @@ def _tail_log_file(n: int) -> str:
 def _within_window(times: list[float], now: float, window: float = 3600.0) -> list[float]:
     """Timestamps from the last `window` seconds. Used to rate-limit auto-recovery."""
     return [t for t in times if t >= now - window]
+
+
+def poll_loop_is_live(
+    *, last_poll_at: float, now: float, poll_seconds: int
+) -> tuple[bool, float | None]:
+    """The /healthz verdict: (is the poll loop still turning, age of its last
+    cycle). Pure, because getting it wrong is expensive in both directions —
+    too strict and the health task restarts a healthy daemon, too loose and a
+    genuinely wedged one is never healed.
+
+    `last_poll_at` must be stamped on every *completed* cycle, not every
+    successful one. The distinction is the whole bug this function documents:
+    stamping it only when the game server answered made "the game server is
+    down" indistinguishable from "this daemon is wedged", and the only consumer
+    that acts on the verdict responds by restarting the daemon — which does
+    nothing for a down game server, and kills the auto-recovery that was
+    handling it.
+
+    A daemon that has not completed its first cycle yet reads as live: it is
+    starting up, not stuck.
+    """
+    if not last_poll_at:
+        return True, None
+    age = now - last_poll_at
+    return age <= max(30.0, poll_seconds * 6), age
 
 
 def autorecover_phase(
@@ -287,7 +353,9 @@ class Daemon:
 
         # Crash/hang auto-recovery bookkeeping. ("palctl is doing this on
         # purpose" now lives in the ServerController's operation lock.)
-        self._ever_alive = False           # only recover a server that WAS up
+        # Only recover a server that WAS up — persisted, so an outage that
+        # spans a daemon restart is still recoverable (see _load_ever_alive).
+        self.__ever_alive = _load_ever_alive()
         # User "Stop" flips this off. Loaded from disk so a daemon restart
         # can't forget an intentional stop (the setter persists changes).
         self._desired_running = _load_desired_running()
@@ -298,6 +366,9 @@ class Daemon:
         # is wrong (rotated out from under us, say) — NOT an outage. Warn once,
         # not every poll, and never let it drive down-detection/auto-recovery.
         self._auth_warned = False
+        # One-shot per outage: the server is down and palctl has been told
+        # not to restart it. Re-armed by a good poll, like the 401 warning.
+        self._recovery_off_warned = False
         # One-shot: warn if the server process runs under a different account
         # than the daemon (the watchdog-blinding split — see _maybe_warn_account_mismatch).
         self._account_warned = False
@@ -338,7 +409,14 @@ class Daemon:
         devices on the LAN can't reach the dashboard — so binding 0.0.0.0 alone
         is a silent no-op. Open the port (private networks) when LAN access is
         on, and close it again when off. Best-effort: a non-elevated daemon can't
-        touch the firewall, so log the one-line manual command instead."""
+        touch the firewall, so log the one-line manual command instead.
+
+        Blocking (up to three netsh invocations) — the caller runs it via
+        to_thread. It must never sit on the event loop: netsh against a sick
+        MpsSvc can take tens of seconds, and this happens *after* the HTTP site
+        is bound, so a blocked loop means a daemon whose port accepts
+        connections and then answers nothing at all. That looks like a hung app
+        from every client, and no "is the port open?" check can see it."""
         if not sys.platform.startswith("win"):
             return
         from . import firewall
@@ -362,6 +440,15 @@ class Daemon:
                 )
         except Exception as e:  # firewall trouble must never break startup
             self.log.warning("dashboard firewall setup failed: %s", e)
+
+    async def _startup_side_effects(self, host: str) -> None:
+        """The two startup chores that shell out, moved off the event loop and
+        out of the startup critical path. Neither gates anything, so a slow
+        netsh or rclone now delays only its own log line — not the poll loop,
+        not the control API, and not the READY signal the service manager is
+        waiting on."""
+        await asyncio.to_thread(self._sync_dashboard_firewall, host)
+        await asyncio.to_thread(self._warn_if_cloud_mirror_broken)
 
     def _warn_if_cloud_mirror_broken(self) -> None:
         """If the backup mirror is an rclone remote that's misconfigured — no
@@ -451,6 +538,21 @@ class Daemon:
         self.__desired_running = value
         _save_desired_running(value)
 
+    @property
+    def _ever_alive(self) -> bool:
+        return self.__ever_alive
+
+    @_ever_alive.setter
+    def _ever_alive(self, value: bool) -> None:
+        # Only ever flips False -> True, and only on a poll that got an answer,
+        # so this writes the state file exactly once in the daemon's life
+        # rather than on every poll.
+        if value and not self.__ever_alive:
+            self.__ever_alive = True
+            _save_ever_alive(True)
+        else:
+            self.__ever_alive = value
+
     def _spawn(self, coro) -> asyncio.Task:
         # asyncio holds only weak refs to tasks; keep one or it can be GC'd mid-run.
         t = asyncio.create_task(coro)
@@ -504,6 +606,15 @@ class Daemon:
                 await self._poll()
             except Exception as e:
                 await self.bus.emit(Event("error", f"Poll failed: {e}"))
+            # Stamped here, on every completed cycle, and NOT inside _poll() —
+            # /healthz asks "is this daemon alive", and the daemon is alive
+            # whether or not the game server answered. Stamping it only on a
+            # successful poll made an unreachable *game server* read as a wedged
+            # *daemon*: /healthz went 503, and the Windows health task then
+            # restarted a perfectly healthy daemon roughly a quarter of an hour
+            # into every outage — precisely while auto-recovery was working the
+            # problem. See the handler for what the probe is actually for.
+            self._last_poll_at = time.time()
             # Clamp: a hand-edited 0/negative poll_seconds would tight-loop the
             # REST API and process enumeration (the scheduler clamps likewise).
             await asyncio.sleep(max(1, self.cfg.poll_seconds))
@@ -562,6 +673,7 @@ class Daemon:
         self._down_polls = 0
         self._api_fail_streak = 0
         self._auth_warned = False  # a good poll re-arms the password warning
+        self._recovery_off_warned = False  # ...and the recovery-is-off notice
         await self._maybe_warn_account_mismatch()
         await self._maybe_warn_wrong_server_root()
 
@@ -569,7 +681,6 @@ class Daemon:
 
         stats = await asyncio.to_thread(procs.proc_stats)  # psutil enumeration off the loop
         self._last_metrics = metrics
-        self._last_poll_at = time.time()
 
         if first_poll:
             # Daemon (re)started while the server was already up: `_history` was
@@ -600,15 +711,22 @@ class Daemon:
         psutil enumeration runs off the event loop."""
         if self._account_warned:
             return
-        self._account_warned = True
         import getpass
 
         try:
-            warning = await asyncio.to_thread(
-                procs.server_account_mismatch, getpass.getuser()
+            checked, warning = await asyncio.to_thread(
+                procs.server_account_check, getpass.getuser()
             )
         except Exception:
-            warning = None
+            checked, warning = False, None
+        if not checked:
+            # Inconclusive — don't burn the one-shot on it. This used to latch
+            # before the check even ran, so a single poll where the process
+            # wasn't readable suppressed the warning permanently. That is
+            # exactly backwards: an account split is a reason the read fails, so
+            # the servers that most need telling were the ones told least.
+            return
+        self._account_warned = True
         if warning:
             self.log.warning("%s", warning)
             await self.bus.emit(Event("error", "⚠️ " + warning))
@@ -635,6 +753,39 @@ class Daemon:
 
     # ---------- crash / hang auto-recovery ----------
 
+    async def _warn_recovery_is_off(self, wd) -> None:
+        """Say — once per outage — that the server is down and palctl has been
+        told not to fix it.
+
+        `auto_restart_on_crash` is opt-in, and deliberately so: restarting
+        someone's server unasked is not a default to take lightly. But the
+        silence around it is the problem. Watching a real hang from the outside,
+        the entire output is one "🔴 Server is down." and then nothing, forever
+        — identical to palctl being broken, and the single most likely reason
+        someone concludes it is. The feature that would have fixed it is one
+        unticked box away, and nothing ever mentions it.
+
+        Only fires once the outage is confirmed (`_alive is False`, same
+        threshold as the down announcement) and only for a server palctl has
+        actually seen working, so a box with no server installed stays quiet.
+        Re-armed when the server comes back, so each outage says it once."""
+        if wd.auto_restart_on_crash or self._recovery_off_warned:
+            return
+        if self._alive is not False or not self._ever_alive:
+            return
+        self._recovery_off_warned = True
+        await self.bus.emit(
+            Event(
+                "error",
+                "⚠️ The server is down and **auto-recovery is turned off**, so "
+                "palctl will not restart it — it is only reporting. Turn on "
+                "*Auto-restart on crash/hang* in Config (or set "
+                "`watchdog.auto_restart_on_crash` to `true`) and reload, and "
+                "palctl will bring the server back on its own next time.",
+                {"action": "recovery_disabled"},
+            )
+        )
+
     async def _maybe_autorecover(self) -> None:
         """
         Called on every poll where the REST API is unreachable. Brings the server
@@ -642,6 +793,7 @@ class Daemon:
         already restarted too many times this hour.
         """
         wd = self.cfg.watchdog
+        await self._warn_recovery_is_off(wd)
         phase = autorecover_phase(
             enabled=wd.auto_restart_on_crash,
             ever_alive=self._ever_alive,
@@ -758,16 +910,33 @@ class Daemon:
             )
         elif wd.predict_notify and not self._predict_warned:
             self._predict_warned = True
+            # The forecast is the one moment the admin is definitely thinking
+            # about the leak, so it's where the other half of the accepted
+            # mitigation belongs — not buried in a tooltip they'd have to go
+            # looking for. Only mentioned when raids are actually on.
             await self.bus.emit(
                 Event(
                     "watchdog",
                     f"🔮 On the current pace, memory hits the watchdog limit "
                     f"({wd.memory_limit_mb:,} MB) in {leak.fmt_minutes(ttl)}. "
                     "The watchdog will handle it — but now would be a good "
-                    "moment for a restart on your terms.",
+                    "moment for a restart on your terms."
+                    + await self._raids_hint(),
                     {"action": "forecast", "minutes_to_limit": round(ttl)},
                 )
             )
+
+    async def _raids_hint(self) -> str:
+        """RAIDS_HINT when raids are on, empty otherwise. Never raises and never
+        guesses: an unreadable ini says nothing rather than giving the admin
+        advice about a setting palctl couldn't actually read."""
+        from .serversetup import RAIDS_HINT, raids_enabled
+
+        try:
+            on = await asyncio.to_thread(raids_enabled, self.cfg.live_ini)
+        except Exception:
+            return ""
+        return RAIDS_HINT if on else ""
 
     # ---------- localhost API for the GUI ----------
 
@@ -805,9 +974,18 @@ class Daemon:
             # Liveness/readiness for an external monitor. No token (no data), so
             # exempt in the auth middleware. 503 when the poll loop hasn't
             # completed a cycle in a while — a wedged event loop or a dead poller.
-            age = time.time() - self._last_poll_at if self._last_poll_at else None
-            stale = age is not None and age > max(30, self.cfg.poll_seconds * 6)
-            ok = self._last_poll_at == 0.0 or not stale  # starting up counts as ok
+            #
+            # This is strictly about THIS PROCESS. It must never go 503 because
+            # the game server is down: the only consumer that acts on it is the
+            # health task, whose remedy is restarting the daemon, and that does
+            # nothing for a down game server — it just kills the thing that was
+            # about to recover it. Game-server reachability is reported by
+            # `alive` below, and acted on by the watchdog and auto-recovery.
+            ok, age = poll_loop_is_live(
+                last_poll_at=self._last_poll_at,
+                now=time.time(),
+                poll_seconds=self.cfg.poll_seconds,
+            )
             return web.json_response(
                 {
                     "status": "ok" if ok else "stale",
@@ -896,7 +1074,17 @@ class Daemon:
                     if not self._spawn_exclusive("backup", self.scheduler.backup_now("gui")):
                         return _busy_response(self.control.current_op)
                 elif what == "update-server":
-                    if not self._spawn_exclusive("update", self.scheduler.update_server()):
+                    # `{"validate": true}` asks SteamCMD to re-verify every file
+                    # against Steam's manifest — a repair for a suspected-broken
+                    # install, not part of a routine update. It is slow (a full
+                    # multi-GB pass) and it restores files that differ, which is
+                    # what resets PalWorldSettings.ini, so it is opt-in per call.
+                    if not self._spawn_exclusive(
+                        "update",
+                        self.scheduler.update_server(
+                            validate=bool(body.get("validate", False))
+                        ),
+                    ):
                         return _busy_response(self.control.current_op)
                     self._desired_running = True
                 elif what == "restore":
@@ -1010,8 +1198,11 @@ class Daemon:
         warning = lan_exposure_warning(host)
         if warning:
             self.log.warning("%s", warning)
-        self._sync_dashboard_firewall(host)
-        self._warn_if_cloud_mirror_broken()
+        # Both shell out (netsh; rclone version) and both are pure diagnostics —
+        # nothing below depends on them, so they run off the loop and, more
+        # importantly, must not delay the workers or READY=1 behind a slow
+        # external tool. Spawned rather than awaited for the same reason.
+        self._spawn(self._supervised("startup checks", self._startup_side_effects(host)))
 
         self._install_signal_handlers()
 
@@ -1069,8 +1260,18 @@ class Daemon:
                 await asyncio.wait_for(self.api.save(), timeout=10)
         for t in list(self._tasks):
             t.cancel()
+        # Cancelling is a request, not a guarantee: a task parked in
+        # asyncio.to_thread (a service query, a psutil sweep, a disk stat) can't
+        # be interrupted and only unwinds when its worker thread returns. Give
+        # them a moment and then move on, or "stop the daemon" waits on the
+        # slowest external tool and the service manager kills us mid-teardown
+        # instead — losing the event-store close below, which is the one step
+        # here that touches a file.
         with contextlib.suppress(Exception):
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(*self._tasks, return_exceptions=True),
+                timeout=SHUTDOWN_TASK_GRACE,
+            )
         with contextlib.suppress(Exception):
             await runner.cleanup()
         with contextlib.suppress(Exception):

@@ -81,12 +81,17 @@ PC, which is the situation most people are trying to get out of.
 - Opt-in scheduled auto-update (Palworld patches constantly) — the same
   save → backup → SteamCMD → restart flow as a manual update, world backup
   included (updates are exactly when saves get eaten), and **no backup means
-  no update** unless you opt out
+  no update** unless you opt out. Reports the build id it actually installed,
+  so "it ran" and "it updated" aren't the same message
 - One **operation lock**: scheduled restarts, watchdog restarts, updates,
   restores, and crash recovery can't fire into the middle of each other
 - Notifies when a newer server build is available, or a newer palctl release
 - Opt-in crash/hang auto-recovery: if the API stops answering while palctl didn't
-  stop the server, it brings it back — rate-limited so a crash-loop isn't hammered
+  stop the server, it brings it back — rate-limited so a crash-loop isn't hammered.
+  **Off by default**, because restarting your server unasked shouldn't be a
+  default — so if you want a hang fixed rather than just reported, turn on
+  *Auto-restart on crash/hang* in Config. With it off, palctl says so once per
+  outage rather than leaving you to wonder why nothing happened
 - Join / leave / level-up events, synthesised by diffing the player list
 - Session + playtime tracking in SQLite (Palworld remembers none of this)
 - Metrics history in SQLite too, so the graphs survive a daemon restart
@@ -100,10 +105,13 @@ PC, which is the situation most people are trying to get out of.
 - Players: level, ping, location, building count, kick/ban
 - Console: announce (real spaces — REST, not RCON), save, backup, **restore a
   backup** (with a pre-restore safety copy), start/stop/restart, and **update the
-  server** (SteamCMD, with the ini guarded across `validate`)
+  server** (SteamCMD; routine updates don't run `validate`, so your ini isn't
+  reset — and the update reports the build id it actually installed)
 - **Settings editor**: parses the one-line `OptionSettings=(...)` blob into a
-  searchable, grouped, typed form. Preserves unknown keys from future patches.
-  Backs up the ini on every save, because SteamCMD `validate` wipes it.
+  searchable, grouped, typed form. Preserves unknown keys from future patches —
+  and everything else in the file too: your comments and any other `[Section]`
+  survive a save byte-for-byte. Backs up the ini on every save, because a
+  SteamCMD `validate` can wipe it.
 - Config: paths (with **Browse** and **Auto-detect**, and a live ✓/✗ that tells
   you the path is really a server before you save), watchdog thresholds,
   schedules, Discord — all entered in the UI — plus a one-click **Export
@@ -335,6 +343,18 @@ invite it to your server with the `bot` and `applications.commands` scopes → p
 the token into the GUI's **Config → Discord bot** tab → Save & reload. (The
 first-run wizard has the same fields under its optional **Set up the Discord
 bot** section, if you'd rather do it there.)
+
+> **One thing worth 20 seconds:** in the Developer Portal → **Bot**, turn
+> **Public Bot** *off*. It ships **on**, which lets anyone holding your client ID
+> invite your bot to a server of their own — where they have Manage Server, which
+> is what admin access falls back to until you set an admin role. palctl already
+> refuses commands from any guild but yours (`guild_id`, or whichever guild your
+> notification channel is in), so this is belt and braces — but it's free.
+
+Server-side gotchas that bite everyone running Palworld — why a Steam update
+resets your ini, why `WorldOption.sav` makes settings silently not apply, and
+why `validate` shouldn't be part of a routine update — are collected with
+sources in **[Palworld server practices](docs/palworld-server-practices.md)**.
 
 For the full walkthrough — inviting with the right **channel permissions**, the
 **role-ID vs user-ID** gotcha behind `/announce` saying *"Not allowed"*, every

@@ -84,6 +84,14 @@ class SetupPlan:
     discord_token: str = ""
     discord_channel_id: int = 0
     discord_admin_id: int = 0
+    # Turn Palworld's raids off (bEnableInvaderEnemy=False).
+    #
+    # Defaults to False — palctl leaves raids exactly as Palworld ships them
+    # unless the admin asks. Raids are game content, and the evidence against
+    # them is operator report rather than anything Pocketpair published, so this
+    # is not palctl's call to make silently. The wizard puts the choice and the
+    # reasoning in front of the admin instead; see _apply_raid_choice.
+    disable_raids: bool = False
 
 
 @dataclass
@@ -180,6 +188,8 @@ def run_setup(cfg: Config, plan: SetupPlan, log: Log) -> SetupResult:
             port=plan.api_port, password=plan.password,
         )
         log("  REST API enabled, port and admin password set.")
+
+        _apply_raid_choice(cfg, plan, log)
 
         server_registered = False
         if plan.register_server_service:
@@ -285,6 +295,34 @@ def _preflight(plan: SetupPlan, log: Log) -> bool:
     if blocking:
         log("\n❌ Fix the ❌ item(s) above, then run setup again.")
     return not blocking
+
+
+def _apply_raid_choice(cfg: Config, plan: SetupPlan, log: Log) -> None:
+    """Turn raids off, if the admin ticked that box in the wizard.
+
+    Only ever acts when asked. Leaving the box unticked must not write
+    ``bEnableInvaderEnemy=True`` — an admin who already turned raids off would
+    then have setup silently turn them back on, which is the exact failure this
+    whole feature is trying to avoid being on the wrong side of.
+    """
+    if not plan.disable_raids:
+        return
+    from .inifile import PalSettings
+
+    try:
+        settings = PalSettings.load(cfg.live_ini)
+        settings.set("bEnableInvaderEnemy", False)
+        settings.save(cfg.live_ini)
+    except (OSError, ValueError) as e:
+        # Never fail setup over an optional tuning choice — the server is
+        # perfectly usable with raids on.
+        log(f"  ⚠️ Couldn't turn raids off ({e}) — do it in Settings → Combat.")
+        return
+    log(
+        "  Raids turned off (bEnableInvaderEnemy=False) — their spawned waves "
+        "are the part of Palworld's memory leak that never gets cleaned up. "
+        "Turn them back on any time in the settings editor, under Combat."
+    )
 
 
 def _install_vcredist(log: Log) -> None:

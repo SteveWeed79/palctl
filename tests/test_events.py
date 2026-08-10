@@ -334,3 +334,39 @@ def test_top_playtime_counts_the_open_session(tmp_path: Path):
     top = store.top_playtime(now=now)
     assert top[0] == ("Bob", 120.0)  # the online player leads on their live session
     assert ("Alice", 10.0) in top
+
+
+def test_event_history_is_pruned_so_backups_do_not_grow_forever(tmp_path):
+    """sessions.db is snapshotted into every backup and mirrored off-site, so an
+    unbounded events table inflates every retained copy. Metrics already had
+    retention; events did not."""
+    from datetime import UTC, datetime, timedelta
+
+    store = SessionStore(tmp_path / "sessions.db")
+    try:
+        old = Event("join", "ancient", at=datetime.now(UTC) - timedelta(days=400))
+        recent = Event("join", "recent")
+        store.log_event(old)
+        store.log_event(recent)
+
+        rows = store._db.execute("SELECT message FROM events").fetchall()
+        messages = [r[0] for r in rows]
+        assert "recent" in messages
+        assert "ancient" not in messages, "past-retention events must be pruned"
+    finally:
+        store.close()
+
+
+def test_event_pruning_keeps_everything_inside_the_window(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    store = SessionStore(tmp_path / "sessions.db")
+    try:
+        for days in (0, 1, 10, 29):
+            store.log_event(
+                Event("join", f"d{days}", at=datetime.now(UTC) - timedelta(days=days))
+            )
+        kept = {r[0] for r in store._db.execute("SELECT message FROM events")}
+        assert kept == {"d0", "d1", "d10", "d29"}
+    finally:
+        store.close()

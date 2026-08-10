@@ -10,6 +10,7 @@ server PC, which is exactly the situation you're trying to get out of.
 from __future__ import annotations
 
 import sys
+import weakref
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
@@ -128,7 +129,49 @@ def call(path: str, body: dict | None = None, *, timeout: float = 10) -> dict:
     return r.json()
 
 
-class CallWorker(QThread):
+# Every worker thread the GUI starts, so quitting can drain them.
+#
+# Qt aborts the process ("QThread: Destroyed while thread is still running")
+# if a QThread is destroyed while its run() is still going, and the tray's Quit
+# action goes straight to QApplication.quit — which stops the event loop and
+# tears everything down without telling the workers anything. The Poller alone
+# guarantees it: it loops forever by design, so at quit time it is *always*
+# running. The user's last interaction with palctl was a crash dialog.
+#
+# A WeakSet, so a finished worker that has been deleteLater()'d drops out on its
+# own and this never keeps threads alive.
+_LIVE_WORKERS: weakref.WeakSet[QThread] = weakref.WeakSet()
+
+
+def stop_all_workers(grace_ms: int = 2000) -> None:
+    """Ask every live worker to stop and wait briefly for it. Called on
+    aboutToQuit, before Qt starts destroying things.
+
+    A worker still running after the grace period is terminated: /action/stop
+    can legitimately be in a 180-second call, nobody wants to wait for that on
+    exit, and terminate() at process-exit is much better than the abort we get
+    for free otherwise."""
+    workers = [w for w in list(_LIVE_WORKERS) if w.isRunning()]
+    for w in workers:
+        w.requestInterruption()
+    for w in workers:
+        if not w.wait(grace_ms):
+            w.terminate()
+            w.wait(500)
+
+
+class _Worker(QThread):
+    """Base for the GUI's threads: registers itself so quit can drain it.
+
+    Inherit from this rather than QThread directly — a worker that isn't in the
+    registry is one that can abort the app on exit."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        _LIVE_WORKERS.add(self)
+
+
+class CallWorker(_Worker):
     """One daemon call, off the UI thread.
 
     /action/stop and /action/start block server-side until the Windows service
@@ -152,11 +195,14 @@ class CallWorker(QThread):
             self.fail.emit(str(e))
 
 
-class Poller(QThread):
+class Poller(_Worker):
     """Pull daemon state off the UI thread."""
 
     state = Signal(dict)
     failed = Signal(str)
+
+    POLL_MS = 2000
+    _SLICE_MS = 100
 
     def run(self) -> None:
         while not self.isInterruptionRequested():
@@ -164,7 +210,13 @@ class Poller(QThread):
                 self.state.emit(call("/state"))
             except Exception as e:
                 self.failed.emit(str(e))
-            self.msleep(2000)
+            # Sleep in slices instead of one msleep(2000): the whole point of
+            # requestInterruption is that quit doesn't have to sit through the
+            # rest of a poll interval before the thread can be joined.
+            waited = 0
+            while waited < self.POLL_MS and not self.isInterruptionRequested():
+                self.msleep(self._SLICE_MS)
+                waited += self._SLICE_MS
 
 
 class Sparkline(QLabel):
@@ -547,7 +599,7 @@ class PathPicker(QWidget):
         self._status.setStyleSheet("color:#3fb950;" if ok else "color:#f85149;")
 
 
-class _MirrorTestWorker(QThread):
+class _MirrorTestWorker(_Worker):
     """Runs the backup-mirror check off the UI thread — an rclone remote test is
     a network round-trip that would otherwise freeze the window."""
 
@@ -1042,7 +1094,9 @@ class Main(QMainWindow):
         self.dash = Dashboard()
         self.players = Players()
         self.console = Console()
-        self.editor = SettingsEditor(self.cfg.live_ini, self.cfg.default_ini)
+        self.editor = SettingsEditor(
+            self.cfg.live_ini, self.cfg.default_ini, self.cfg.savegames_dir
+        )
         self.config = ConfigTab(self.cfg)
 
         self._tab_icons = [
@@ -1118,7 +1172,9 @@ class Main(QMainWindow):
         old server root's ini."""
         current = self.tabs.currentIndex()
         old_editor, old_config = self.editor, self.config
-        self.editor = SettingsEditor(self.cfg.live_ini, self.cfg.default_ini)
+        self.editor = SettingsEditor(
+            self.cfg.live_ini, self.cfg.default_ini, self.cfg.savegames_dir
+        )
         self.config = ConfigTab(self.cfg)
         for index, widget, icon, label in (
             (3, self.editor, "tab-settings", "Settings"),
@@ -1336,6 +1392,11 @@ def main() -> None:
     if not guard.acquire():
         guard.signal_existing()
         return
+
+    # Drain the worker threads before Qt tears anything down. Without this the
+    # Poller — which by design is always running — gets destroyed mid-run and Qt
+    # aborts the process, so the last thing the user sees on "Quit" is a crash.
+    app.aboutToQuit.connect(stop_all_workers)
 
     w = Main()
     guard.set_activation_target(w)

@@ -43,6 +43,16 @@ Knowing where palctl draws its lines makes reports (and triage) faster.
   in an **Export diagnostics** bundle **is a vulnerability**.
 - Backup and restore names are validated against path traversal; an operation
   escaping the backups folder or the SaveGames folder **is a vulnerability**.
+- **The Discord bot is the one remote control surface**, so it has its own
+  boundary: commands are honoured from a single guild (`discord.guild_id`, or
+  the guild owning your notification channel), and admin commands additionally
+  require the configured `admin_role_id` — falling back to Manage Server *within
+  that guild* when it's unset. Anything that lets a guild other than yours drive
+  the server, or clears the admin check, **is a vulnerability**. Note that a
+  Discord application ships with **Public Bot** enabled, which lets anyone with
+  your client ID invite your bot to a guild of their own; the guild check is what
+  makes that harmless, and turning Public Bot off in the Developer Portal closes
+  it at the source.
 
 **By design / out of scope:**
 
@@ -54,9 +64,9 @@ Knowing where palctl draws its lines makes reports (and triage) faster.
   you not to port-forward it. Deliberately exposing it is a server
   misconfiguration — though if a palctl **default** makes that mistake easy to
   stumble into, that's worth a report.
-- Vulnerabilities in the Palworld server binary, SteamCMD, NSSM, or other
-  third-party software palctl launches or downloads. (Ideas for *verifying*
-  those downloads are welcome — see CONTRIBUTING.md.)
+- Vulnerabilities in the Palworld server binary, SteamCMD, WinSW, rclone, or
+  other third-party software palctl launches or downloads. (Ideas for
+  *verifying* those downloads are welcome — see CONTRIBUTING.md.)
 - The unsigned installer / SmartScreen prompt. Known tradeoff; every release
   publishes `SHA256SUMS.txt` so downloads can be verified, and free signing via
   SignPath Foundation is on the roadmap.

@@ -68,8 +68,29 @@ def _on_windows() -> bool:
     return sys.platform.startswith("win")
 
 
+# schtasks talks to the Task Scheduler service; when that service is wedged the
+# call can hang indefinitely. This runs during install and from the setup
+# wizard, so an unbounded wait is a stuck installer with no output. Every caller
+# already treats failure as best-effort ("a daemon without its healer is still a
+# daemon"), so a timeout folds into the existing False/failed path.
+SCHTASKS_TIMEOUT = 30.0
+
+
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True, creationflags=_NO_WINDOW)
+    """Run a schtasks command, bounded. A timeout comes back as a non-zero
+    result rather than an exception, so it lands in the same "couldn't do it"
+    branch every caller already has — TimeoutExpired is a SubprocessError, not
+    an OSError, so it would otherwise sail straight past their except clauses."""
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, creationflags=_NO_WINDOW,
+            timeout=SCHTASKS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            cmd, returncode=1, stdout="",
+            stderr=f"schtasks timed out after {SCHTASKS_TIMEOUT:.0f}s",
+        )
 
 
 def register_health_task(

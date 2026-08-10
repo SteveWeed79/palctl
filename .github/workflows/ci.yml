@@ -211,3 +211,15 @@ jobs:
           QT_QPA_PLATFORM: offscreen
           PYTHON_KEYRING_BACKEND: keyring.backends.null.Keyring
         run: python scripts/import_smoke.py
+      # The GUI's thread lifecycle needs a real QApplication, so it can only run
+      # where Qt is installed — here. Quitting used to destroy the still-running
+      # Poller, which makes Qt abort the process: the user's last interaction
+      # with palctl was a crash dialog. These tests skip everywhere else, so
+      # this step is the only thing standing between that and shipping again.
+      - name: GUI thread lifecycle (needs a real QApplication)
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHON_KEYRING_BACKEND: keyring.backends.null.Keyring
+        run: |
+          pip install pytest
+          pytest tests/test_gui_lifecycle.py -v

@@ -75,8 +75,13 @@ def test_update_server_stops_updates_then_starts(tmp_path, monkeypatch):
     _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
 
     assert [c[0] for c in calls] == ["stop", "update", "start"]
-    # the update ran against the configured install dir and app id, with validate
-    assert calls[1][1] == cfg.server_root and calls[1][2] == cfg.app_id and calls[1][3] is True
+    # The update ran against the configured install dir and app id — and
+    # WITHOUT validate. `validate` is a full re-verification of every file
+    # against Steam's manifest, which restores anything that differs; it is
+    # what resets PalWorldSettings.ini, and it has no place in a routine
+    # update. Plain app_update still installs the newest build.
+    assert calls[1][1] == cfg.server_root and calls[1][2] == cfg.app_id
+    assert calls[1][3] is False, "routine updates must not validate"
     assert any(e.kind == "update" and "back up" in e.message for e in events)
 
 
@@ -1022,3 +1027,92 @@ def test_update_available_warns_once_when_the_manifest_is_unreadable(tmp_path, m
 
     blind = [e for e in events if e.kind == "error" and "build id" in e.message]
     assert len(blind) == 1  # said once, not every few hours
+
+
+def test_update_that_resets_the_ini_restores_it_and_keeps_palctl_able_to_see(
+    tmp_path, monkeypatch
+):
+    """The whole failure, end to end.
+
+    A server update can leave PalWorldSettings.ini holding Palworld's defaults —
+    a valid file, so the blank check never fires and the pre-update backup was
+    never used. Because those defaults carry RESTAPIEnabled=False and no
+    AdminPassword, palctl went permanently blind to a server that was up the
+    whole time: nothing on the dashboard, and restarting fixed nothing because
+    the process was never the problem.
+    """
+    from palctl.inifile import PalSettings
+
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path / "server")
+    cfg.backup_root = str(tmp_path / "backups")
+    cfg.api_port = 8212
+
+    tuned = (
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        'OptionSettings=(ExpRate=3.000000,ServerName="mine",'
+        'AdminPassword="hunter2",RESTAPIEnabled=True,RESTAPIPort=8212)\n'
+    )
+    defaults = (
+        "[/Script/Pal.PalGameWorldSettings]\n"
+        'OptionSettings=(ExpRate=1.000000,ServerName="Default Palworld Server",'
+        'AdminPassword="",RESTAPIEnabled=False,RESTAPIPort=8212)\n'
+    )
+    ini = cfg.live_ini
+    ini.parent.mkdir(parents=True, exist_ok=True)
+    ini.write_text(tuned, encoding="utf-8")
+    cfg.default_ini.parent.mkdir(parents=True, exist_ok=True)
+    cfg.default_ini.write_text(defaults, encoding="utf-8")
+
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line=None):
+        ini.write_text(defaults, encoding="utf-8")  # a VALID ini, just reset
+        return 0
+
+    monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
+    # No keyring in tests; the admin's password has to come back from the ini.
+    monkeypatch.setattr("palctl.config.get_admin_password", lambda: "")
+
+    bus = EventBus()
+    events = _collect(bus)
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+
+    after = PalSettings.load(ini)
+    assert after.get("RESTAPIEnabled") is True, "palctl must still be able to see it"
+    assert after.get("AdminPassword") == "hunter2", "and still authenticate"
+    assert after.get("ExpRate") == 3.0, "the admin's tuning must survive an update"
+    assert after.get("ServerName") == "mine"
+    assert any(
+        "reset" in e.message and "PalWorldSettings.ini" in e.message
+        for e in events
+    ), "and the admin has to be told it happened"
+
+def test_validate_is_available_as_an_explicit_repair(tmp_path, monkeypatch):
+    """Removing validate from routine updates must not remove the ability to
+    repair a genuinely broken install — it just stops being the default."""
+    steam = tmp_path / "steamcmd.exe"
+    steam.write_bytes(b"MZ")
+    cfg = Config()
+    cfg.steamcmd_path = str(steam)
+    cfg.server_root = str(tmp_path / "server")
+    cfg.backup_root = str(tmp_path / "backups")
+
+    calls: list = []
+    _patch_service(monkeypatch, calls)
+
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line=None):
+        calls.append(("update", validate))
+        return 0
+
+    monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
+    monkeypatch.setattr(sched_mod.steamcmd, "backup_file", lambda p: None)
+
+    bus = EventBus()
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(validate=True))
+
+    assert ("update", True) in calls

@@ -26,7 +26,50 @@ from datetime import datetime
 from pathlib import Path
 
 SECTION = "[/Script/Pal.PalGameWorldSettings]"
-_OPTION_RE = re.compile(r"OptionSettings\s*=\s*\((.*)\)\s*$", re.DOTALL)
+# Locates the start of the block. Where it *ends* is found by matching parens
+# (see _find_option_block) rather than by regex: the obvious
+# `OptionSettings\s*=\s*\((.*)\)\s*$` with DOTALL reaches for the last ")" in
+# the whole file, which breaks two real files —
+#   * anything after the block containing a ")" gets swallowed into the last
+#     option's value, and writing the file back then mangles both, and
+#   * a trailing comment line makes the "$" anchor fail, so a perfectly good
+#     ini reads as "no OptionSettings block" — reported to the user as "the
+#     file is blank, seed it from the default", i.e. advice that would destroy
+#     the settings it failed to read.
+_OPTION_START_RE = re.compile(r"OptionSettings\s*=\s*\(")
+
+
+def _find_option_block(text: str) -> tuple[int, str, int] | None:
+    """Locate `OptionSettings=(...)`, returning (body_start, body, body_end) —
+    the slice indices of the text *inside* the outermost parens, so a caller can
+    keep everything before and after it byte-for-byte.
+
+    The closing paren is found by counting depth and honouring double quotes,
+    the same rules _split_top_level uses. That's what makes a value like
+    `ServerDescription="a )"` and a following `[SomeOtherSection]` both safe.
+    None if there's no block at all.
+    """
+    m = _OPTION_START_RE.search(text)
+    if not m:
+        return None
+    start = m.end()  # first char inside the opening paren
+    depth = 1
+    in_quotes = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == '"':
+            in_quotes = not in_quotes
+        elif in_quotes:
+            continue
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return start, text[start:i], i
+    # Unbalanced — the file is truncated mid-block. Treat everything left as the
+    # body rather than refusing: the caller still gets the options that survived.
+    return start, text[start:], len(text)
 
 
 def _split_top_level(body: str) -> list[str]:
@@ -136,25 +179,39 @@ class PalSettings:
     people's servers after an update.
     """
 
-    def __init__(self, options: dict[str, Option], order: list[str]) -> None:
+    def __init__(
+        self,
+        options: dict[str, Option],
+        order: list[str],
+        prefix: str = SECTION + "\n" + "OptionSettings=(",
+        suffix: str = ")\n",
+    ) -> None:
         self._options = options
         self._order = order
+        # Everything before and after the OptionSettings block, kept verbatim so
+        # a save can't quietly delete another section, a header comment, or a
+        # trailing note. Same principle as preserving unknown keys: a settings
+        # editor that drops what it didn't understand is how config editors eat
+        # people's servers.
+        self._prefix = prefix
+        self._suffix = suffix
 
     # ---------- parsing ----------
 
     @classmethod
     def parse(cls, text: str) -> PalSettings:
-        m = _OPTION_RE.search(text)
-        if not m:
+        found = _find_option_block(text)
+        if found is None:
             raise ValueError(
                 "No OptionSettings=(...) block found. If the file is blank, that's "
                 "normal — seed it from DefaultPalWorldSettings.ini first."
             )
+        body_start, body, body_end = found
 
         options: dict[str, Option] = {}
         order: list[str] = []
 
-        for part in _split_top_level(m.group(1)):
+        for part in _split_top_level(body):
             if "=" not in part:
                 continue
             key, _, raw = part.partition("=")
@@ -162,7 +219,7 @@ class PalSettings:
             options[key] = Option(key=key, raw=raw.strip(), kind=_classify(raw))
             order.append(key)
 
-        return cls(options, order)
+        return cls(options, order, text[:body_start], text[body_end:])
 
     @classmethod
     def load(cls, path: Path) -> PalSettings:
@@ -205,7 +262,7 @@ class PalSettings:
 
     def render(self) -> str:
         body = ",".join(f"{k}={self._options[k].raw}" for k in self._order)
-        return f"{SECTION}\nOptionSettings=({body})\n"
+        return f"{self._prefix}{body}{self._suffix}"
 
     def save(self, path: Path, *, backup: bool = True) -> Path | None:
         """

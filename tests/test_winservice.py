@@ -422,3 +422,44 @@ def test_ensure_winsw_refuses_a_tampered_download(tmp_path: Path, monkeypatch):
         winservice.ensure_winsw(cache, sha256="f" * 64)
     # Nothing unverified was left on disk as the usable binary.
     assert not (cache / "winsw.exe").exists()
+
+
+def test_a_hung_service_command_reads_as_failure_not_an_exception(monkeypatch):
+    """WinSW's install/start/stop drive the SCM, which can sit in START_PENDING
+    or STOP_PENDING for a long time on a sick service. A timeout must become a
+    reportable failed step, not an exception the callers don't catch."""
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        assert kwargs.get("timeout") == winservice.WINSW_TIMEOUT
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert winservice._run(["winsw", "start"]).returncode != 0
+
+
+def test_the_account_password_is_scrubbed_even_when_install_fails(tmp_path, monkeypatch):
+    """The password is in the XML only because WinSW needs it there for the one
+    `install` command; the SCM holds it from then on. The scrub therefore has to
+    happen on the failure path too — `install` can raise rather than return
+    non-zero (a quarantined or locked wrapper exe is an OSError), and skipping
+    the scrub there leaves a Windows account password in a plaintext file
+    indefinitely, while setup reports failure so nobody thinks to look."""
+    winsw = tmp_path / "winsw.exe"
+    winsw.write_bytes(b"MZ")
+
+    monkeypatch.setattr(winservice, "service_exists", lambda name: False)
+
+    def refuse(cmd):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(winservice, "_run", refuse)
+
+    with pytest.raises(PermissionError):
+        winservice.install_service(
+            winsw, "PalServer", r"C:\srv\PalServer.exe", "-args", r"C:\srv",
+            user=".\\steve", password="MyWindowsPassword123", start=False,
+        )
+
+    _, xml = winservice.wrapper_paths(tmp_path, "PalServer")
+    assert "MyWindowsPassword123" not in xml.read_text(encoding="utf-8")

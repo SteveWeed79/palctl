@@ -73,3 +73,18 @@ def test_remove_health_task_deletes_when_present(monkeypatch):
     calls = _fake_run(monkeypatch, {"/Query": 0, "/Delete": 0})
     assert wintask.remove_health_task() is True
     assert calls[-1][1] == "/Delete"
+
+
+def test_a_hung_schtasks_reads_as_failure_not_an_exception(monkeypatch):
+    """schtasks talks to the Task Scheduler service and can hang when that
+    service is wedged. TimeoutExpired is a SubprocessError, not an OSError, so
+    it would escape every caller's except clause — _run folds it into a non-zero
+    result, which is already the best-effort "couldn't do it" path."""
+
+    def fake_run(cmd, **kwargs):
+        assert kwargs.get("timeout") == wintask.SCHTASKS_TIMEOUT
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wintask, "_on_windows", lambda: True)
+    assert wintask._run(["schtasks", "/Query"]).returncode != 0

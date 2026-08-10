@@ -40,6 +40,34 @@ RED = 0xF85149
 GREEN = 0x3FB950
 
 
+def command_allowed_here(home_guild_id: int, interaction_guild_id: int | None) -> bool:
+    """Whether a slash command from this guild may drive *this* server.
+
+    Commands are registered globally, so they appear in every guild the bot is
+    in — and a Discord application is created with "Public Bot" switched ON, so
+    anyone who has the client ID (it is in the invite URL, and on the bot's
+    profile) can add the bot to a guild of their own. Without this check, the
+    default setup then hands them the keys: `_admin_allowed` falls back to
+    Manage Server when no admin ID is configured, and in a guild they created
+    they have Manage Server by definition. `/stop`, `/restore`, `/update` and
+    `/ban` against someone else's Palworld server, from a guild the operator
+    has never heard of.
+
+    So a command only counts if it came from the operator's own guild. Until we
+    know which one that is (`home_guild_id == 0` — no `guild_id` configured and
+    no notification channel to infer it from) nothing is rejected, because
+    guessing wrong would lock the real operator out of their own bot. Setting
+    either one closes the door.
+
+    DMs (`interaction_guild_id is None`) are allowed through to
+    `_admin_allowed`, which denies them unless the caller *is* the configured
+    admin user — there is no Manage Server to fall back on in a DM.
+    """
+    if not home_guild_id or interaction_guild_id is None:
+        return True
+    return interaction_guild_id == home_guild_id
+
+
 def _admin_allowed(
     admin_id: int,
     caller_id: int,
@@ -227,6 +255,9 @@ class PalBot(discord.Client):
     ) -> None:
         super().__init__(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self)
+        # One gate in front of every command, present and future — a per-handler
+        # check would be one forgotten decorator away from a hole.
+        self.tree.interaction_check = self._guild_check
         self._cfg = cfg
         self._api = api
         self._bus = bus
@@ -363,6 +394,40 @@ class PalBot(discord.Client):
             pass
 
     # ---------- permissions ----------
+
+    def _home_guild_id(self) -> int:
+        """The one guild allowed to drive this server: the configured
+        `guild_id`, or the guild owning the notification channel. 0 if neither
+        is known — see command_allowed_here for why that stays permissive."""
+        explicit = self._cfg.discord.guild_id
+        if explicit:
+            return explicit
+        cid = self._cfg.discord.channel_id
+        if not cid:
+            return 0
+        channel = self.get_channel(cid)
+        guild = getattr(channel, "guild", None)
+        return getattr(guild, "id", 0) or 0
+
+    async def _guild_check(self, interaction: discord.Interaction) -> bool:
+        """Runs before every slash command. Rejecting here means the handler
+        never runs, so a command added later is covered without remembering
+        anything."""
+        if command_allowed_here(self._home_guild_id(), interaction.guild_id):
+            return True
+        logging.getLogger("palctl.bot").warning(
+            "rejected /%s from guild %s (not this server's guild) — user %s",
+            getattr(interaction.command, "name", "?"),
+            interaction.guild_id,
+            getattr(interaction.user, "id", "?"),
+        )
+        with contextlib.suppress(discord.DiscordException):
+            await interaction.response.send_message(
+                "This bot is tied to a different Discord server and won't take "
+                "commands here.",
+                ephemeral=True,
+            )
+        return False
 
     def _is_admin(self, interaction: discord.Interaction) -> bool:
         perms = getattr(interaction.user, "guild_permissions", None)

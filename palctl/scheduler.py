@@ -615,15 +615,26 @@ class Scheduler:
 
     # ---------- server update (SteamCMD) ----------
 
-    async def update_server(self, *, validate: bool = True) -> None:
+    async def update_server(self, *, validate: bool = False) -> None:
         """
         Stop the server, run SteamCMD `app_update`, and bring it back — the thing
         that finally uses the steamcmd_path / app_id the config always stored.
 
-        The `validate` pass is what blanks PalWorldSettings.ini, so we copy the
-        ini aside first and, if Steam does wipe it, put it straight back. Losing
-        an afternoon of server tuning to an update is the exact papercut this
-        avoids.
+        ``validate`` is **off** for routine updates, and that is a deliberate
+        change from how this used to work. Every update — scheduled, GUI button,
+        Discord `/update` — used to run `app_update … validate`, and `validate`
+        is not an update: it is a full checksum of every file in the install
+        against Steam's manifest, restoring anything that differs. Valve's own
+        guidance is to use it to repair a suspected-broken install, not to
+        update one. Running it routinely cost a full multi-GB verification pass
+        on every single update, and — as this module's old docstring cheerfully
+        admitted — it is the thing that resets PalWorldSettings.ini. palctl was
+        causing that damage itself, on a schedule, and then trying to undo it
+        afterwards.
+
+        Plain `app_update` still installs the newest build; it just doesn't
+        re-verify files that were already correct. Pass ``validate=True`` to get
+        the old behaviour deliberately, as a repair.
         """
         cfg = self._cfg
         steam = Path(cfg.steamcmd_path)
@@ -640,6 +651,85 @@ class Scheduler:
         async with self._control.operation("update"):
             self._set_intent(True)  # the server is meant to be up after an update
             await self._update_locked(cfg, validate=validate)
+
+    async def _heal_ini_after_update(
+        self, cfg: Config, ini: Path, ini_backup: Path | None
+    ) -> None:
+        """Put PalWorldSettings.ini back the way the admin had it, and make sure
+        palctl can still reach the server through it.
+
+        A server update can leave the ini blank, or — the case that used to slip
+        through entirely — full of Palworld's *defaults*. The second is worse
+        precisely because it looks fine: `is_blank` says no, so the pre-update
+        backup was never used, every tuned rate silently reverted, and since the
+        defaults carry `RESTAPIEnabled=False` and no `AdminPassword`, palctl went
+        permanently blind to a server that was running the whole time. Nothing in
+        the daemon could see it, restarting fixed nothing (the process was never
+        the problem), and the only clue was "the server did not come back".
+
+        So: restore a blank file wholesale, merge the admin's own values back
+        over a reset one, then re-assert the three REST API settings palctl
+        needs — the same call setup makes, which is idempotent and until now was
+        never made again for the life of the install."""
+        from .config import get_admin_password
+        from .serversetup import ensure_rest_api, restore_user_settings
+
+        if ini_backup and await asyncio.to_thread(is_blank, ini):
+            await asyncio.to_thread(shutil.copy2, ini_backup, ini)
+            await self._bus.emit(
+                Event(
+                    "update",
+                    "♻️ The update blanked PalWorldSettings.ini — restored it "
+                    "from the pre-update backup.",
+                )
+            )
+        elif ini_backup:
+            restored = await asyncio.to_thread(restore_user_settings, ini, ini_backup)
+            if restored:
+                shown = ", ".join(f"`{k}`" for k in restored[:8])
+                more = f" (+{len(restored) - 8} more)" if len(restored) > 8 else ""
+                await self._bus.emit(
+                    Event(
+                        "update",
+                        f"♻️ The update reset {len(restored)} setting(s) in "
+                        f"PalWorldSettings.ini back to Palworld's defaults — put "
+                        f"your values back: {shown}{more}. The pre-update copy is "
+                        f"at `{ini_backup.name}` if you want to compare.",
+                        {"restored": restored, "backup": str(ini_backup)},
+                    )
+                )
+
+        # Re-assert: cheap, idempotent, and the one thing that decides whether
+        # palctl can still see the server it just updated.
+        #
+        # Skipped only when there is no ini and no default to seed one from —
+        # that means the server isn't installed, which the update's own "did the
+        # files arrive?" reporting already covers. Warning again here would just
+        # add noise to a failure the caller has already explained.
+        have_ini = await asyncio.to_thread(ini.exists)
+        have_default = await asyncio.to_thread(cfg.default_ini.exists)
+        if not have_ini and not have_default:
+            return
+
+        password = await asyncio.to_thread(get_admin_password)
+        try:
+            await asyncio.to_thread(
+                ensure_rest_api,
+                ini,
+                cfg.default_ini,
+                port=cfg.api_port,
+                password=password,
+            )
+        except Exception as e:
+            await self._bus.emit(
+                Event(
+                    "error",
+                    "⚠️ Couldn't confirm the REST API settings in "
+                    f"PalWorldSettings.ini after the update ({e}). If palctl "
+                    "can't see the server from here, check RESTAPIEnabled, "
+                    "RESTAPIPort and AdminPassword in that file.",
+                )
+            )
 
     async def _confirm_install_is_free(self, cfg: Config) -> bool:
         """
@@ -805,17 +895,10 @@ class Scheduler:
                     on_line=sink,
                 )
             finally:
-                # SteamCMD can blank the ini and then die — put the settings
-                # back even on failure, before the server is started again.
-                if ini_backup and is_blank(ini):
-                    await asyncio.to_thread(shutil.copy2, ini_backup, ini)
-                    await self._bus.emit(
-                        Event(
-                            "update",
-                            "♻️ SteamCMD blanked PalWorldSettings.ini — restored "
-                            "it from the pre-update backup.",
-                        )
-                    )
+                # Whatever the update did to the ini, put it right before the
+                # server comes back up. Runs on failure too — a SteamCMD that
+                # died halfway is exactly when the ini is half-rewritten.
+                await self._heal_ini_after_update(cfg, ini, ini_backup)
 
             tail = f" ({latest[0]})" if latest else ""
             after = await asyncio.to_thread(

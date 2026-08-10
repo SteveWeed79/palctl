@@ -10,6 +10,282 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+## [1.2.5.7] — 2026-08-09
+
+Four audit passes over the reliability of palctl's own machinery, prompted by a
+report of the app or the server "hanging up badly". Builds on 1.2.5.6, which
+made updates prove the build landed; this pass is about everything else that
+could stall, mislead, or quietly undo itself.
+
+The through-line: palctl drives things that can stop responding — SteamCMD,
+`sc.exe`/`systemctl`, `netsh`, `schtasks`, the Palworld REST API, its own worker
+threads — and in a dozen places it waited on them forever, or drew the wrong
+conclusion when they went quiet. Two could park the whole app indefinitely, one
+made the daemon restart itself at the worst possible moment, one let a stranger
+drive your server from Discord, and one turned a single comment in
+`PalWorldSettings.ini` into a file palctl couldn't read.
+
+Later passes stopped reading code and drove palctl from the outside instead —
+against a server that hangs (accepting connections and never answering, which
+is what a wedged PalServer actually does), and against a Steam update that
+resets `PalWorldSettings.ini`. Those found the two failures most likely to read
+as "palctl is broken": an update that leaves palctl permanently unable to see
+a server that is running fine (top of **Fixed**), and a down server that palctl
+reports once and then never mentions again because auto-recovery is off by
+default (see **Changed**). Neither was reachable by reading files.
+
+### Security
+- **The Discord bot now only takes commands from your own server.** Slash
+  commands are registered globally, so they appear in *every* guild the bot has
+  been added to — and a Discord application is created with **Public Bot**
+  switched **on**, so anyone holding the client ID (it's in the invite URL, and
+  on the bot's profile) could add your bot to a guild of their own. There they
+  hold Manage Server by definition, which is exactly what admin access falls
+  back to when `admin_role_id` is unset — the default, and the setup the docs
+  recommended. That was a working path to `/stop`, `/restore`, `/update` and
+  `/ban` on a stranger's Palworld server. The bot now accepts commands from one
+  guild only: `discord.guild_id` if set, otherwise whichever guild owns your
+  notification channel; anything else is refused and logged. The check sits in
+  front of the whole command tree rather than on each handler, so commands added
+  later are covered automatically. If you have a channel configured there is
+  nothing to do. The Discord guide now also says to turn Public Bot off.
+
+- **A failed service registration no longer leaves your Windows account password
+  on disk.** WinSW needs the password in its config XML for the single `install`
+  command, after which the SCM holds it and palctl scrubs the file. The scrub
+  wasn't in a `finally`, and `install` can raise rather than return non-zero (a
+  quarantined or locked wrapper exe is an `OSError`) — on that path the password
+  stayed in plaintext indefinitely, while setup reported failure, so nobody
+  would think to look.
+
+### Added
+- **[Palworld server practices](docs/palworld-server-practices.md)** — the
+  documented behaviour of Palworld and SteamCMD that this release's fixes come
+  from, with sources, and where palctl agrees or deviates. Written so the
+  deviations are a choice on the record rather than an accident, and so the next
+  person doesn't re-derive it.
+
+### Fixed
+- **The account-split warning could be silenced permanently by one bad look.**
+  If the Palworld server runs under a different Windows account than palctl,
+  palctl can't read its memory — it lands on the idle launcher, and the leak
+  watchdog can never fire, so the box climbs until it thrashes. A one-shot
+  warning is the only protection against that, and its "already warned" flag was
+  set *before* the check ran, unconditionally. A single poll where the process
+  wasn't readable therefore suppressed the warning for the rest of the daemon's
+  life — and an account split is itself a reason psutil can't read the process,
+  so the servers that most needed telling were the ones told least. "Couldn't
+  tell" and "no mismatch" are now distinct, and only a definitive answer latches.
+- **`-pre-restore` safety copies are now bounded (newest 3) instead of never
+  pruned.** They're full copies of the world, taken automatically on every
+  restore, and being exempt from retention entirely reads as safe but isn't —
+  a few restores leave several multi-GB worlds on the same disk as the live one,
+  forever, and a full disk corrupts saves. They're counted separately from
+  ordinary backups, so a restore's safety copy can never push a real backup out
+  or be pushed out by one.
+
+### Added
+- **The first-run wizard now has a "Raids and the memory leak" section.** It's
+  the only choice in setup that changes how the *game* plays rather than how
+  palctl is installed, so it gets its own section and its own explanation:
+  what the raid waves do to memory, how much difference turning them off
+  makes, and why palctl leaves the decision to you. **Unticked by default** —
+  leave it alone and Palworld behaves exactly as it ships. Ticking it is the
+  only thing that writes `bEnableInvaderEnemy=False`; an admin who already
+  turned raids off never has setup turn them back on.
+
+### Changed
+- **palctl now points at raids when memory is climbing.** Palworld's scripted
+  invader waves spawn enemies the server never cleans up; operators
+  consistently report RAM climbing at roughly half the rate with
+  `bEnableInvaderEnemy=False`, making it the most-recommended companion to
+  scheduled restarts. A memory-leak-focused tool had nowhere that said so. The
+  settings editor now explains it, and the leak forecast — the moment you're
+  actually thinking about memory — appends the suggestion, but only when raids
+  are on and only when palctl could genuinely read the setting. palctl does not
+  change it for you: raids are game content, and the evidence is operator
+  experience rather than vendor guidance.
+- **The settings editor now tells you when `WorldOption.sav` is silently
+  overriding the file you're editing.** This is the single most common reason
+  Palworld settings "don't apply", and it fails without any error:
+  `PalWorldSettings.ini` is read when a world is *created*, after which the
+  server copies the gameplay settings into `WorldOption.sav` and reads them from
+  there — and a world imported from co-op or single-player always brings one
+  along. palctl used to mention this in a sentence shown to everybody, which is
+  noise on the servers it doesn't affect and easy to skim past on the ones where
+  it discards every edit. It now looks for the file and, only when one exists,
+  names the settings that will be ignored, the ones that still work (server
+  name, ports, player cap, the REST API), and the path.
+- **Updates no longer run `validate`, which is what was resetting your ini.**
+  Every update path — the schedule, the GUI button, Discord `/update` — ran
+  `app_update … validate`. `validate` is not an update: it is a full checksum of
+  every file in the install against Steam's manifest, restoring anything that
+  differs. Valve's guidance is to use it to repair a suspected-broken install,
+  not to update one. palctl ran it routinely, which cost a full multi-GB
+  verification pass every time and — as this code's own docstring admitted — is
+  the thing that resets `PalWorldSettings.ini`. palctl was causing that damage
+  itself, on a schedule, then trying to undo it afterwards. Plain `app_update`
+  still installs the newest build. Validation is still available deliberately,
+  as a repair: `POST /action/update-server {"validate": true}`.
+- **A server update could leave palctl permanently blind, and silently wipe your
+  settings.** This is the one that looks like "palctl is broken": after a
+  SteamCMD update the dashboard shows nothing, the server can't be connected to,
+  and restarting the service changes nothing — because nothing is wrong with the
+  process. palctl took a backup of `PalWorldSettings.ini` before every update and
+  then only ever restored it `if is_blank(...)` — only when the file came back
+  *completely empty*. An update that leaves a **valid** ini full of Palworld's
+  defaults sailed straight past that check, and those defaults carry
+  `RESTAPIEnabled=False` and an empty `AdminPassword` — the exact two settings
+  palctl needs to see the server at all. Every tuned rate, the server name and
+  the player cap went with them. The backup was sitting on disk, unused and
+  unmentioned. Now: a blank ini is restored wholesale as before, a *reset* ini
+  has the admin's own values merged back over it (settings a genuine game patch
+  added keep their new defaults; settings it removed stay removed), and the REST
+  API settings are re-asserted after every update — the same idempotent call
+  setup makes, which until now was never made again for the life of the install.
+  palctl also says which settings it put back, and where the pre-update copy is.
+- **A stalled SteamCMD no longer wedges palctl permanently.** This was the worst
+  one. An update stops the game server *first*, then runs SteamCMD while holding
+  the single server-operation lock. SteamCMD had no timeout — so a download that
+  stalled, or a SteamCMD sitting on a login/Steam Guard prompt, left the server
+  **down** and the lock **held forever**: the memory watchdog, crash
+  auto-recovery, scheduled restarts, and every Start/Stop/Restart/Backup/Restore
+  in the GUI, dashboard and Discord bot all answered *"busy: update is in
+  progress"* until someone restarted the daemon by hand. `/healthz` still
+  reported **ok** the whole time, because the poll loop was fine — so nothing
+  monitoring the box would ever tell you. SteamCMD is now killed if it goes
+  silent for 20 minutes (silence is the signal: it's continuously chatty while
+  it actually works, and a total time cap would either kill legitimate multi-GB
+  installs or be too loose to catch anything). The failure is reported as an
+  event, the ini is restored, the server is started again, and the lock is
+  released — the same path as any other failed update.
+- **Killing a hung SteamCMD now kills its children too.** SteamCMD is a launcher
+  (`steamcmd.sh` re-execs the real binary; the Windows build spawns helpers).
+  Signalling only the process palctl launched leaves a child holding the
+  inherited stdout pipe open, so the reader never sees EOF and the wait after
+  the kill blocks for as long as that orphan lives — which would have recreated
+  the exact hang above, from inside the recovery path. It also meant SteamCMD
+  could still be writing into the install directory while the server restarted
+  on top of it.
+- **The daemon no longer goes deaf during startup on Windows.** The dashboard
+  firewall sync (`netsh`) and the cloud-mirror check ran on the event loop,
+  *after* the control API's port was bound. `netsh` against a stopped or sick
+  Windows Firewall service can take tens of seconds, and during that window the
+  daemon accepted TCP connections and answered **nothing** — the GUI showed
+  "Can't reach the palctl daemon", the dashboard hung, and no port check could
+  see anything wrong. Both now run off the loop and out of the startup path, so
+  they delay only their own log line — not polling, not the control API, and not
+  the READY signal the service manager waits on.
+- **A wrong or missing `service_name` now fails in seconds instead of two
+  minutes.** A service name the SCM/systemd doesn't recognise never reaches
+  RUNNING or STOPPED, so every Start and Stop waited out the full 120-second
+  timeout, held the server lock for all of it, and then failed anyway — with no
+  hint as to why. palctl now recognises a sustained UNKNOWN as "the service
+  manager has never heard of this name", gives up after about ten seconds, and
+  logs the actual problem and how to fix it. A single blip (a query that timed
+  out) is still tolerated.
+- **Bounded every remaining external command.** `netsh` (firewall), `schtasks`
+  (the health task), `systemctl` (the Linux unit), WinSW/`sc` (service
+  install/start/stop) and the silent Visual C++ runtime install all ran with no
+  timeout, so a wedged service manager or a competing installer could hang the
+  setup wizard or the CLI with no output and no way out but killing the app.
+  Each now has a timeout and reports a normal failure — these all already had a
+  best-effort failure path; they just never reached it.
+- **SteamCMD's build-id check is bounded too**, so a hung metadata query can't
+  leak a process and silently stop the six-hourly update check from ever
+  running again.
+- **Daemon shutdown can no longer overrun the service manager's stop timeout.**
+  Cancelling a task that is parked in a worker thread is a request, not a
+  guarantee; teardown now waits a bounded time for those to unwind rather than
+  blocking on the slowest external tool and being killed mid-teardown — which
+  skipped closing the event store, the one step that writes to disk.
+- **The daemon no longer restarts itself whenever the game server goes down.**
+  `/healthz` is meant to answer "is this daemon alive", and the only thing that
+  acts on it — the Windows health task — responds by restarting the daemon. But
+  its liveness clock was stamped only on polls where the *Palworld REST API
+  answered*, so a down game server was indistinguishable from a wedged daemon:
+  60 seconds into any outage `/healthz` went 503, and ~15 minutes in the health
+  task restarted a completely healthy daemon. That is the worst possible moment
+  — auto-recovery is mid-flight, and the restart kills it, wipes the
+  `crash_restart_max_per_hour` budget that exists to stop restart loops, and can
+  leave the game server stopped between the stop and start of a restart cycle.
+  The clock is now stamped on every completed poll cycle, whatever the outcome.
+  Game-server reachability is still reported, as `alive`, and still acted on by
+  the watchdog and auto-recovery — where it belongs.
+- **An outage that spans a daemon restart is recoverable again.** Auto-recovery
+  refuses to touch a server it has never seen up — a sound guard, but the flag
+  lived only in memory, so a daemon that restarted *during* an outage came back
+  believing the server had never worked and would never recover it. It stayed
+  down until a human noticed. The flag is now persisted next to the Stop intent.
+- **An empty `daemon_token` file no longer locks you out permanently.** A
+  zero-byte token file made every caller mint a fresh random token that was
+  never written, so the daemon and the GUI could never agree again — 401s that
+  no restart fixes, reported by the GUI as a config-directory mismatch, which
+  sends you chasing a completely unrelated fix. Getting there took nothing
+  exotic: a crash or a full disk between creating the file and writing it, and
+  the write failure was swallowed by design, leaving the empty file behind. An
+  empty or whitespace-only token file is now treated as no token and replaced,
+  and a failed write cleans up after itself instead of poisoning every later run.
+- **Event history is pruned (30 days), like metrics already were.** Nothing ever
+  read this table back, and it grew forever — inside `sessions.db`, which is
+  snapshotted into *every* backup and mirrored off-site, so the bloat multiplied
+  across every retained copy. The durable audit trail is the rotating file log,
+  which every event is also written to.
+- **A comment in `PalWorldSettings.ini` no longer hides the whole file.** The
+  parser looked for the block's closing paren with a regex anchored to the end
+  of the file, so a single trailing line — a comment, a note to self — made a
+  perfectly good ini read as *"no OptionSettings block found"*. The settings
+  editor then told you the file was blank and offered to re-seed it from the
+  default, which would have destroyed the settings it had just failed to read.
+  Quieter and worse: `read_admin_password` swallows that same parse error and
+  returns empty, so the daemon couldn't authenticate to the REST API and
+  reported the server as up-but-unauthorised — for one comment line.
+- **A second `[Section]` in the ini is no longer silently corrupted.** The same
+  greedy match reached past the block to the last `)` anywhere in the file, so
+  another section landed *inside* the final option's value — and saving wrote
+  both back mangled. The block's end is now found by matching parens (honouring
+  quotes), and everything outside it — other sections, header comments, trailing
+  notes — round-trips byte-for-byte. A truncated file now yields the options
+  that survived instead of refusing outright.
+- **Quitting the GUI no longer crashes it.** Qt aborts the process when a
+  QThread is destroyed while still running, the tray's Quit went straight to
+  `QApplication.quit`, and the state poller loops forever by design — so it was
+  *always* running at quit time. Every exit ended in an abort (a "palctl-gui.exe
+  has stopped working" dialog on Windows), which is the last thing a user sees.
+  Worker threads now register themselves and are drained on `aboutToQuit`;
+  anything still busy after a short grace — an `/action/stop` can legitimately
+  be in a long call — is terminated rather than allowed to abort the app. The
+  poller also sleeps in slices so quit is immediate instead of waiting out the
+  poll interval.
+- **Settings-editor group headings show their ampersand.** Qt reads `&` in a
+  title as a mnemonic marker, so "Difficulty & rates" rendered as
+  "Difficulty _rates" (and likewise "Base & building", "Pals & eggs").
+- **A corrupt `config.json` can't crash-loop the daemon after all.** The
+  recovery path renames the bad file aside and carries on with defaults — but
+  the rename itself can fail (a Windows AV scanner or the search indexer holding
+  the file open is a `PermissionError`), and that escaped, killing the daemon
+  *before* `asyncio.run`, in the code written to prevent exactly that crash
+  loop. The quarantine is now best-effort, as it always claimed to be.
+
+### Changed
+- **A down server no longer fails silently when auto-recovery is off.** Watching
+  a real hang from outside, the entire output was one *"🔴 Server is down."* and
+  then nothing, ever — which is indistinguishable from palctl itself being
+  broken, and is the likeliest reason anyone concludes that it is. The recovery
+  that would have fixed it (`watchdog.auto_restart_on_crash`) is **off by
+  default**, deliberately: restarting your server unasked shouldn't be a
+  default. But nothing said so. palctl now reports, once per outage, that the
+  server is down and it has been told not to restart it — naming the setting to
+  change. Turned on, behaviour is unchanged.
+- The SteamCMD stall timeout is 20 minutes rather than 10. The two errors aren't
+  symmetric: a real wedge is permanent, so noticing ten minutes later costs ten
+  minutes once, while killing a healthy run costs a failed install — and
+  SteamCMD's commit phase after a large depot download is legitimately quiet for
+  minutes on a slow disk.
+- CI now runs the GUI's thread-lifecycle tests in the import-smoke job, which
+  already has a headless Qt. They need a real `QApplication`, so nothing else
+  could have caught the crash-on-quit above.
+
 ## [1.2.5.6] — 2026-07-29
 
 A server-update honesty pass. Every fix here targets the same end state: the
