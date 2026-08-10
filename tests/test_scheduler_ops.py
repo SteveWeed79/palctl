@@ -12,11 +12,34 @@ from palctl.events import EventBus
 
 
 class FakeApi:
+    # `online` drives the countdown-collapse rule: an empty server has nobody
+    # to warn, so the wait is cut short. None = the REST API isn't answering,
+    # which reads the same way (an announcement reaches nobody either).
+    def __init__(self, online: int | None = 1):
+        self.online = online
+        self.announced: list[str] = []
+
     async def save(self):
         pass
 
     async def wait_until_alive(self, timeout=240):
         return True
+
+    async def announce(self, message):
+        self.announced.append(message)
+
+    async def players(self):
+        if self.online is None:
+            raise RuntimeError("REST API not answering")
+        return [object()] * self.online
+
+
+def _no_countdown(cfg: Config) -> Config:
+    """Most of these tests are about what happens *after* the warning, so turn
+    it off rather than sleeping through it."""
+    cfg.schedule.restart_countdown_seconds = 0
+    cfg.schedule.restore_countdown_seconds = 0
+    return cfg
 
 
 def _collect(bus: EventBus) -> list:
@@ -519,7 +542,7 @@ def test_update_server_aborts_without_steamcmd(tmp_path, monkeypatch):
 
 
 def test_restore_backup_stops_restores_then_starts(tmp_path, monkeypatch):
-    cfg = Config()
+    cfg = _no_countdown(Config())
     cfg.backup_root = str(tmp_path / "backups")
     cfg.server_root = str(tmp_path / "server")
     name = "2026-01-01_00-00-00-manual"
@@ -543,7 +566,7 @@ def test_restore_backup_stops_restores_then_starts(tmp_path, monkeypatch):
 def test_restore_backup_aborts_when_server_wont_stop(tmp_path, monkeypatch):
     # Copying over a live save corrupts it: a stop that never confirms STOPPED
     # must leave the world untouched.
-    cfg = Config()
+    cfg = _no_countdown(Config())
     cfg.backup_root = str(tmp_path / "backups")
     cfg.server_root = str(tmp_path / "server")
     name = "2026-01-01_00-00-00-manual"
@@ -798,16 +821,11 @@ def test_reserved_restart_runs_and_clears_the_reservation(monkeypatch):
     # operation lock clears the reservation, the restart runs, and the finally
     # clears again. Proves the reserve+run path can't deadlock or leak a
     # reservation. Countdown sleeps are faked so the test is instant.
-    cfg = Config()
+    cfg = _no_countdown(Config())
     calls: list = []
     _patch_service(monkeypatch, calls)
 
     sched = sched_mod.Scheduler(cfg, FakeApi(), EventBus())
-
-    async def _no_wait(_delay):
-        return False  # never "cancelled", and no real sleeping
-
-    monkeypatch.setattr(sched, "_sleep_or_cancel", _no_wait)
 
     assert sched.reserve("restart") is True
 
@@ -859,69 +877,248 @@ def test_start_server_when_busy_returns_busy_without_claiming_intent(monkeypatch
     assert not any(c[0] == "start" for c in calls)
 
 
-# ---------------- /cancel an in-progress countdown ----------------
+# ---------------- cancelling and skipping a countdown ----------------
+#
+# The admin-facing half of every take-the-server-down operation. Both escape
+# hatches, on both operations, plus the three answers the surfaces give back —
+# "too late" is deliberately not the same reply as "nothing was running".
 
 
-def test_cancel_countdown_reports_whether_one_was_running():
+async def _armed(sched, timeout_ticks: int = 1000):
+    """Yield to the loop until the countdown has registered itself."""
+    for _ in range(timeout_ticks):
+        if sched._countdown is not None:
+            return True
+        await asyncio.sleep(0)
+    return False
+
+
+def _countdown_sched(monkeypatch, calls, *, seconds=30, online=1, **kw):
+    cfg = Config()
+    cfg.schedule.restart_countdown_seconds = seconds
+    cfg.schedule.restore_countdown_seconds = seconds
+    _patch_service(monkeypatch, calls)
+    bus = EventBus()
+    return cfg, bus, sched_mod.Scheduler(cfg, FakeApi(online), bus, **kw)
+
+
+def test_cancel_and_skip_report_idle_when_nothing_is_running():
     sched = sched_mod.Scheduler(Config(), FakeApi(), EventBus())
-    assert sched.cancel_countdown() is False  # nothing armed
-    sched._cancel_restart = asyncio.Event()
-    assert sched.cancel_countdown() is True
-    assert sched._cancel_restart.is_set()
-    assert sched.cancel_countdown() is False  # already cancelled, don't re-fire
+    assert sched.cancel_countdown() == "idle"
+    assert sched.skip_countdown() == "idle"
+    assert sched.countdown_state() is None
 
 
-def test_sleep_or_cancel_true_when_event_set_false_without_event():
-    async def with_set():
-        sched = sched_mod.Scheduler(Config(), FakeApi(), EventBus())
-        sched._cancel_restart = asyncio.Event()
-        sched._cancel_restart.set()
-        return await sched._sleep_or_cancel(0)
+def test_only_operations_that_count_down_can_be_arrived_at_too_late():
+    """"Too late" means the admin missed a window. A backup, an update or the
+    boot-time start never had one, so answering their Cancel with "too late"
+    sends them looking for a countdown that never existed — and, because the
+    daemon starts the server at boot, made the answer depend on how recently
+    the machine came up."""
+    sched = sched_mod.Scheduler(Config(), FakeApi(), EventBus())
 
-    async def without_event():
-        sched = sched_mod.Scheduler(Config(), FakeApi(), EventBus())
-        return await sched._sleep_or_cancel(0)  # no event armed -> plain (0s) sleep
+    async def verdict_while(op: str) -> tuple[str, str]:
+        async with sched._control.operation(op):
+            return sched.cancel_countdown(), sched.skip_countdown()
 
-    assert _run(with_set()) is True
-    assert _run(without_event()) is False
+    for op in ("restart", "restore"):
+        assert _run(verdict_while(op)) == ("too_late", "too_late"), op
+    for op in ("backup", "update", "start", "stop", "auto-recover", "watchdog-restart"):
+        assert _run(verdict_while(op)) == ("idle", "idle"), op
 
 
 def test_restart_countdown_can_be_cancelled_before_restart(monkeypatch):
-    monkeypatch.setattr(sched_mod, "COUNTDOWN_MARKS", (10,))  # one interruptible wait
-    cfg = Config()
     calls: list = []
-    _patch_service(monkeypatch, calls)
-    bus = EventBus()
-    events = _collect(bus)
     intent: list = []
-    sched = sched_mod.Scheduler(cfg, FakeApi(), bus, set_intent=intent.append)
+    _cfg, bus, sched = _countdown_sched(
+        monkeypatch, calls, set_intent=intent.append
+    )
+    events = _collect(bus)
 
     async def go():
         task = asyncio.create_task(sched.restart_with_countdown("test"))
-        for _ in range(1000):  # wait until the countdown arms its cancel event
-            if sched._cancel_restart is not None:
-                break
-            await asyncio.sleep(0)
-        assert sched.cancel_countdown() is True
+        assert await _armed(sched)
+        assert sched.cancel_countdown() == "cancelled"
+        # A second cancel has nothing left to take: the verdict is already in.
+        assert sched.cancel_countdown() == "too_late"
         return await task
 
     result = _run(go())
     assert result is False  # the scheduled loop needs this to skip today's slot
     assert not any(c[0] in ("stop", "start") for c in calls)  # never restarted
-    assert any("cancel" in e.message.lower() for e in events)
-    assert sched._cancel_restart is None  # cleaned up
+    assert any("cancelled" in e.message.lower() for e in events)
+    assert sched._countdown is None  # cleaned up
     assert True in intent  # a restart records 'server should be up' at entry
+
+
+def test_restart_countdown_can_be_skipped_and_still_restarts(monkeypatch):
+    # The half that didn't exist: an admin who doesn't want to wait out a
+    # countdown they started gets the restart *now*, not a cancelled one.
+    calls: list = []
+    _cfg, bus, sched = _countdown_sched(monkeypatch, calls)
+    events = _collect(bus)
+
+    async def go():
+        task = asyncio.create_task(sched.restart_with_countdown("test"))
+        assert await _armed(sched)
+        assert sched.skip_countdown() == "skipped"
+        return await task
+
+    assert _run(go()) is True  # it ran — a skip is not a cancel
+    assert [c[0] for c in calls] == ["stop", "start"]
+    assert any("skipped the countdown" in e.message.lower() for e in events)
+
+
+def test_restore_countdown_can_be_cancelled_leaving_the_world_alone(tmp_path, monkeypatch):
+    calls: list = []
+    cfg, bus, sched = _countdown_sched(monkeypatch, calls)
+    cfg.backup_root = str(tmp_path / "backups")
+    cfg.server_root = str(tmp_path / "server")
+    name = "2026-01-01_00-00-00-manual"
+    (Path(cfg.backup_root) / name).mkdir(parents=True)
+    monkeypatch.setattr(
+        sched_mod.backups, "restore",
+        lambda root, n, savegames: calls.append(("restore", n)),
+    )
+    events = _collect(bus)
+
+    async def go():
+        task = asyncio.create_task(sched.restore_backup(name))
+        assert await _armed(sched)
+        assert sched.cancel_countdown() == "cancelled"
+        return await task
+
+    assert _run(go()) is False
+    # The whole point: a cancelled restore never stopped the server, never
+    # touched SaveGames, and never restarted anything.
+    assert calls == []
+    assert any("cancelled" in e.message.lower() for e in events)
+
+
+def test_restore_countdown_can_be_skipped(tmp_path, monkeypatch):
+    calls: list = []
+    cfg, bus, sched = _countdown_sched(monkeypatch, calls)
+    cfg.backup_root = str(tmp_path / "backups")
+    cfg.server_root = str(tmp_path / "server")
+    name = "2026-01-01_00-00-00-manual"
+    (Path(cfg.backup_root) / name).mkdir(parents=True)
+    monkeypatch.setattr(
+        sched_mod.backups, "restore",
+        lambda root, n, savegames: calls.append(("restore", n)),
+    )
+
+    async def go():
+        task = asyncio.create_task(sched.restore_backup(name))
+        assert await _armed(sched)
+        assert sched.skip_countdown() == "skipped"
+        return await task
+
+    assert _run(go()) is True
+    assert [c[0] for c in calls] == ["stop", "restore", "start"]
+
+
+def test_countdown_state_is_published_while_it_runs(monkeypatch):
+    calls: list = []
+    _cfg, _bus, sched = _countdown_sched(monkeypatch, calls, seconds=45)
+
+    async def go():
+        task = asyncio.create_task(sched.restart_with_countdown("test"))
+        assert await _armed(sched)
+        state = sched.countdown_state()
+        sched.cancel_countdown()
+        await task
+        return state
+
+    state = _run(go())
+    assert state["kind"] == "restart"
+    assert state["reason"] == "test"
+    assert state["total_seconds"] == 45
+    assert 0 < state["seconds_remaining"] <= 45
+    assert state["cancellable"] is True
+
+
+def test_countdown_collapses_when_nobody_is_online(monkeypatch):
+    # The complaint this whole feature came from: a ten-minute warning
+    # announced to an empty server is ten minutes of nothing.
+    calls: list = []
+    _cfg, bus, sched = _countdown_sched(monkeypatch, calls, seconds=600, online=0)
+    events = _collect(bus)
+
+    async def go():
+        task = asyncio.create_task(sched.restart_with_countdown("test"))
+        assert await _armed(sched)
+        total = sched.countdown_state()["total_seconds"]
+        sched.skip_countdown()  # don't actually wait even the short one out
+        await task
+        return total
+
+    assert _run(go()) == sched_mod.countdown.EMPTY_SERVER_SECONDS
+    assert any("nobody is online" in e.message for e in events)
+
+
+def test_countdown_collapses_when_the_api_is_not_answering(monkeypatch):
+    # An unreachable REST API means the announcement reaches nobody either, so
+    # waiting it out buys exactly as much as an empty server does.
+    calls: list = []
+    _cfg, _bus, sched = _countdown_sched(monkeypatch, calls, seconds=600, online=None)
+
+    async def go():
+        task = asyncio.create_task(sched.restart_with_countdown("test"))
+        assert await _armed(sched)
+        total = sched.countdown_state()["total_seconds"]
+        sched.skip_countdown()
+        await task
+        return total
+
+    assert _run(go()) == sched_mod.countdown.EMPTY_SERVER_SECONDS
+
+
+def test_countdown_is_kept_in_full_when_players_are_online(monkeypatch):
+    calls: list = []
+    _cfg, _bus, sched = _countdown_sched(monkeypatch, calls, seconds=600, online=3)
+
+    async def go():
+        task = asyncio.create_task(sched.restart_with_countdown("test"))
+        assert await _armed(sched)
+        total = sched.countdown_state()["total_seconds"]
+        sched.cancel_countdown()
+        await task
+        return total
+
+    assert _run(go()) == 600  # players deserve the notice they were promised
+
+
+def test_collapse_can_be_turned_off(monkeypatch):
+    calls: list = []
+    cfg, _bus, sched = _countdown_sched(monkeypatch, calls, seconds=600, online=0)
+    cfg.schedule.skip_countdown_when_empty = False
+
+    async def go():
+        task = asyncio.create_task(sched.restart_with_countdown("test"))
+        assert await _armed(sched)
+        total = sched.countdown_state()["total_seconds"]
+        sched.cancel_countdown()
+        await task
+        return total
+
+    assert _run(go()) == 600
+
+
+def test_explicit_seconds_override_the_configured_countdown(monkeypatch):
+    calls: list = []
+    _cfg, bus, sched = _countdown_sched(monkeypatch, calls, seconds=600, online=3)
+    events = _collect(bus)
+    # seconds=0 is the "go now, don't warn anybody" escape hatch.
+    assert _run(sched.restart_with_countdown("test", seconds=0)) is True
+    assert [c[0] for c in calls] == ["stop", "start"]
+    assert any("no countdown" in e.message for e in events)
 
 
 def test_restart_countdown_returns_true_when_it_runs(monkeypatch):
     # The counterpart to the cancel case: a completed restart reports True, so the
     # daily loop knows it happened (and won't be told to skip the day).
-    monkeypatch.setattr(sched_mod, "COUNTDOWN_MARKS", (0,))  # no waiting
-    cfg = Config()
     calls: list = []
-    _patch_service(monkeypatch, calls)
-    bus = EventBus()
-    sched = sched_mod.Scheduler(cfg, FakeApi(), bus)
+    _cfg, _bus, sched = _countdown_sched(monkeypatch, calls, seconds=0)
     assert _run(sched.restart_with_countdown("test")) is True
     assert [c[0] for c in calls] == ["stop", "start"]  # it actually restarted
 

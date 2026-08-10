@@ -94,6 +94,87 @@ def test_health_stays_ok_while_the_server_is_down(sim):
     assert r.json()["status"] == "ok"
 
 
+# ---------------- the admin changes their mind mid-countdown ----------------
+#
+# The countdown is the one place palctl deliberately does nothing for minutes,
+# and for a long time the only way out of it was a Discord command most installs
+# don't have. These prove both escape hatches work over the real HTTP API — the
+# one the dashboard, the GUI and the CLI all speak.
+
+
+def test_a_countdown_is_visible_and_can_be_cancelled(sim):
+    """Start a restart, see it counting down on /state, call it off. The server
+    must never have gone down: a cancel that only stops the *announcements* is
+    worse than no cancel at all."""
+    running_server(sim)
+    sim.post("/action/restart", {"reason": "Admin restart", "seconds": 600})
+
+    sim.wait_for(
+        lambda: sim.state().get("countdown") is not None,
+        timeout=30,
+        what="the countdown to show up on /state",
+    )
+    cd = sim.state()["countdown"]
+    assert cd["kind"] == "restart"
+    assert cd["cancellable"] is True
+    assert 0 < cd["seconds_remaining"] <= 600
+    # A player is online in the sim, so the full countdown is kept.
+    assert cd["total_seconds"] == 600
+
+    r = sim.post("/action/cancel-countdown")
+    assert r.status_code == 200 and r.json()["result"] == "cancelled"
+
+    sim.wait_for(
+        lambda: sim.state().get("operation") is None,
+        timeout=30,
+        what="the restart operation to unwind",
+    )
+    assert sim.state()["countdown"] is None
+    # The whole point: the service was never stopped, and the server is still up.
+    assert "stop" not in sim.service_calls()
+    assert sim.state()["alive"] is True
+    assert any("cancelled" in e.lower() for e in sim.events())
+
+
+def test_a_countdown_can_be_skipped_and_the_restart_happens_now(sim):
+    """The other half: an admin who knows the server is empty shouldn't pay the
+    ten minutes. Skipping must restart, not cancel."""
+    running_server(sim)
+    sim.post("/action/restart", {"reason": "Admin restart", "seconds": 600})
+    sim.wait_for(
+        lambda: sim.state().get("countdown") is not None,
+        timeout=30,
+        what="the countdown to arm",
+    )
+
+    r = sim.post("/action/skip-countdown")
+    assert r.status_code == 200 and r.json()["result"] == "skipped"
+
+    sim.wait_for(
+        lambda: any(c.lower().startswith("stop") for c in sim.service_calls()),
+        timeout=60,
+        what="the restart to actually take the server down",
+    )
+    sim.wait_for(
+        lambda: sim.state().get("alive") is True and sim.state().get("operation") is None,
+        timeout=180,
+        what="the server to come back from the skipped-ahead restart",
+    )
+
+
+def test_a_zero_second_restart_needs_no_countdown_at_all(sim):
+    """`{"seconds": 0}` — the 'just do it' path the CLI's `--now` uses when
+    nothing is counting down yet."""
+    running_server(sim)
+    r = sim.post("/action/restart", {"reason": "Admin restart", "seconds": 0})
+    assert r.status_code == 200
+    sim.wait_for(
+        lambda: any(c.lower().startswith("stop") for c in sim.service_calls()),
+        timeout=60,
+        what="the immediate restart to take the server down",
+    )
+
+
 # ---------------- somebody else drives the service ----------------
 
 

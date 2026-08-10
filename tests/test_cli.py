@@ -9,8 +9,10 @@ pytest.importorskip("httpx")
 pytest.importorskip("keyring")
 
 from palctl.cli import (  # noqa: E402  (after importorskip)
+    _countdown_seconds,
     find_players,
     fmt_backups,
+    fmt_countdown,
     fmt_players,
     fmt_status,
 )
@@ -56,6 +58,38 @@ def test_fmt_status_shows_the_operation_and_survives_a_dead_server():
                       "metrics": None, "process": None})
     assert "STOPPED" in out and "not answering" in out
     assert "update in progress" in out
+
+
+def test_fmt_status_shows_a_pending_countdown_and_how_to_act_on_it():
+    # "restart in progress" for ten minutes told an admin nothing about the
+    # fact that it hadn't happened yet — or that they could stop it.
+    out = fmt_status({
+        "service": "RUNNING", "alive": True, "operation": "restart",
+        "metrics": None, "process": None,
+        "countdown": {"kind": "restart", "reason": "Scheduled daily restart",
+                      "total_seconds": 600, "seconds_remaining": 272.0,
+                      "cancellable": True},
+    })
+    assert "Scheduled daily restart in 4m 32s" in out
+    assert "palctl cancel" in out and "palctl skip" in out
+
+
+def test_fmt_countdown_drops_the_hint_once_it_is_too_late():
+    line = fmt_countdown({"kind": "restore", "reason": "Restoring backup X",
+                          "seconds_remaining": 0, "cancellable": False})
+    assert line == "Restoring backup X in 0s"
+
+
+def test_now_flag_is_just_a_zero_second_countdown():
+    class Args:
+        now = True
+        in_seconds = None
+
+    assert _countdown_seconds(Args()) == 0
+    Args.now, Args.in_seconds = False, 45
+    assert _countdown_seconds(Args()) == 45
+    Args.in_seconds = None
+    assert _countdown_seconds(Args()) is None  # no flag -> use the config
 
 
 def test_fmt_players_table_and_empty():

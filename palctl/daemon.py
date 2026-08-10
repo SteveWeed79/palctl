@@ -26,7 +26,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from . import backups, inifile, leak, localauth, netinfo, procs, supervisor
+from . import backups, countdown, inifile, leak, localauth, netinfo, procs, supervisor
 from .alerts import WebhookAlerter
 from .api import PalApi, PalApiError, PalApiUnauthorized
 from .bot import run_bot
@@ -613,6 +613,48 @@ class Daemon:
         self._spawn(_run())
         return True
 
+    def _countdown_response(self, what: str) -> web.Response:
+        """Answer /action/cancel-countdown and /action/skip-countdown.
+
+        Three outcomes, three answers, because "it didn't work" is not one
+        thing: the admin either stopped the countdown, arrived after it ran
+        out, or there was never one running. The last two are 409 (the request
+        made sense, the state didn't allow it) with the reason spelled out —
+        telling someone who clicked Cancel a second too late that "nothing was
+        running" reads as a broken button.
+        """
+        skipping = what == "skip-countdown"
+        result = (
+            self.scheduler.skip_countdown() if skipping
+            else self.scheduler.cancel_countdown()
+        )
+        if result in ("cancelled", "skipped"):
+            return web.json_response({"ok": True, "result": result})
+        op = self.control.current_op
+        if result == "too_late":
+            # Deliberately not "the countdown is over": this also covers an
+            # operation that never had one (a watchdog restart hands its timer
+            # to the game itself), and claiming otherwise would send the admin
+            # looking for a clock that was never there.
+            reason = (
+                f"too late — the {op or 'operation'} is already under way, past "
+                "the point where it can be called off."
+            )
+        elif op:
+            # Busy, but with something that never counts down (a backup, an
+            # update, the boot-time start). Say which, so "nothing is counting
+            # down" doesn't read as a contradiction of the status badge.
+            reason = (
+                f"nothing is counting down right now — {op} is running, and it "
+                "has no countdown to interrupt."
+            )
+        else:
+            reason = (
+                "nothing is counting down right now. Start a restart or a "
+                "restore first."
+            )
+        return web.json_response({"error": reason, "result": result}, status=409)
+
     async def _persist(self, e: Event) -> None:
         await asyncio.to_thread(self.store.log_event, e)
 
@@ -1179,6 +1221,11 @@ class Daemon:
                     "alive": self._alive,
                     "restarting": self.watchdog.is_restarting,
                     "operation": self.control.current_op,
+                    # The live restart/restore countdown, or None. Published so
+                    # every client shows the same clock and the same two escape
+                    # hatches — before this, a countdown was invisible to
+                    # everything except the Discord channel it announced in.
+                    "countdown": self.scheduler.countdown_state(),
                     "memory_limit_mb": self.cfg.watchdog.memory_limit_mb,
                     "metrics": asdict(self._last_metrics) if self._last_metrics else None,
                     "process": asdict(stats) if stats else None,
@@ -1228,6 +1275,22 @@ class Daemon:
                     raise _BadRequest(f"missing required field: {field}")
                 return value
 
+            def optional_seconds() -> int | None:
+                """`{"seconds": N}` overrides the configured countdown for this
+                one call — 0 means "no warning, go now". Absent = use the
+                config. Validated here so a bad value is a 400 with a reason
+                rather than a countdown of NaN seconds."""
+                if "seconds" not in body or body["seconds"] is None:
+                    return None
+                value = body["seconds"]
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise _BadRequest("'seconds' must be a whole number of seconds")
+                if not 0 <= value <= countdown.MAX_SECONDS:
+                    raise _BadRequest(
+                        f"'seconds' must be between 0 and {countdown.MAX_SECONDS}"
+                    )
+                return value
+
             try:
                 if what == "start":
                     # One implementation for start/stop (also the bot's /start,
@@ -1254,11 +1317,17 @@ class Daemon:
                     if not self._spawn_exclusive(
                         "restart",
                         self.scheduler.restart_with_countdown(
-                            body.get("reason", "Admin restart")
+                            body.get("reason", "Admin restart"),
+                            seconds=optional_seconds(),
                         ),
                     ):
                         return _busy_response(self.control.current_op)
                     self._desired_running = True
+                elif what in ("cancel-countdown", "skip-countdown"):
+                    # The two escape hatches from a running countdown. Not
+                    # server-exclusive operations themselves — they interrupt
+                    # one — so they never go through _spawn_exclusive.
+                    return self._countdown_response(what)
                 elif what == "announce":
                     await self.api.announce(require("message"))
                 elif what == "save":
@@ -1282,8 +1351,19 @@ class Daemon:
                     self._desired_running = True
                 elif what == "restore":
                     name = require("name")
+                    seconds = optional_seconds()
+                    # Check the name *here*, not only inside the spawned task.
+                    # The task reports a typo as an event nobody is watching,
+                    # while this handler had already answered 200 — so `palctl
+                    # restore typo` printed "Restoring…" and did nothing.
+                    if not await asyncio.to_thread(
+                        backups.is_restorable, Path(self.cfg.backup_root), name
+                    ):
+                        raise _BadRequest(
+                            f"no such backup: {name!r} (see `palctl backups`)"
+                        )
                     if not self._spawn_exclusive(
-                        "restore", self.scheduler.restore_backup(name)
+                        "restore", self.scheduler.restore_backup(name, seconds=seconds)
                     ):
                         return _busy_response(self.control.current_op)
                     self._desired_running = True

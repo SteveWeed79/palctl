@@ -10,7 +10,7 @@ ship no log file. Chat is UE4SS-only territory.
 What you DO get, all reconstructed from polling /players and /metrics:
   reads:   /status /health /players /whois /playtime /leaderboard /backups
            /events /next /help
-  admin:   /start /stop /restart /cancel /update /save /backup /restore
+  admin:   /start /stop /restart /cancel /now /update /save /backup /restore
            /announce /kick /ban /unban
   alerts:  join + leave, level-up, watchdog, up/down, update-available
 
@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 import discord
 from discord import app_commands
 
-from . import backups, leak, procs
+from . import backups, countdown, leak, procs
 from .api import PalApi, PalApiError
 from .config import Config, get_discord_token
 from .events import Event, EventBus, SessionStore
@@ -581,12 +581,24 @@ class PalBot(discord.Client):
             await interaction.followup.send("📦 Backup started.")
 
         @tree.command(name="restart", description="Restart with an in-game countdown")
-        @app_commands.describe(reason="Shown to players in-game")
+        @app_commands.describe(
+            reason="Shown to players in-game",
+            seconds="Countdown length for this restart (0 = now). Blank = the "
+                    "configured default.",
+        )
         async def restart(
-            interaction: discord.Interaction, reason: str = "Admin restart"
+            interaction: discord.Interaction,
+            reason: str = "Admin restart",
+            seconds: int | None = None,
         ) -> None:
             if not self._is_admin(interaction):
                 await interaction.response.send_message("Not allowed.", ephemeral=True)
+                return
+            if seconds is not None and not 0 <= seconds <= countdown.MAX_SECONDS:
+                await interaction.response.send_message(
+                    f"`seconds` must be between 0 and {countdown.MAX_SECONDS}.",
+                    ephemeral=True,
+                )
                 return
             # Reserve up front so a second /restart (or a restart while an update
             # is mid-flight) reports 'busy' instead of silently queueing another
@@ -599,10 +611,14 @@ class PalBot(discord.Client):
                 )
                 return
             await interaction.response.send_message(
-                f"🔁 Restarting with countdown — *{reason}*. I'll report back."
+                f"🔁 Restarting — *{reason}*. `/cancel` calls it off, `/now` skips "
+                "the wait. I'll report back."
             )
             self._spawn(
-                self._run_reserved("restart", self._sched.restart_with_countdown(reason))
+                self._run_reserved(
+                    "restart",
+                    self._sched.restart_with_countdown(reason, seconds=seconds),
+                )
             )
 
         @tree.command(
@@ -665,10 +681,23 @@ class PalBot(discord.Client):
                 "copy of the current world is taken first, so this is undoable.",
             ):
                 return
+            # Reserve after the confirm dialog, like /update — /restore was the
+            # one destructive command that didn't, so two of them (or a restore
+            # during an update) silently queued a second world-overwrite behind
+            # the first instead of reporting the server busy.
+            if not self._sched.reserve("restore"):
+                await interaction.followup.send(
+                    f"⏳ The server is mid-operation ({self._sched.current_op}) — "
+                    "try again in a moment."
+                )
+                return
             await interaction.followup.send(
-                f"♻️ Restoring `{name}` — I'll report back here."
+                f"♻️ Restoring `{name}` — `/cancel` calls it off while it warns "
+                "players, `/now` skips the wait. I'll report back here."
             )
-            self._spawn(self._sched.restore_backup(name))
+            self._spawn(
+                self._run_reserved("restore", self._sched.restore_backup(name))
+            )
 
         @restore.autocomplete("name")
         async def _restore_ac(interaction: discord.Interaction, current: str):
@@ -767,18 +796,29 @@ class PalBot(discord.Client):
                 )
             )
 
-        @tree.command(name="cancel", description="Cancel an in-progress restart countdown")
+        @tree.command(
+            name="cancel", description="Cancel the restart/restore countdown that's running"
+        )
         async def cancel(interaction: discord.Interaction) -> None:
             if not self._is_admin(interaction):
                 await interaction.response.send_message("Not allowed.", ephemeral=True)
                 return
             await interaction.response.defer()
-            if self._sched.cancel_countdown():
-                await interaction.followup.send(
-                    "🚫 Cancelling the restart countdown — the server stays up."
-                )
-            else:
-                await interaction.followup.send("Nothing to cancel — no countdown is running.")
+            await interaction.followup.send(
+                self._countdown_reply(self._sched.cancel_countdown())
+            )
+
+        @tree.command(
+            name="now", description="Skip the rest of the countdown and go now"
+        )
+        async def now(interaction: discord.Interaction) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message("Not allowed.", ephemeral=True)
+                return
+            await interaction.response.defer()
+            await interaction.followup.send(
+                self._countdown_reply(self._sched.skip_countdown())
+            )
 
         @tree.command(
             name="next", description="Upcoming automatic restarts, backups, and updates"
@@ -793,6 +833,31 @@ class PalBot(discord.Client):
         @tree.command(name="help", description="What palctl's bot can do")
         async def help_(interaction: discord.Interaction) -> None:
             await interaction.response.send_message(embed=self._help_embed(), ephemeral=True)
+
+    def _countdown_reply(self, result: str) -> str:
+        """The one message for /cancel and /now. 'Too late' and 'nothing was
+        running' are different answers: the first tells an admin who was two
+        seconds slow what actually happened, instead of implying their command
+        didn't register."""
+        if result == "cancelled":
+            return "🚫 Cancelled — the server stays up."
+        if result == "skipped":
+            return "⏩ Skipping the wait — going now."
+        op = self._sched.current_op
+        if result == "too_late":
+            return (
+                f"Too late — the {op or 'operation'} is already under way, past "
+                "the point where it can be called off. It'll report back here "
+                "when it's done."
+            )
+        if op:
+            # Busy with something that never counts down, so there is nothing
+            # to interrupt — but saying only that would contradict /status.
+            return (
+                f"Nothing is counting down — {op} is running, and it has no "
+                "countdown to interrupt."
+            )
+        return "Nothing is counting down right now."
 
     def _help_embed(self) -> discord.Embed:
         e = discord.Embed(
@@ -809,8 +874,8 @@ class PalBot(discord.Client):
         )
         e.add_field(
             name="Admins",
-            value="/start · /stop · /restart · /cancel · /update · /save · /backup "
-            "· /restore · /announce · /kick · /ban · /unban",
+            value="/start · /stop · /restart · /cancel · /now · /update · /save "
+            "· /backup · /restore · /announce · /kick · /ban · /unban",
             inline=False,
         )
         e.set_footer(

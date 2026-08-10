@@ -722,3 +722,38 @@ def test_server_power_stop_cancelled_does_not_stop():
     it = _FakeInteraction()
     asyncio.run(PalBot._server_power(_StopBot(sched, confirm=False), it, "stop"))
     assert not sched.stopped and it.followup.messages == []
+
+
+# ---------------- countdown replies (/cancel, /now) ----------------
+#
+# The wording is the whole feature here: an admin who clicked Cancel a second
+# too late must not be told "nothing was running", which reads as a command
+# that didn't register rather than a countdown that had already finished.
+
+
+class _CdBot:
+    def __init__(self, current_op=None):
+        self._sched = type("S", (), {"current_op": current_op})()
+
+
+def test_countdown_reply_confirms_a_cancel_and_a_skip():
+    bot = _CdBot()
+    assert "stays up" in PalBot._countdown_reply(bot, "cancelled")
+    assert "going now" in PalBot._countdown_reply(bot, "skipped")
+
+
+def test_countdown_reply_distinguishes_too_late_from_nothing_running():
+    late = PalBot._countdown_reply(_CdBot(current_op="restore"), "too_late")
+    assert "too late" in late.lower() and "restore" in late
+
+    idle = PalBot._countdown_reply(_CdBot(), "idle")
+    assert "nothing is counting down" in idle.lower()
+    assert "too late" not in idle.lower()
+
+
+def test_countdown_reply_names_a_busy_operation_that_has_no_countdown():
+    # "Nothing is counting down" on its own contradicts a /status that says a
+    # backup is running. Name it instead.
+    idle = PalBot._countdown_reply(_CdBot(current_op="backup"), "idle")
+    assert "backup" in idle and "no countdown to interrupt" in idle
+    assert "too late" not in idle.lower()

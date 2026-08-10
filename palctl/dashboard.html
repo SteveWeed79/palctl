@@ -124,6 +124,22 @@
        color: var(--ink-2); }
   td:first-child { color: var(--ink); }
   th.num, td.num { text-align: right; }
+  /* The countdown bar. Amber rather than red: something is *about* to happen
+     and the admin still has both a brake and an accelerator — it is not an
+     error, and colouring it like one would train people to ignore it. */
+  .countdown {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; flex-wrap: wrap; margin: 14px 0 0;
+    background: var(--surface); border: 1px solid var(--warning);
+    border-left: 4px solid var(--warning);
+    border-radius: 12px; padding: 12px 14px;
+  }
+  .cd-what { font-size: 13px; color: var(--ink-2); }
+  .cd-clock {
+    font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums;
+    margin-top: 2px;
+  }
+  .cd-buttons { display: flex; gap: 8px; }
   .why { font-size: 13px; margin: 0 0 10px; }
   .why.warn { color: var(--warn, #b45309); }
   .events { list-style: none; margin: 0; padding: 0; font-size: 13px; }
@@ -203,6 +219,23 @@
        reason "it says my server is down and it isn't" used to be a support
        thread instead of a glance. -->
   <p class="muted why" id="why" hidden></p>
+
+  <!-- Shown only while a restart/restore is counting down. It is the one place
+       the two escape hatches live on this page: the action buttons below are
+       greyed out during an operation (the daemon answers 409), which used to
+       leave a web admin with no way to abort or hurry a ten-minute wait. -->
+  <section id="countdown-sec" hidden>
+    <div class="countdown">
+      <div>
+        <div class="cd-what" id="cd-what"></div>
+        <div class="cd-clock" id="cd-clock">—</div>
+      </div>
+      <div class="cd-buttons">
+        <button id="cd-now" class="small">Do it now</button>
+        <button id="cd-cancel" class="small danger">Cancel</button>
+      </div>
+    </div>
+  </section>
 
   <section id="actions-sec" hidden>
     <h2>Actions</h2>
@@ -410,6 +443,8 @@ $("a-restart").addEventListener("click", () =>
     body: "Players get the in-game countdown before it goes down.",
     ok: "Restart", danger: false,
   }));
+$("cd-cancel").addEventListener("click", () => act("cancel-countdown"));
+$("cd-now").addEventListener("click", () => act("skip-countdown"));
 $("a-save").addEventListener("click", () => act("save"));
 $("a-backup").addEventListener("click", () => act("backup"));
 $("a-update").addEventListener("click", () =>
@@ -480,6 +515,38 @@ $("b-rows").addEventListener("click", (ev) => {
   });
 });
 
+// ---------- countdown ----------
+// /state is polled every couple of seconds, which is too coarse for a clock
+// that people watch tick. Anchor an end time on each poll and interpolate
+// locally in between, so the seconds count down smoothly and the daemon stays
+// the source of truth.
+
+let cdEndsAt = null;
+
+function renderCountdown(cd) {
+  $("countdown-sec").hidden = !cd;
+  if (!cd) { cdEndsAt = null; return; }
+  cdEndsAt = Date.now() + (cd.seconds_remaining || 0) * 1000;
+  $("cd-what").textContent = cd.reason || cd.kind || "Operation";
+  // Past the countdown the operation is committed; say so instead of leaving
+  // two buttons that can now only answer "too late".
+  const live = cd.cancellable !== false;
+  $("cd-now").disabled = !live;
+  $("cd-cancel").disabled = !live;
+  tickClock();
+}
+
+function tickClock() {
+  if (cdEndsAt === null) return;
+  const left = Math.max(0, Math.round((cdEndsAt - Date.now()) / 1000));
+  const m = Math.floor(left / 60), s = left % 60;
+  $("cd-clock").textContent = m
+    ? `${m}:${String(s).padStart(2, "0")}`
+    : `${s}s`;
+}
+
+setInterval(tickClock, 1000);
+
 // ---------- render ----------
 
 function render(state) {
@@ -502,6 +569,8 @@ function render(state) {
   why.hidden = parts.length === 0;
   why.className = "muted why" + (behind ? " warn" : "");
   why.textContent = parts.join(" · ");
+
+  renderCountdown(state.countdown);
 
   running = state.service === "RUNNING";
   $("actions-sec").hidden = false;

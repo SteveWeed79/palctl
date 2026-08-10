@@ -108,6 +108,21 @@ class ScheduleConfig:
     # run a 6-8h cadence to stay ahead of the leak. 0 (default) = keep the
     # daily-at-HH:MM behaviour; > 0 takes precedence over daily_restart_at.
     restart_every_hours: int = 0
+    # How long the in-game countdown runs before a restart takes the server
+    # down. This used to be a hard-coded ten minutes with no setting at all, so
+    # every restart — including "restart it now, nobody's on" — cost ten
+    # minutes. 0 = no countdown; capped at an hour (countdown.MAX_SECONDS),
+    # since the operation lock is held for the whole wait.
+    restart_countdown_seconds: int = 600
+    # The same warning before a restore overwrites the world. Restores used to
+    # drop everyone the instant the button was clicked, which is also why there
+    # was never a window in which to cancel a mis-clicked one. 0 restores the
+    # old immediate behaviour.
+    restore_countdown_seconds: int = 60
+    # Nobody online — or a server whose REST API isn't answering — means the
+    # countdown is being announced to an empty room. Collapse it to a few
+    # seconds instead of waiting it out. Turn off to always wait the full time.
+    skip_countdown_when_empty: bool = True
     autosave_minutes: int = 15
     # Local backups always run — this is only how often. Capped at 24h (the GUI
     # and the scheduler both enforce it) so backups happen at least once a day;
