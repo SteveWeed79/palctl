@@ -23,7 +23,24 @@ permissions:
   contents: write   # create the release and upload assets
 
 jobs:
+  # Cheap, and first: a tag whose CHANGELOG heading doesn't match ships a binary
+  # whose --version disagrees with the notes describing it. docs/VERSIONING.md
+  # has said "the heading must equal the tag, exactly" from the start; it drifted
+  # anyway, because nothing checked. Now something does, before anything builds.
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: CHANGELOG heading matches the tag
+        run: python scripts/check_changelog.py "${{ github.event.inputs.tag || github.ref_name }}"
+
   build-windows:
+    needs: changelog
     runs-on: windows-latest
     steps:
       # Third-party actions are pinned by full commit SHA, not a mutable tag:

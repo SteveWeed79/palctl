@@ -26,16 +26,18 @@ from pathlib import Path
 
 from aiohttp import web
 
-from . import backups, inifile, leak, localauth, netinfo, procs
+from . import backups, inifile, leak, localauth, netinfo, procs, supervisor
 from .alerts import WebhookAlerter
 from .api import PalApi, PalApiError, PalApiUnauthorized
 from .bot import run_bot
 from .client import DAEMON_PORT
 from .config import Config, config_dir, get_admin_password
 from .control import ServerController
+from .decisions import DecisionLog, summarize
 from .events import Event, EventBus, PlayerTracker, SessionStore
 from .logging_setup import setup_logging
 from .scheduler import Scheduler
+from .supervisor import Action, Observation, is_boot_start
 from .watchdog import Watchdog
 
 SERVICE_NAME = "palctl-daemon"  # the Windows service name palctl registers
@@ -166,95 +168,6 @@ def poll_loop_is_live(
         return True, None
     age = now - last_poll_at
     return age <= max(30.0, poll_seconds * 6), age
-
-
-def autorecover_phase(
-    *,
-    enabled: bool,
-    ever_alive: bool,
-    busy: bool,
-    restarting: bool,
-    desired_running: bool,
-) -> str:
-    """
-    First half of the crash-recovery decision — the guards. Pure, so the whole
-    'never fight an intentional stop' rule is testable without a live daemon.
-
-    Returns:
-      'ignore' — feature off, or the server never came up; do nothing.
-      'reset'  — palctl took the server down on purpose (stop/restart/update/
-                 restore/watchdog); clear the down-streak, do nothing.
-      'count'  — a genuine unexpected outage; count this poll toward recovery.
-    """
-    if not enabled or not ever_alive:
-        return "ignore"
-    if busy or restarting or not desired_running:
-        return "reset"
-    return "count"
-
-
-def looks_externally_stopped(
-    *, service_state: str, busy: bool, restarting: bool
-) -> bool:
-    """Did somebody stop the server *outside* palctl?
-
-    palctl decides whether to auto-recover from one signal — "the REST API
-    stopped answering" — and that signal cannot tell a crash from an admin
-    stopping the service in services.msc, `sc stop`, or Task Manager. It only
-    knew a stop was deliberate when it did the stopping itself, so every other
-    stop read as a crash and got undone. Stop the service by hand, watch palctl
-    put it straight back, repeat: the server behaves as though it cannot be
-    turned off.
-
-    The service manager already knows the difference and palctl already reads
-    it. A process that crashed leaves the service RUNNING (or briefly
-    START_PENDING while the wrapper's onfailure restarts it) with nothing
-    answering behind it. A deliberate stop is the SCM reporting **STOPPED** —
-    the state nothing but a stop request produces.
-
-    `busy`/`restarting` exclude palctl's own operations, which pass through
-    STOPPED constantly on their way to a restart.
-    """
-    return service_state == "STOPPED" and not busy and not restarting
-
-
-# Consecutive STOPPED readings before palctl concludes an admin meant it. A
-# restart cycle — palctl's own, or the service wrapper's onfailure — passes
-# through STOPPED for a moment, and sampling one of those must not be read as
-# "they want it off".
-EXTERNAL_STOP_CONFIRM_POLLS = 3
-
-
-# How long after the machine booted a daemon start still counts as "this is the
-# boot". Generous: the SCM starts services early, but a cold box with a slow
-# disk and a dozen Automatic services can take minutes to get here.
-BOOT_INTENT_WINDOW = 900.0
-
-
-def is_boot_start(now: float, boot_time: float, window: float = BOOT_INTENT_WINDOW) -> bool:
-    """Whether this daemon start is the machine coming up, rather than the
-    daemon being restarted on an already-running box.
-
-    The distinction is what keeps _restore_boot_intent narrow. Restoring the
-    recorded intent at *boot* only moves a start that the SCM's Automatic
-    startmode used to do anyway — same behaviour, decided by palctl instead of
-    Windows. Doing it on any daemon start would be new behaviour, and the wrong
-    kind: the installer bounces the daemon on upgrade and the health task
-    restarts it during an outage, so a server that was down would be started by
-    the side door — bypassing `auto_restart_on_crash`, which is opt-in
-    precisely because restarting someone's server unasked is not palctl's call.
-    """
-    return 0.0 <= now - boot_time <= window
-
-
-def should_recover_now(
-    *, down_polls: int, confirm_polls: int, recent_restarts: int, cap: int
-) -> bool:
-    """Second half: only recover after N confirming polls, and not if we've
-    already restarted `cap` times this hour (a real crash-loop needs a human)."""
-    if down_polls < max(1, confirm_polls):
-        return False
-    return recent_restarts < cap
 
 
 def _busy_response(current_op: str | None) -> web.Response:
@@ -436,8 +349,11 @@ class Daemon:
         self._service_seen_up = False
         # Cleared once _restore_boot_intent has had its say. Until then a
         # STOPPED service is the state palctl is about to act on, not evidence
-        # of anything — see the guard in _adopt_external_stop.
+        # of anything — see supervisor.decide's AWAIT_STARTUP branch.
         self._boot_intent_pending = True
+        # Why palctl is doing (or not doing) something. The event feed says what
+        # happened; this says what was decided — the half an admin can't infer.
+        self.decisions = DecisionLog()
         # One-shot: warn if the server process runs under a different account
         # than the daemon (the watchdog-blinding split — see _maybe_warn_account_mismatch).
         self._account_warned = False
@@ -517,7 +433,46 @@ class Daemon:
         not the control API, and not the READY signal the service manager is
         waiting on."""
         await asyncio.to_thread(self._sync_dashboard_firewall, host)
+        await self._check_settings_drift()
         await asyncio.to_thread(self._warn_if_cloud_mirror_broken)
+
+    async def _check_settings_drift(self) -> None:
+        """Say when PalWorldSettings.ini stopped being what palctl wrote.
+
+        The failure this exists for is silent by construction: a Steam update
+        puts Steam's defaults back, `RESTAPIEnabled` returns to False, and from
+        then on palctl reports an outage on a server that is running perfectly
+        well. Nothing else in palctl can see the difference between that and a
+        genuinely down server, so nothing else can say it.
+
+        Non-critical drift is reported once and then adopted as the new
+        baseline — an admin who edits their own settings shouldn't be nagged
+        every restart. Critical drift is not adopted: it keeps saying so until
+        somebody puts the REST API settings back, because until then palctl is
+        blind.
+        """
+        from . import inidrift
+
+        drift = await asyncio.to_thread(
+            inidrift.compare, inidrift.load(), self.cfg.live_ini, self.cfg.default_ini
+        )
+        if not drift.matters:
+            return
+        self._decide(
+            "settings_drift",
+            f"PalWorldSettings.ini differs from what palctl wrote ({drift.kind})",
+            kind=drift.kind,
+            critical=list(drift.critical),
+        )
+        await self.bus.emit(
+            Event(
+                "error" if drift.critical else "info",
+                inidrift.describe(drift),
+                {"action": "settings_drift", "kind": drift.kind},
+            )
+        )
+        if not drift.critical:
+            await asyncio.to_thread(inidrift.record, self.cfg.live_ini)
 
     def _warn_if_cloud_mirror_broken(self) -> None:
         """If the backup mirror is an rclone remote that's misconfigured — no
@@ -857,6 +812,14 @@ class Daemon:
             )
         )
 
+    def _decide(self, action: str, why: str, **data) -> None:
+        """Record a decision and log it once. Repeats collapse in the log (the
+        poll loop revisits the same conclusion every few seconds), so this is
+        cheap to call from anywhere a choice is made."""
+        entry = self.decisions.record(action, why, data=data or None)
+        if entry.count == 1:
+            self.log.info("decision: %s — %s", action, why)
+
     async def _restore_boot_intent(self) -> None:
         """After a reboot, put the server back the way it was left.
 
@@ -880,24 +843,42 @@ class Daemon:
         """
         try:
             if not self._desired_running:
-                self.log.info(
-                    "server was last stopped on purpose — leaving it stopped"
+                self._decide(
+                    "boot_stand_down",
+                    "the server was stopped on purpose before the restart, so "
+                    "palctl is leaving it stopped",
                 )
                 return
             if not is_boot_start(time.time(), procs.boot_time()):
+                self._decide(
+                    "boot_not_a_boot",
+                    "palctl restarted but the machine didn't, so it won't start "
+                    "or stop anything on its own",
+                )
                 return  # a daemon restart, not a boot; not ours to act on
             state = await self._service_state_cached(ttl=0)
             if state != "STOPPED":
+                self._decide(
+                    "boot_already_up",
+                    "the server was already coming up after the restart",
+                )
                 return  # already up (or the SCM is mid-start) — nothing to do
-            self.log.info(
-                "machine restarted and the server is meant to be running — "
-                "starting the '%s' service", self.cfg.service_name,
+            self._decide(
+                "boot_start",
+                "the machine restarted and the server is meant to be running — "
+                "starting it",
             )
             # The shared implementation, so this takes the operation lock and
             # records intent exactly like the GUI's Start button.
             if await self.scheduler.start_server() == "busy":
                 return
             if await self._service_state_cached(ttl=0) != "RUNNING":
+                self._decide(
+                    "boot_start_failed",
+                    "palctl tried to start the server after the restart and the "
+                    "service didn't reach RUNNING — this is a failure to start, "
+                    "not somebody stopping it",
+                )
                 await self.bus.emit(
                     Event(
                         "error",
@@ -916,102 +897,107 @@ class Daemon:
         finally:
             self._boot_intent_pending = False
 
-    async def _adopt_external_stop(self) -> bool:
-        """Notice that somebody stopped the server without going through palctl,
-        and take it as the instruction it is. Returns True when this poll should
-        stop here rather than fall through to recovery.
-
-        Recording the intent matters as much as skipping the restart. Without
-        it, auto-recovery defers but the *schedule* doesn't: the daily restart
-        and the auto-update both start a server they believe should be running,
-        so a hand-stopped server still comes back — just later, which is worse
-        for being unpredictable. Adopting the stop puts palctl in the same state
-        as if its own Stop had been pressed, and its own Start undoes it.
-
-        Confirmed over several polls, because palctl's own restarts and the
-        service wrapper's onfailure both pass through STOPPED on the way back
-        up. Never fires while palctl holds the operation lock.
-        """
-        if not self._desired_running:
-            return True  # already know it's meant to be down; nothing to adopt
-        if self._boot_intent_pending:
-            # Startup hasn't decided yet. With the game service registered
-            # Manual, STOPPED is exactly how every boot begins — counting those
-            # polls would let the daemon adopt its own not-started-yet server as
-            # somebody's deliberate stop, and latch the intent off. Hold, and
-            # don't recover either: _restore_boot_intent is the thing that acts.
-            return True
-        state = await self._service_state_cached()
-        if not looks_externally_stopped(
-            service_state=state,
-            busy=self.control.busy,
-            restarting=self.watchdog.is_restarting,
-        ):
-            self._external_stop_polls = 0
-            self._service_seen_up = True  # not STOPPED — there's a stop to notice now
-            return False
-        if not self._service_seen_up:
-            # STOPPED for this daemon's whole life: nothing stopped it, it never
-            # started. Leave the intent alone (so the admin's "should be
-            # running" survives) and let recovery/the error path speak.
-            return False
-
-        self._external_stop_polls += 1
-        if self._external_stop_polls < EXTERNAL_STOP_CONFIRM_POLLS:
-            return True  # wait for confirmation, but don't recover meanwhile
-
-        self._external_stop_polls = 0
-        self._desired_running = False
-        self._down_polls = 0
-        await self.bus.emit(
-            Event(
-                "server_down",
-                "⏹️ The server was stopped outside palctl (services.msc, "
-                "`sc stop`, or Task Manager). Taking that as deliberate: palctl "
-                "will **not** restart it, and the schedule won't either. Use "
-                "Start in palctl when you want it back.",
-                {"action": "external_stop"},
-            )
-        )
-        return True
-
     async def _maybe_autorecover(self) -> None:
-        """
-        Called on every poll where the REST API is unreachable. Brings the server
-        back only when it was up before, palctl didn't stop it, and we haven't
-        already restarted too many times this hour.
+        """Called on every poll where the REST API is unreachable.
+
+        The decision itself is `supervisor.decide` — one pure function over one
+        observation. This method's only jobs are to assemble that observation,
+        record what was decided and why, and carry it out. Keeping those apart
+        is deliberate: the two most recent bugs in this area were both ordering
+        mistakes between guard clauses that used to live here, and neither was
+        reachable by a test that didn't boot a daemon.
         """
         wd = self.cfg.watchdog
-        if await self._adopt_external_stop():
-            return
-        await self._warn_recovery_is_off(wd)
-        phase = autorecover_phase(
-            enabled=wd.auto_restart_on_crash,
+        self._autorestart_times = _within_window(self._autorestart_times, time.time())
+        # Skip the service query for a server that is meant to be down (or a
+        # startup that hasn't decided yet) — those answers don't depend on it,
+        # and this runs every poll, forever, on a deliberately stopped server.
+        needs_state = supervisor.needs_service_state(
+            desired_running=self._desired_running,
+            startup_pending=self._boot_intent_pending,
+        )
+        obs = Observation(
+            # ttl=0: never decide from the display cache. That cache exists so
+            # a dashboard polling /state twice a second doesn't run `sc query`
+            # twice a second, and its staleness is harmless for *showing* a
+            # state. It is not harmless for deciding one: with a short poll
+            # interval, two consecutive polls can be served the same 2-second-
+            # old "RUNNING" reading, which is long enough for palctl to conclude
+            # a server somebody had just stopped was a crash and restart it —
+            # the exact bug the external-stop detector exists to prevent. One
+            # extra subprocess, only on polls where the server isn't answering.
+            service_state=await self._service_state_cached(ttl=0) if needs_state else "",
+            desired_running=self._desired_running,
             ever_alive=self._ever_alive,
+            seen_service_up=self._service_seen_up,
             busy=self.control.busy,
             restarting=self.watchdog.is_restarting,
-            desired_running=self._desired_running,
+            startup_pending=self._boot_intent_pending,
+            recovery_enabled=wd.auto_restart_on_crash,
+            down_polls=self._down_polls,
+            external_stop_polls=self._external_stop_polls,
+            recent_restarts=len(self._autorestart_times),
+            confirm_polls=wd.crash_confirm_polls,
+            restart_cap=wd.crash_restart_max_per_hour,
         )
-        if phase == "ignore":
+        decision = supervisor.decide(obs)
+        self._decide(decision.action.value, decision.why)
+        await self._apply_decision(decision, obs)
+
+    async def _apply_decision(self, decision, obs: Observation) -> None:
+        """Carry out one supervisor decision. No conditions of its own beyond
+        the action it was handed — anything that looks like a policy judgement
+        belongs in supervisor.decide, where it is testable without a daemon."""
+        action = decision.action
+
+        if action in (Action.STAND_DOWN, Action.AWAIT_STARTUP):
             return
-        if phase == "reset":
+
+        # A service somebody stopped, or one that never started. Both leave the
+        # server down; only the first is an instruction.
+        if action is Action.REPORT_NEVER_STARTED:
+            return  # the boot-start path owns this message; don't double-report
+        if action is Action.CONFIRM_EXTERNAL_STOP:
+            self._external_stop_polls += 1
+            return
+        if action is Action.ADOPT_EXTERNAL_STOP:
+            self._external_stop_polls = 0
+            self._desired_running = False
+            self._down_polls = 0
+            await self.bus.emit(
+                Event(
+                    "server_down",
+                    "⏹️ The server was stopped outside palctl (services.msc, "
+                    "`sc stop`, or Task Manager). Taking that as deliberate: "
+                    "palctl will **not** restart it, and the schedule won't "
+                    "either. Use Start in palctl when you want it back.",
+                    {"action": "external_stop"},
+                )
+            )
+            return
+
+        # Past here the service is not sitting stopped, so any half-counted
+        # external stop was a blip on the way through a restart.
+        self._external_stop_polls = 0
+        if obs.service_state in supervisor.UP_STATES:
+            # Seeing it up is what makes a *later* stop attributable to somebody.
+            self._service_seen_up = True
+
+        if action is Action.IGNORE:
+            await self._warn_recovery_is_off(self.cfg.watchdog)
+            return
+        if action is Action.RESET:
             self._down_polls = 0
             return
-
-        # phase == "count": a genuine unexpected outage.
-        self._down_polls += 1
-        now = time.time()
-        self._autorestart_times = _within_window(self._autorestart_times, now)
-        if not should_recover_now(
-            down_polls=self._down_polls,
-            confirm_polls=wd.crash_confirm_polls,
-            recent_restarts=len(self._autorestart_times),
-            cap=wd.crash_restart_max_per_hour,
-        ):
+        if action in (Action.COUNT_DOWN_POLL, Action.THROTTLED):
+            self._down_polls += 1
             return
-
-        self._down_polls = 0
-        self._spawn(self._autorecover())
+        if action is Action.RECOVER:
+            self._down_polls = 0
+            self._autorestart_times = _within_window(
+                self._autorestart_times, time.time()
+            )
+            self._spawn(self._autorecover())
 
     async def _autorecover(self) -> None:
         op = self.control.try_operation("auto-recover")
@@ -1204,8 +1190,26 @@ class Daemon:
                         {"kind": e.kind, "message": e.message, "at": e.at.isoformat()}
                         for e in self.bus.recent(60)
                     ],
+                    # What palctl decided, and why. `why` is the one-liner a
+                    # dashboard can put next to the status without the reader
+                    # having to open a log; `decisions` is the recent history.
+                    "why": summarize(self.decisions.latest()),
+                    "decisions": self.decisions.entries(10),
+                    # Standing, not a scrolled-away event: a server left on an
+                    # old build refuses players with a version mismatch while
+                    # every other reading says it's healthy.
+                    "update": self.scheduler.update_status,
                 }
             )
+
+        async def decisions(request: web.Request) -> web.Response:
+            """The full recent decision history — "why isn't palctl doing
+            anything" as data instead of an inference from the log."""
+            try:
+                limit = max(1, min(200, int(request.query.get("n", "50"))))
+            except ValueError:
+                limit = 50
+            return web.json_response({"decisions": self.decisions.entries(limit)})
 
         async def action(request: web.Request) -> web.Response:
             try:
@@ -1346,6 +1350,7 @@ class Daemon:
         app.router.add_get("/state", state)
         app.router.add_get("/backups", list_backups)
         app.router.add_get("/logs", tail_logs)
+        app.router.add_get("/decisions", decisions)
         app.router.add_post("/action/{what}", action)
         return app
 

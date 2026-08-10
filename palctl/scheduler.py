@@ -109,6 +109,12 @@ class Scheduler:
         # no readable Steam manifest would otherwise repeat the same warning
         # forever. Reset on reconfigure, so fixing the path re-arms it.
         self._manifest_warned = False
+        # The standing answer to "is this server on the build Steam is serving
+        # clients?", refreshed by every update check and surfaced on /state.
+        # Kept because the mismatch it catches is the one failure players hit
+        # first: they're refused at the join screen while palctl — correctly —
+        # reports a healthy server.
+        self.update_status: dict = {"state": "unknown", "checked_at": None}
 
     def reconfigure(self, cfg: Config, api: PalApi) -> None:
         self._cfg = cfg
@@ -344,20 +350,42 @@ class Scheduler:
 
     async def check_update_available(self) -> bool:
         """Compare the installed build id to Steam's latest; emit an event if a
-        newer one exists. Best-effort — a missing steamcmd just means 'no'."""
+        newer one exists. Best-effort — a missing steamcmd just means 'no'.
+
+        The answer is also *kept* (`update_status`), not only announced. A
+        version mismatch is the one failure players hit before the admin does —
+        they're refused at the join screen while every palctl surface says the
+        server is healthy, because it is. An event scrolls away; a standing
+        "this server is N builds behind" is what turns that support call into a
+        glance at the dashboard.
+        """
         cfg = self._cfg
         if not cfg.steamcmd_path or not Path(cfg.steamcmd_path).exists():
+            self._record_update_status(state="unknown", detail="no steamcmd configured")
             return False
         installed = await asyncio.to_thread(
             steamcmd.installed_buildid, cfg.server_root, cfg.app_id
         )
         if installed is None:
+            self._record_update_status(
+                state="unknown", detail="Steam's appmanifest could not be read"
+            )
             # Nothing to compare against: this check is now permanently blind,
             # so the first sign of a server left behind on an old build would be
             # players bouncing off the join screen. Say so once per daemon run.
             await self._warn_unreadable_manifest()
             return False
         latest = await steamcmd.latest_buildid(cfg.steamcmd_path, cfg.app_id)
+        if not latest:
+            self._record_update_status(
+                state="unknown", installed=installed,
+                detail="Steam didn't report a latest build",
+            )
+            return False
+        self._record_update_status(
+            state="behind" if installed != latest else "current",
+            installed=installed, latest=latest,
+        )
         if latest and installed != latest:
             await self._bus.emit(
                 Event(
@@ -373,6 +401,25 @@ class Scheduler:
             )
             return True
         return False
+
+    def _record_update_status(
+        self,
+        *,
+        state: str,
+        installed: str | None = None,
+        latest: str | None = None,
+        detail: str = "",
+    ) -> None:
+        """state: current | behind | unknown."""
+        import time as _time
+
+        self.update_status = {
+            "state": state,
+            "installed": installed,
+            "latest": latest,
+            "detail": detail,
+            "checked_at": _time.time(),
+        }
 
     async def _warn_unreadable_manifest(self) -> None:
         """One warning per daemon run when Steam's appmanifest can't be found

@@ -43,6 +43,12 @@ def ensure_rest_api(
     if password:
         settings.set("AdminPassword", password)
     settings.save(live_ini)
+    # Re-baseline: from here, anything that differs from this file was written
+    # by somebody else (an admin, or a Steam update putting defaults back), and
+    # inidrift can say so exactly instead of guessing from heuristics.
+    from . import inidrift
+
+    inidrift.record(live_ini)
 
 
 # Gameplay settings the server copies into WorldOption.sav when a world is
@@ -150,4 +156,7 @@ def restore_user_settings(live_ini: Path, backup_ini: Path) -> list[str]:
 
     if restored:
         live.save(live_ini)
+        from . import inidrift
+
+        inidrift.record(live_ini)  # palctl wrote it; that's the new baseline
     return restored

@@ -19,12 +19,11 @@ pytest.importorskip("discord")
 import palctl.daemon as daemon_mod  # noqa: E402
 from palctl.daemon import (  # noqa: E402  (after importorskip guard)
     _within_window,
-    autorecover_phase,
     lan_exposure_warning,
     make_auth_middleware,
     service_target,
-    should_recover_now,
 )
+from palctl.decisions import DecisionLog  # noqa: E402
 from palctl.localauth import TOKEN_HEADER  # noqa: E402
 
 # ---------------- LAN-exposure warning ----------------
@@ -58,37 +57,6 @@ def test_within_window_all_recent():
     now = 500.0
     times = [now - 10, now - 20, now - 30]
     assert _within_window(times, now, window=3600) == times
-
-
-# ---------------- auto-recover state machine ----------------
-
-_CLEAR = dict(enabled=True, ever_alive=True, busy=False, restarting=False, desired_running=True)
-
-
-def test_phase_ignore_when_disabled_or_never_alive():
-    assert autorecover_phase(**{**_CLEAR, "enabled": False}) == "ignore"
-    assert autorecover_phase(**{**_CLEAR, "ever_alive": False}) == "ignore"
-
-
-def test_phase_reset_on_intentional_downtime():
-    # busy (update/restore), a watchdog restart, or a user "Stop" all mean the
-    # outage was on purpose — never auto-recover through those.
-    assert autorecover_phase(**{**_CLEAR, "busy": True}) == "reset"
-    assert autorecover_phase(**{**_CLEAR, "restarting": True}) == "reset"
-    assert autorecover_phase(**{**_CLEAR, "desired_running": False}) == "reset"
-
-
-def test_phase_count_on_genuine_outage():
-    assert autorecover_phase(**_CLEAR) == "count"
-
-
-def test_should_recover_needs_confirmation_then_respects_cap():
-    # not enough confirming polls yet
-    assert should_recover_now(down_polls=1, confirm_polls=3, recent_restarts=0, cap=3) is False
-    # confirmed, and under the hourly cap
-    assert should_recover_now(down_polls=3, confirm_polls=3, recent_restarts=2, cap=3) is True
-    # confirmed, but already at the cap this hour -> hands off, let a human look
-    assert should_recover_now(down_polls=3, confirm_polls=3, recent_restarts=3, cap=3) is False
 
 
 # ---------------- API token gate ----------------
@@ -843,6 +811,11 @@ def test_startup_side_effects_do_not_block_the_event_loop():
             calls.append(("mirror",))
             _time.sleep(0.5)  # a slow rclone
 
+        async def _check_settings_drift(self):
+            # Reads and parses the ini; same rule — it must not sit on the loop.
+            calls.append(("drift",))
+            await asyncio.to_thread(_time.sleep, 0.5)
+
     async def main():
         ticks = 0
 
@@ -859,7 +832,7 @@ def test_startup_side_effects_do_not_block_the_event_loop():
 
     ticks = asyncio.run(main())
     # Both chores ran...
-    assert calls == [("firewall", "0.0.0.0"), ("mirror",)]
+    assert calls == [("firewall", "0.0.0.0"), ("drift",), ("mirror",)]
     # ...and the loop kept running throughout, instead of freezing for ~1s.
     assert ticks > 10, f"event loop was blocked (only {ticks} ticks in ~1s)"
 
@@ -1094,167 +1067,14 @@ def test_the_raids_hint_appears_only_when_raids_are_on(tmp_path):
     assert asyncio.run(d._raids_hint()) == "", "an unreadable ini must say nothing"
 
 
-# ---------------- a stop palctl didn't make is still a stop ----------------
-#
-# Auto-recovery decided from one signal — "the REST API stopped answering" —
-# which cannot tell a crash from an admin stopping the service. palctl only knew
-# a stop was deliberate when it did the stopping, so every other stop read as a
-# crash and got undone within seconds. The service could not be turned off by
-# any normal means.
-
-
-def test_a_deliberate_stop_is_recognised():
-    assert daemon_mod.looks_externally_stopped(
-        service_state="STOPPED", busy=False, restarting=False
-    )
-
-
-def test_a_crashed_server_is_not_mistaken_for_a_deliberate_stop():
-    """The distinction the SCM already knows: a crash leaves the service
-    RUNNING (or START_PENDING while the wrapper restarts it) with nothing
-    answering behind it. Only a stop request produces STOPPED."""
-    for state in ("RUNNING", "START_PENDING", "STOP_PENDING", "UNKNOWN"):
-        assert not daemon_mod.looks_externally_stopped(
-            service_state=state, busy=False, restarting=False
-        ), state
-
-
-def test_palctls_own_operations_are_not_mistaken_for_an_admin():
-    """Every restart palctl runs passes through STOPPED on its way back up."""
-    assert not daemon_mod.looks_externally_stopped(
-        service_state="STOPPED", busy=True, restarting=False
-    )
-    assert not daemon_mod.looks_externally_stopped(
-        service_state="STOPPED", busy=False, restarting=True
-    )
-
-
-def _daemon_for_external_stop(service_state: str, *, desired=True):
-    d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
-    d.__dict__["_Daemon__desired_running"] = desired
-    d._external_stop_polls = 0
-    d._down_polls = 0
-    # A daemon past startup that has seen the server up — the only state in
-    # which "somebody stopped it" is even a possible reading. The two
-    # narrower cases get their own tests below.
-    d._boot_intent_pending = False
-    d._service_seen_up = True
-    d.emitted = []
-    d.control = types.SimpleNamespace(busy=False)
-    d.watchdog = types.SimpleNamespace(is_restarting=False)
-
-    async def _state():
-        return service_state
-
-    d._service_state_cached = _state
-
-    class _Bus:
-        @staticmethod
-        async def emit(e):
-            d.emitted.append(e)
-
-    d.bus = _Bus()
-    return d
-
-
-def _adopted(d):
-    return [e for e in d.emitted if e.data.get("action") == "external_stop"]
-
-
-def test_an_external_stop_is_adopted_only_after_confirmation(monkeypatch, tmp_path):
-    """A restart passes through STOPPED for a moment; sampling one of those must
-    not be read as 'they want it off'."""
-    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
-    d = _daemon_for_external_stop("STOPPED")
-
-    for _ in range(daemon_mod.EXTERNAL_STOP_CONFIRM_POLLS - 1):
-        assert asyncio.run(d._adopt_external_stop()) is True  # skip recovery...
-        assert _adopted(d) == []                              # ...but not decided yet
-        assert d._desired_running is True
-
-    assert asyncio.run(d._adopt_external_stop()) is True
-    assert len(_adopted(d)) == 1
-    assert d._desired_running is False, "the stop must be recorded, not just skipped"
-
-
-def test_a_running_service_lets_recovery_proceed(monkeypatch, tmp_path):
-    """The genuine-crash path has to keep working — that's the whole feature."""
-    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
-    d = _daemon_for_external_stop("RUNNING")
-    assert asyncio.run(d._adopt_external_stop()) is False
-    assert d._desired_running is True
-
-
-def test_a_brief_stopped_blip_does_not_stick(monkeypatch, tmp_path):
-    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
-    d = _daemon_for_external_stop("STOPPED")
-    asyncio.run(d._adopt_external_stop())
-    assert d._external_stop_polls == 1
-
-    async def _running():
-        return "RUNNING"
-
-    d._service_state_cached = _running
-    assert asyncio.run(d._adopt_external_stop()) is False
-    assert d._external_stop_polls == 0, "the streak must reset when it comes back"
-
-
-
-def test_startup_holds_adoption_until_the_boot_decision_is_made(monkeypatch, tmp_path):
-    """With the game service registered Manual, STOPPED is how every boot
-    starts. Counting those polls would let the daemon adopt its own
-    not-started-yet server as somebody's deliberate stop."""
-    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
-    d = _daemon_for_external_stop("STOPPED")
-    d._boot_intent_pending = True
-
-    for _ in range(daemon_mod.EXTERNAL_STOP_CONFIRM_POLLS + 2):
-        assert asyncio.run(d._adopt_external_stop()) is True  # and no recovery either
-    assert _adopted(d) == []
-    assert d._desired_running is True
-    assert d._external_stop_polls == 0, "nothing may accumulate before startup decides"
-
-
-def test_a_server_that_never_came_up_is_not_an_external_stop(monkeypatch, tmp_path):
-    """STOPPED for this daemon's whole life is a server that failed to start,
-    not one somebody turned off — and the intent must survive it."""
-    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
-    d = _daemon_for_external_stop("STOPPED")
-    d._service_seen_up = False
-
-    for _ in range(daemon_mod.EXTERNAL_STOP_CONFIRM_POLLS + 2):
-        assert asyncio.run(d._adopt_external_stop()) is False  # recovery may try
-    assert _adopted(d) == []
-    assert d._desired_running is True
-
-
-def test_seeing_the_service_up_arms_adoption(monkeypatch, tmp_path):
-    """A server observed running is one a later stop can be attributed to."""
-    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
-    d = _daemon_for_external_stop("RUNNING")
-    d._service_seen_up = False
-    assert asyncio.run(d._adopt_external_stop()) is False
-    assert d._service_seen_up is True
-
-
 # ---------------- boot-time intent restore ----------------
-
-
-def test_is_boot_start_distinguishes_a_reboot_from_a_daemon_restart():
-    boot = 1_000_000.0
-    assert daemon_mod.is_boot_start(boot + 5.0, boot) is True
-    assert daemon_mod.is_boot_start(boot + daemon_mod.BOOT_INTENT_WINDOW, boot) is True
-    # Hours into an uptime: the installer bouncing the daemon, or the health
-    # task restarting it mid-outage. Not a boot, so not ours to act on.
-    assert daemon_mod.is_boot_start(boot + 6 * 3600, boot) is False
-    # A clock that moved backwards must not read as "just booted".
-    assert daemon_mod.is_boot_start(boot - 60.0, boot) is False
 
 
 def _daemon_for_boot_intent(state: str, *, desired=True, after_start="RUNNING"):
     d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
     d.__dict__["_Daemon__desired_running"] = desired
     d._boot_intent_pending = True
+    d.decisions = DecisionLog()
     d.log = logging.getLogger("test-boot-intent")
     d.cfg = types.SimpleNamespace(service_name="PalServer")
     d.emitted = []

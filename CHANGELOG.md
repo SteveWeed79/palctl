@@ -10,6 +10,57 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+### Added
+- **palctl now records why it is doing nothing.** The event feed says what
+  happened; nothing said what palctl *decided* — and every hard-to-diagnose
+  report in this project has been palctl reasoning correctly and silently
+  (declining to recover a server it believed was meant to be stopped, holding
+  off during an operation, throttling after too many restarts). Each decision is
+  now kept with its reason and shown on `/state` (`why`, `decisions`) and a new
+  `/decisions` endpoint. Repeats collapse, so a five-hour outage reads as one
+  line with a count.
+- **A standing "is this server on Steam's current build?"** on `/state`, instead
+  of only a notification that scrolls away. A version mismatch is the failure
+  players hit before the admin does — refused at the join screen while every
+  palctl reading correctly says the server is healthy. "Couldn't tell" is
+  reported as its own state, never as "up to date".
+- **Drift detection for `PalWorldSettings.ini`.** palctl records what it wrote
+  and reports anything else — a Steam update putting defaults back, a hand edit,
+  a missing file — naming the settings that changed. The previous approach
+  guessed at the damage ("is the file blank?") and missed the variant that
+  actually happened. Losing the REST API settings is reported as urgent, because
+  the symptom (palctl reporting a healthy server as down) points nowhere near
+  that file. No values are stored, only hashes, so the snapshot can never leak
+  the admin password.
+
+### Fixed
+- **An externally stopped server could still be restarted, for up to two
+  seconds.** The decision "did somebody stop this?" was being made from the same
+  short-lived cache that backs the dashboard's status display. Stale is harmless
+  for *showing* a state and not for *deciding* one: with a short poll interval,
+  two consecutive polls could be served the same 2-second-old "RUNNING" reading
+  — long enough for palctl to conclude a server that had just been stopped by
+  hand was a crash, and restart it. The recovery path now always reads the
+  service manager fresh. Found by the new end-to-end scenarios, which is exactly
+  the class of bug they exist for.
+
+### Changed
+- **The 'what to do about a server that isn't answering' decision is now one
+  pure function** (`palctl/supervisor.py`) over one observation, instead of a
+  sequence of guard clauses reading eight flags on the daemon. Both recent bugs
+  in that area were ordering mistakes between those clauses. Same behaviour,
+  stated once, with the whole policy pinned as a table.
+- **End-to-end scenarios in CI.** `tests/sim` builds a fake machine — a Palworld
+  server that can hang (accept the connection and never answer), a service
+  manager that can be driven behind palctl's back or refuse to start, and a real
+  daemon subprocess driven through its own HTTP API. Nothing is patched. Every
+  failure this project has shipped was invisible to the unit suite and visible
+  here in minutes.
+- **A release whose CHANGELOG heading doesn't match its tag now fails**
+  (`scripts/check_changelog.py`, run before anything builds).
+  `docs/VERSIONING.md` has required that from the start; it drifted anyway,
+  because nothing checked.
+
 ## [1.2.5.7] — 2026-08-09
 
 Four audit passes over the reliability of palctl's own machinery, prompted by a
