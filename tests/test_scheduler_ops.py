@@ -909,6 +909,24 @@ def test_cancel_and_skip_report_idle_when_nothing_is_running():
     assert sched.countdown_state() is None
 
 
+def test_only_operations_that_count_down_can_be_arrived_at_too_late():
+    """"Too late" means the admin missed a window. A backup, an update or the
+    boot-time start never had one, so answering their Cancel with "too late"
+    sends them looking for a countdown that never existed — and, because the
+    daemon starts the server at boot, made the answer depend on how recently
+    the machine came up."""
+    sched = sched_mod.Scheduler(Config(), FakeApi(), EventBus())
+
+    async def verdict_while(op: str) -> tuple[str, str]:
+        async with sched._control.operation(op):
+            return sched.cancel_countdown(), sched.skip_countdown()
+
+    for op in ("restart", "restore"):
+        assert _run(verdict_while(op)) == ("too_late", "too_late"), op
+    for op in ("backup", "update", "start", "stop", "auto-recover", "watchdog-restart"):
+        assert _run(verdict_while(op)) == ("idle", "idle"), op
+
+
 def test_restart_countdown_can_be_cancelled_before_restart(monkeypatch):
     calls: list = []
     intent: list = []

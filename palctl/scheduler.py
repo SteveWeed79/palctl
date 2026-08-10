@@ -30,6 +30,12 @@ _ESCAPES = (
     "`palctl cancel` / `palctl skip`, or Discord `/cancel` / `/now`."
 )
 
+# The operations that run a countdown, and so have a window an admin can arrive
+# too late for. Every *other* operation — a backup, an update, a boot-time
+# start, a watchdog restart that handed its timer to the game — never had one,
+# so "too late" would be the wrong word: there was nothing to be in time for.
+_COUNTDOWN_OPS = frozenset({"restart", "restore"})
+
 
 def _dir_size_bytes(path: Path | str) -> int:
     """Total size of a directory tree. Blocking — call via to_thread. Best-effort:
@@ -473,18 +479,21 @@ class Scheduler:
 
         Returns one of:
           "cancelled" — done; the server stays up.
-          "too_late"  — the wait is over and the operation is committed (or
-                        the operation never had a countdown to interrupt).
-          "idle"      — nothing is running.
+          "too_late"  — a restart or restore is running and its countdown is
+                        over, so it can no longer be called off.
+          "idle"      — no countdown to interrupt. Includes a server busy with
+                        something that never had one (a backup, an update, a
+                        boot-time start): "too late" would imply the admin
+                        nearly made a window that never existed.
 
-        Three outcomes rather than a bool because the two failures need
-        different words: an admin who clicked Cancel two seconds late is not
-        told "nothing was running", which reads as a broken button.
+        Three outcomes rather than a bool because the failures need different
+        words: an admin who clicked Cancel two seconds late is not told
+        "nothing was running", which reads as a broken button.
         """
         cd = self._countdown
         if cd is not None and cd.cancel():
             return "cancelled"
-        return "too_late" if (cd is not None or self._control.busy) else "idle"
+        return self._missed_verdict(cd)
 
     def skip_countdown(self) -> str:
         """Stop waiting and run the operation now. Same three outcomes as
@@ -495,7 +504,19 @@ class Scheduler:
         cd = self._countdown
         if cd is not None and cd.skip():
             return "skipped"
-        return "too_late" if (cd is not None or self._control.busy) else "idle"
+        return self._missed_verdict(cd)
+
+    def _missed_verdict(self, cd: Countdown | None) -> str:
+        """Why cancel/skip couldn't do anything: "too_late" or "idle".
+
+        Deliberately narrower than "is the server busy?". The daemon starts the
+        server at boot, backs up on a schedule and updates on another — none of
+        which an admin can be late for, and all of which would otherwise answer
+        a Cancel with "too late", sending them looking for a countdown that
+        never existed."""
+        if cd is not None:
+            return "too_late"  # it exists but already has a verdict, or has run out
+        return "too_late" if self._control.current_op in _COUNTDOWN_OPS else "idle"
 
     def countdown_state(self) -> dict | None:
         """The countdown as `/state` publishes it, or None. Every client draws

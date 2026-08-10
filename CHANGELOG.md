@@ -63,7 +63,11 @@ Installers for every release are on the
 - **"Nothing to cancel" no longer means "you were two seconds late".** Cancel
   and skip report three outcomes, not a bool, so an admin who just missed the
   window is told the operation is already under way rather than being told
-  nothing was running, which reads as a broken button.
+  nothing was running, which reads as a broken button. The converse holds too:
+  only a restart or a restore *has* a window, so cancelling during a backup, an
+  update or the boot-time start says there is no countdown to interrupt (and
+  names what is running) instead of "too late" — which would send someone
+  looking for a clock that never existed.
 
 ## [1.2.6.0] — 2026-08-10
 

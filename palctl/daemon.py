@@ -640,10 +640,18 @@ class Daemon:
                 f"too late — the {op or 'operation'} is already under way, past "
                 "the point where it can be called off."
             )
+        elif op:
+            # Busy, but with something that never counts down (a backup, an
+            # update, the boot-time start). Say which, so "nothing is counting
+            # down" doesn't read as a contradiction of the status badge.
+            reason = (
+                f"nothing is counting down right now — {op} is running, and it "
+                "has no countdown to interrupt."
+            )
         else:
             reason = (
-                "nothing is counting down right now. Start a restart or a restore "
-                "first — or, if one is already past its countdown, let it finish."
+                "nothing is counting down right now. Start a restart or a "
+                "restore first."
             )
         return web.json_response({"error": reason, "result": result}, status=409)
 

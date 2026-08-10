@@ -749,3 +749,11 @@ def test_countdown_reply_distinguishes_too_late_from_nothing_running():
     idle = PalBot._countdown_reply(_CdBot(), "idle")
     assert "nothing is counting down" in idle.lower()
     assert "too late" not in idle.lower()
+
+
+def test_countdown_reply_names_a_busy_operation_that_has_no_countdown():
+    # "Nothing is counting down" on its own contradicts a /status that says a
+    # backup is running. Name it instead.
+    idle = PalBot._countdown_reply(_CdBot(current_op="backup"), "idle")
+    assert "backup" in idle and "no countdown to interrupt" in idle
+    assert "too late" not in idle.lower()

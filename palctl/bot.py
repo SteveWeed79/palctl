@@ -843,11 +843,19 @@ class PalBot(discord.Client):
             return "🚫 Cancelled — the server stays up."
         if result == "skipped":
             return "⏩ Skipping the wait — going now."
+        op = self._sched.current_op
         if result == "too_late":
-            op = self._sched.current_op or "operation"
             return (
-                f"Too late — the {op} is already under way, past the point where "
-                "it can be called off. It'll report back here when it's done."
+                f"Too late — the {op or 'operation'} is already under way, past "
+                "the point where it can be called off. It'll report back here "
+                "when it's done."
+            )
+        if op:
+            # Busy with something that never counts down, so there is nothing
+            # to interrupt — but saying only that would contradict /status.
+            return (
+                f"Nothing is counting down — {op} is running, and it has no "
+                "countdown to interrupt."
             )
         return "Nothing is counting down right now."
 

@@ -169,11 +169,17 @@ def test_state_publishes_the_countdown_slot(daemon):
 def test_cancel_and_skip_with_nothing_running_are_409_with_a_reason(daemon):
     # Not a 500, and not a fake 200: the request made sense, the state didn't
     # allow it, and the admin gets told which.
+    #
+    # "idle" specifically, not just any refusal: this daemon may well be busy
+    # with its boot-time start of a server that isn't there, and an admin who
+    # cancels during THAT must not be told they were too late for a countdown
+    # that never existed. (That is the bug this assertion caught: it passed on
+    # Windows and failed on Linux purely on how a start behaves there.)
     for what in ("cancel-countdown", "skip-countdown"):
         r = httpx.post(f"{BASE}/action/{what}", headers=_auth(daemon), json={}, timeout=5)
         assert r.status_code == 409, what
         body = r.json()
-        assert body["result"] == "idle"
+        assert body["result"] == "idle", (what, body)
         assert "nothing is counting down" in body["error"].lower()
 
 
