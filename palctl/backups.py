@@ -205,14 +205,34 @@ def is_restorable(backup_root: Path, name: str) -> bool:
         return False
 
 
-def restore(backup_root: Path, name: str, savegames: Path) -> None:
+def restore(backup_root: Path, name: str, savegames: Path) -> str | None:
     """
     CALLER MUST STOP THE SERVER FIRST — copying over a live save corrupts it.
 
-    Stages the full backup copy *next to* SaveGames before touching the live
-    world, so a mid-copy failure (disk full, unreadable backup) leaves the
-    current world exactly as it was. Snapshots the current world before the
-    swap, so restoring the wrong backup is itself undoable.
+    Returns None on a clean restore, or a warning message when the world was
+    restored correctly but its undo copy could not be archived — a distinction
+    the caller needs, because that case is a success with a caveat, not a
+    failure.
+
+    Three phases, ordered so the live world is never the thing at risk:
+
+      1. **Stage.** Copy the whole backup to a sibling of SaveGames. A failure
+         here — unreadable backup, full disk — leaves the current world
+         untouched and nothing to undo.
+      2. **Swap.** Rename the live world aside, rename the staged copy into
+         place. Two renames on one filesystem, back to back, with nothing slow
+         between them.
+      3. **Archive.** Copy the world we swapped out into the backup folder as a
+         `-pre-restore` backup, so restoring the wrong one is undoable.
+
+    Phases 2 and 3 used to be one phase, in the other order: copy the live
+    world to the backup folder (minutes, and it can fail — full backup volume,
+    a file the game still holds open), *then* rmtree the live world, then move
+    the staged copy in. Every failure in that window left the server with no
+    world at all, and the caller then started it — so Palworld generated a
+    fresh one. Archiving after the swap means the slow, failure-prone part
+    happens when the live world is already correct, and a failure there costs
+    only the convenience of the undo copy, which is left beside SaveGames.
     """
     src = _safe_backup_path(backup_root, name)
     if not src.is_dir():
@@ -232,13 +252,30 @@ def restore(backup_root: Path, name: str, savegames: Path) -> None:
         shutil.rmtree(staged, ignore_errors=True)
         raise
 
-    # The staged copy is complete — only now touch the live world. If the
-    # snapshot or swap below still fails, the staged dir is deliberately left
-    # in place: past this point it may be the only good copy.
-    if savegames.exists():
-        _copytree_staged(savegames, backup_root / f"{_stamp()}-pre-restore")
-        shutil.rmtree(savegames)
+    # The staged copy is complete — only now touch the live world.
+    aside = savegames.parent / f"{savegames.name}.pre-restore"
+    if aside.exists():
+        shutil.rmtree(aside)  # leftover from a previous failed attempt
+    had_world = savegames.exists()
+    if had_world:
+        os.replace(savegames, aside)  # same directory, so this is a rename
     os.replace(staged, savegames)
+
+    # From here the live world is already the restored one. Everything below is
+    # the undo copy, and must never turn a completed restore into a failure.
+    if not had_world:
+        return None
+    try:
+        _copytree_staged(aside, backup_root / f"{_stamp()}-pre-restore")
+    except Exception as e:
+        return (
+            f"The restore succeeded, but the pre-restore safety copy of the old "
+            f"world could not be archived to {backup_root} ({e}). The old world "
+            f"is still on disk at {aside} — move it somewhere safe (or delete it "
+            "to reclaim the space) once you're happy with the restore."
+        )
+    shutil.rmtree(aside, ignore_errors=True)
+    return None
 
 
 def mirror(backup_path: Path, mirror_root: Path) -> Path:

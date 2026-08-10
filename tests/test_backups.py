@@ -1,3 +1,4 @@
+import shutil
 from pathlib import Path
 
 import pytest
@@ -174,6 +175,64 @@ def test_restore_failure_leaves_live_world_untouched(tmp_path: Path, monkeypatch
 
     assert (sg / "0" / "world" / "Level.sav").read_bytes() == b"live-world"
     assert not (sg.parent / f"{sg.name}.partial-restore").exists()
+
+
+def test_restore_never_leaves_the_world_missing_if_archiving_fails(tmp_path: Path):
+    """The world is swapped in before the undo copy is archived, so the slow,
+    failure-prone half can't cost you the world.
+
+    This is the ordering bug the old code had: it copied the live world to the
+    backup folder *first* (minutes, and it fails on a full backup volume) and
+    rmtree'd the live world before moving the restored copy in. Any failure in
+    that window left SaveGames gone — and the caller then started the server,
+    which had Palworld generate a fresh world over the top of the problem."""
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+    b = backups.create(sg, root, "manual")
+    (sg / "0" / "world" / "Level.sav").write_bytes(b"live-world")
+
+    # Archiving the swapped-out world fails — a full backup volume, a share
+    # that dropped, a permissions problem.
+    def archive_dies(src, dest):
+        raise OSError("No space left on device")
+
+    original = backups._copytree_staged
+    backups._copytree_staged = archive_dies
+    try:
+        warning = backups.restore(root, b.name, sg)
+    finally:
+        backups._copytree_staged = original
+
+    # The restore itself SUCCEEDED — the live world is the backup's contents.
+    assert (sg / "0" / "world" / "Level.sav").read_bytes() == b"x" * 1024
+    # ...and it says so, rather than reporting a failure that didn't happen.
+    assert warning and "succeeded" in warning
+    # The old world is still recoverable, sitting where the caller is told.
+    aside = sg.parent / f"{sg.name}.pre-restore"
+    assert (aside / "0" / "world" / "Level.sav").read_bytes() == b"live-world"
+
+
+def test_restore_reports_no_warning_on_a_clean_run(tmp_path: Path):
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+    b = backups.create(sg, root, "manual")
+    assert backups.restore(root, b.name, sg) is None
+    # The swapped-out world was archived and its working copy cleaned up.
+    assert not (sg.parent / f"{sg.name}.pre-restore").exists()
+    assert len([d for d in root.iterdir() if d.name.endswith("-pre-restore")]) == 1
+
+
+def test_restore_onto_a_missing_world_needs_no_undo_copy(tmp_path: Path):
+    # A world that doesn't exist yet (fresh install, or a previous restore that
+    # was interrupted) has nothing to snapshot — and must not fail over it.
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+    b = backups.create(sg, root, "manual")
+    shutil.rmtree(sg)
+
+    assert backups.restore(root, b.name, sg) is None
+    assert (sg / "0" / "world" / "Level.sav").read_bytes() == b"x" * 1024
+    assert not any(d.name.endswith("-pre-restore") for d in root.iterdir())
 
 
 def test_create_retries_once_for_a_quiet_window(tmp_path: Path, monkeypatch):

@@ -71,7 +71,12 @@ PC, which is the situation most people are trying to get out of.
 - Leak **forecasting**: fits the actual memory growth curve and warns *before*
   the limit — and, opt-in, restarts early at a moment the server happens to be
   empty, instead of at the threshold later with players mid-session
-- Scheduled restarts with in-game countdown, autosave, and rotating **local
+- Scheduled restarts with an in-game countdown you can **cancel or skip** from
+  any surface — the length is a setting, not a fixed ten minutes, and a
+  countdown with nobody online collapses to a few seconds rather than warning
+  an empty server. Restores get the same warning, so a mis-clicked one is
+  recoverable instead of instant
+- Autosave, and rotating **local
   backups that always run, at least once a day** (pick any more-frequent
   cadence) — **consistency-checked** (a copy the server wrote through is retried,
   and flagged if it stays dirty). Turn on an optional **off-site copy** to a
@@ -125,8 +130,13 @@ PC, which is the situation most people are trying to get out of.
 **CLI** — `palctl`
 ```
 palctl status | players | events | start | stop | restart | save
-       backup | backups | restore NAME | update | announce MSG | kick NAME | ban NAME | ui
+       cancel | skip | backup | backups | restore NAME | update
+       announce MSG | kick NAME | ban NAME | ui
 ```
+`restart` and `restore` take `--in SECONDS` or `--now` to set (or drop) the
+in-game countdown for that one call; `palctl cancel` calls a running countdown
+off and `palctl skip` cuts it short. `palctl status` shows the clock while one
+is running.
 Talks to the daemon's token-gated localhost API, so it works anywhere the
 daemon runs — ssh sessions, cron jobs, and the headless-Linux setup the GUI
 can't serve. `palctl kick zoe` resolves the name to a user ID for you. The
@@ -138,7 +148,9 @@ The daemon serves a dashboard at `http://127.0.0.1:8830` (localhost only, like
 everything else): live status, FPS, players, a memory sparkline with the
 watchdog limit drawn in, recent events — and the controls: start/stop/restart,
 save, backup, update, announce, kick/ban, and restore a backup (destructive
-actions confirm first, and a restore still snapshots the current world). The
+actions confirm first, and a restore still snapshots the current world). While
+a restart or restore is counting down, a bar at the top shows the clock with
+**Do it now** and **Cancel** beside it. The
 page is static; the data and action calls need your per-user token, which
 `palctl ui` puts in the URL fragment — fragments never leave the browser.
 
@@ -176,7 +188,7 @@ internet.
 *Reads (anyone):*
 `/status` `/health` `/players` `/whois` `/playtime` `/leaderboard` `/backups` `/events` `/next` `/help`
 *Admin:*
-`/start` `/stop` `/restart` `/cancel` `/update` `/save` `/backup` `/restore` `/announce` `/kick` `/ban` `/unban`
+`/start` `/stop` `/restart` `/cancel` `/now` `/update` `/save` `/backup` `/restore` `/announce` `/kick` `/ban` `/unban`
 
 `/health` shows memory against the watchdog limit *and the leak forecast* — how
 long until a restart is due on the current trend. `/leaderboard` ranks players
@@ -186,9 +198,11 @@ live if they're online, from history if they're not. `/playtime` and `/whois`
 work for **offline** players too. Player-name and backup-name arguments
 **autocomplete**, and the destructive commands (`/stop` `/update` `/restore`)
 pop a **Confirm/Cancel** button first — all so the bot is safe to drive
-one-handed from a phone. Changed your mind mid-countdown? `/cancel` aborts a
-restart before it takes the server down. The optional live status embed carries
-the leak forecast too, so a pinned message shows health at a glance.
+one-handed from a phone. Changed your mind mid-countdown? `/cancel` calls it
+off and `/now` skips the wait — the same two buttons the web dashboard and the
+desktop Console show while anything is counting down. The optional live status
+embed carries the leak forecast too, so a pinned message shows health at a
+glance.
 
 Plus join/leave, level-up, watchdog, server up/down, and update-available
 notifications — with an optional auto-refreshing status message and a

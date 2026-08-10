@@ -8,15 +8,27 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import backups, procs, rclone, steamcmd  # noqa: F401  (procs: tests patch service ctl here)
+# procs is imported as a module, not by name: the tests patch service control
+# through this reference.
+from . import backups, countdown, procs, rclone, steamcmd  # noqa: F401
 from .api import PalApi
 from .config import Config
 from .control import ServerController
+from .countdown import Countdown
 from .events import Event, EventBus
 from .inifile import is_blank
 
-# Announce at these marks before a scheduled restart.
-COUNTDOWN_MARKS = (600, 300, 60, 30, 10)
+# The emoji each countdown opens with, so the event feed reads the same as the
+# operation it precedes.
+_COUNTDOWN_ICON = {"restart": "🔁", "restore": "♻️"}
+
+# Where an admin can reach the two escape hatches. Repeated in the opening
+# event because the old countdown announced `/cancel` — a Discord command that
+# does not exist on the many installs running with the bot switched off.
+_ESCAPES = (
+    "Cancel it or skip the wait from the dashboard, the Console tab, "
+    "`palctl cancel` / `palctl skip`, or Discord `/cancel` / `/now`."
+)
 
 
 def _dir_size_bytes(path: Path | str) -> int:
@@ -102,9 +114,11 @@ class Scheduler:
         # Discord /start or /stop is remembered exactly like the GUI's buttons —
         # a /stop must not be undone by auto-recovery. None = no-op (standalone).
         self._set_intent = set_intent or (lambda _running: None)
-        # Armed for the duration of a countdown restart so /cancel can abort it
-        # before the server actually goes down. None = no countdown in flight.
-        self._cancel_restart: asyncio.Event | None = None
+        # The countdown currently running ahead of a restart or a restore, or
+        # None. Every surface reads it (`/state`), and every surface can cancel
+        # it or cut it short — it used to be a bare Event that only Discord's
+        # /cancel could reach, and nothing at all could shorten.
+        self._countdown: Countdown | None = None
         # One-shot: the update check runs every few hours, and a server root with
         # no readable Steam manifest would otherwise repeat the same warning
         # forever. Reset on reconfigure, so fixing the path re-arms it.
@@ -285,8 +299,11 @@ class Scheduler:
                 self._cfg.schedule.daily_restart_at,
             )
             wait = (target - datetime.now()).total_seconds()
-            # Wake before the restart so we can run the countdown.
-            await asyncio.sleep(max(0.0, wait - COUNTDOWN_MARKS[0]))
+            # Wake a full countdown before the target so the countdown *ends* on
+            # it. The lead is whatever the countdown is configured to be, not a
+            # hard-coded ten minutes.
+            lead = countdown.clamp_seconds(self._cfg.schedule.restart_countdown_seconds)
+            await asyncio.sleep(max(0.0, wait - lead))
 
             if not (self._cfg.schedule.enabled and self._cfg.schedule.daily_restart):
                 continue
@@ -299,8 +316,16 @@ class Scheduler:
                     )
                 )
             else:
+                # An empty server collapses the countdown to a few seconds, and
+                # a restart that then ran immediately would happen a full lead
+                # time *before* the hour the admin scheduled. Spend the
+                # difference waiting instead, so 06:00 still means 06:00.
+                effective, _why = await self._effective_countdown(lead)
+                await asyncio.sleep(max(0.0, lead - effective))
                 try:
-                    await self.restart_with_countdown("Scheduled daily restart")
+                    await self.restart_with_countdown(
+                        "Scheduled daily restart", seconds=lead
+                    )
                 except Exception as e:
                     await self._bus.emit(
                         Event("error", f"Scheduled daily restart failed: {e}")
@@ -441,85 +466,161 @@ class Scheduler:
             )
         )
 
-    def cancel_countdown(self) -> bool:
-        """Ask an in-progress countdown restart to abort before it takes the
-        server down. Returns True if a countdown was running to cancel. Called
-        from the same event loop (the Discord /cancel command)."""
-        ev = self._cancel_restart
-        if ev is not None and not ev.is_set():
-            ev.set()
-            return True
-        return False
+    # ---------- the countdown, and the two ways out of it ----------
 
-    async def _sleep_or_cancel(self, delay: float) -> bool:
-        """Sleep `delay` seconds, returning True early if the countdown was
-        cancelled meanwhile. A plain sleep when no cancel event is armed."""
-        ev = self._cancel_restart
-        if ev is None:
-            await asyncio.sleep(max(0.0, delay))
-            return False
-        if delay <= 0:
-            return ev.is_set()
+    def cancel_countdown(self) -> str:
+        """Abort the countdown in flight, so the operation never happens.
+
+        Returns one of:
+          "cancelled" — done; the server stays up.
+          "too_late"  — the wait is over and the operation is committed (or
+                        the operation never had a countdown to interrupt).
+          "idle"      — nothing is running.
+
+        Three outcomes rather than a bool because the two failures need
+        different words: an admin who clicked Cancel two seconds late is not
+        told "nothing was running", which reads as a broken button.
+        """
+        cd = self._countdown
+        if cd is not None and cd.cancel():
+            return "cancelled"
+        return "too_late" if (cd is not None or self._control.busy) else "idle"
+
+    def skip_countdown(self) -> str:
+        """Stop waiting and run the operation now. Same three outcomes as
+        cancel_countdown(), with "skipped" in place of "cancelled".
+
+        The half that was missing entirely: an admin who knows the server is
+        empty had no way to say so, and paid the full countdown for it."""
+        cd = self._countdown
+        if cd is not None and cd.skip():
+            return "skipped"
+        return "too_late" if (cd is not None or self._control.busy) else "idle"
+
+    def countdown_state(self) -> dict | None:
+        """The countdown as `/state` publishes it, or None. Every client draws
+        its clock and its Cancel / Now buttons from this one reading."""
+        cd = self._countdown
+        return cd.state() if cd is not None else None
+
+    async def _players_to_warn(self) -> int | None:
+        """How many players would actually see an in-game countdown.
+
+        0 means nobody is on. None means the REST API didn't answer — in which
+        case an announcement reaches nobody either, so for the purpose of
+        "is this wait buying anything?" the two are the same answer."""
         try:
-            await asyncio.wait_for(ev.wait(), timeout=delay)
-            return True  # the event fired within the window = cancelled
-        except TimeoutError:
-            return False
+            return len(await self._api.players())
+        except Exception:
+            return None
 
-    async def restart_with_countdown(self, reason: str) -> bool:
+    async def _effective_countdown(self, requested: int) -> tuple[int, str]:
+        """(seconds, why-it-was-shortened) for a countdown of `requested`.
+
+        Waiting ten minutes to warn an empty server is the single biggest
+        source of "palctl made me wait for nothing". Collapse it — unless the
+        admin has turned that off, or there are players who deserve the notice.
+        """
+        total = countdown.clamp_seconds(requested)
+        if total <= countdown.EMPTY_SERVER_SECONDS:
+            return total, ""
+        if not self._cfg.schedule.skip_countdown_when_empty:
+            return total, ""
+        online = await self._players_to_warn()
+        if online:
+            return total, ""
+        if online == 0:
+            return countdown.EMPTY_SERVER_SECONDS, "nobody is online to warn"
+        return countdown.EMPTY_SERVER_SECONDS, (
+            "the server's REST API isn't answering, so an in-game warning "
+            "would reach nobody"
+        )
+
+    async def _count_down(
+        self, kind: str, reason: str, requested: int, *, announce_as: str | None = None
+    ) -> bool:
+        """Run the pre-operation countdown. True = go ahead, False = cancelled.
+
+        Registers the countdown on `self._countdown` for its whole life, which
+        is what makes it visible on `/state` and reachable by cancel/skip from
+        every surface. `announce_as` is the player-facing wording where the
+        operator's is more specific than players need."""
+        total, why = await self._effective_countdown(requested)
+        icon = _COUNTDOWN_ICON.get(kind, "⏳")
+        if total <= 0:
+            await self._bus.emit(
+                Event(kind, f"{icon} {reason} — no countdown, going now.",
+                      {"countdown_seconds": 0})
+            )
+            return True
+
+        await self._bus.emit(
+            Event(
+                kind,
+                f"{icon} {reason} — {countdown.humanize(total)} to go"
+                + (f" ({why})" if why else "")
+                + f". {_ESCAPES}",
+                {"countdown_seconds": total, "shortened": why},
+            )
+        )
+        cd = Countdown(
+            kind,
+            reason,
+            total,
+            announce_as=announce_as,
+            # Resolved per announcement, not bound now: a countdown outlives a
+            # config reload, and Countdown treats a failure here as "nobody
+            # heard it" rather than a reason to stop counting down.
+            announce=lambda m: self._api.announce(m),
+            notify=lambda m: self._bus.emit(Event(kind, m)),
+        )
+        self._countdown = cd
+        try:
+            return await cd.run()
+        finally:
+            self._countdown = None
+
+    async def restart_with_countdown(
+        self, reason: str, *, seconds: int | None = None
+    ) -> bool:
         """Announce, count down, save, restart. Also used by the GUI/bot buttons.
 
         Holds the op lock for the whole countdown, so an update or a watchdog
-        restart can't fire into the middle of it. Cancellable via /cancel right
-        up until the save+restart at the end. Returns True if the restart ran,
-        False if it was cancelled — the scheduled-restart loop needs to tell the
-        two apart so a cancel skips today's slot instead of re-arming it."""
+        restart can't fire into the middle of it. `seconds` overrides the
+        configured countdown for this one restart (0 = go now, no warning);
+        None uses `schedule.restart_countdown_seconds`.
+
+        Returns True if the restart ran — including when an admin cut the
+        countdown short — and False if it was cancelled. The scheduled-restart
+        loop needs to tell those apart so a cancel skips today's slot instead of
+        re-arming it."""
         async with self._control.operation("restart"):
             # A restart intends the server up afterward — record that so it has
             # parity with the daemon's HTTP /action/restart and a prior /stop
             # can't leave auto-recovery thinking the server should stay down.
             self._set_intent(True)
-            self._cancel_restart = asyncio.Event()
-            try:
-                await self._bus.emit(
-                    Event("restart", f"🔁 {reason} — counting down. (`/cancel` to abort)")
+            requested = (
+                self._cfg.schedule.restart_countdown_seconds
+                if seconds is None
+                else seconds
+            )
+            if not await self._count_down("restart", reason, requested):
+                return False
+            await self._control.save_best_effort(settle=3)
+            ok = await self._control.restart_cycle(
+                escalate=True,
+                on_escalate=lambda m: self._bus.emit(
+                    Event("restart", f"🔨 {m}", {"action": "force_stop"})
+                ),
+            )
+            await self._bus.emit(
+                Event(
+                    "restart",
+                    "✅ Server back up." if ok else "❌ Server did not come back up.",
+                    {"recovered": ok},
                 )
-
-                cancelled_msg = (
-                    f"🚫 Restart cancelled — '{reason}' called off. Server left running."
-                )
-                prev = COUNTDOWN_MARKS[0]
-                for mark in COUNTDOWN_MARKS:
-                    if await self._sleep_or_cancel(max(0, prev - mark)):
-                        await self._bus.emit(Event("restart", cancelled_msg))
-                        return False
-                    prev = mark
-                    label = f"{mark // 60} minute(s)" if mark >= 60 else f"{mark} seconds"
-                    try:
-                        await self._api.announce(f"{reason} in {label}.")
-                    except Exception:
-                        pass
-
-                if await self._sleep_or_cancel(prev):
-                    await self._bus.emit(Event("restart", cancelled_msg))
-                    return False
-                await self._control.save_best_effort(settle=3)
-                ok = await self._control.restart_cycle(
-                    escalate=True,
-                    on_escalate=lambda m: self._bus.emit(
-                        Event("restart", f"🔨 {m}", {"action": "force_stop"})
-                    ),
-                )
-                await self._bus.emit(
-                    Event(
-                        "restart",
-                        "✅ Server back up." if ok else "❌ Server did not come back up.",
-                        {"recovered": ok},
-                    )
-                )
-                return True
-            finally:
-                self._cancel_restart = None
+            )
+            return True
 
     async def restart_quick(self, reason: str, *, skip_if_busy: bool = False) -> None:
         """Save and restart with no countdown. For moments when there's nobody
@@ -606,22 +707,43 @@ class Scheduler:
 
     # ---------- restore ----------
 
-    async def restore_backup(self, name: str) -> None:
+    async def restore_backup(self, name: str, *, seconds: int | None = None) -> bool:
         """
-        Stop the server, restore a backup over SaveGames, bring it back.
+        Warn players, stop the server, restore a backup over SaveGames, bring
+        it back. Returns True if the restore ran, False if it was refused or
+        cancelled.
 
         `backups.restore` rejects path-traversal names and snapshots the current
-        world to a `-pre-restore` copy first, so restoring the wrong one is itself
+        world to a `-pre-restore` copy, so restoring the wrong one is itself
         undoable. We pre-check the name exists so a typo doesn't take the server
         down for nothing.
+
+        The countdown is the part that used to be missing: a restore dropped
+        everyone the instant the button was clicked, which is both rude to
+        players and left no window in which to take back a mis-click. `seconds`
+        overrides it for this one restore (0 = the old immediate behaviour);
+        None uses `schedule.restore_countdown_seconds`.
         """
         cfg = self._cfg
         if not backups.is_restorable(Path(cfg.backup_root), name):
             await self._bus.emit(Event("error", f"Restore aborted: no such backup '{name}'."))
-            return
+            return False
 
         async with self._control.operation("restore"):
             self._set_intent(True)  # the server is meant to be up after a restore
+            requested = (
+                cfg.schedule.restore_countdown_seconds if seconds is None else seconds
+            )
+            if not await self._count_down(
+                "restore",
+                f"Restoring backup {name}",
+                requested,
+                # Players get told the server is going down, not the name of a
+                # timestamped folder on the admin's disk.
+                announce_as="Server restart to restore a backup",
+            ):
+                return False
+
             await self._bus.emit(
                 Event("restore", f"♻️ Restoring backup `{name}` — stopping the server.")
             )
@@ -637,28 +759,88 @@ class Scheduler:
                         "untouched. Stop the server manually, then retry.",
                     )
                 )
-                return
+                return False
+            if not await self._confirm_world_is_free(cfg):
+                return False
+
             try:
-                await asyncio.to_thread(
+                warning = await asyncio.to_thread(
                     backups.restore, Path(cfg.backup_root), name, cfg.savegames_dir
                 )
                 await self._bus.emit(
                     Event("restore", f"📥 Restored `{name}`. Starting the server.")
                 )
+                if warning:
+                    await self._bus.emit(Event("error", warning))
             except Exception as e:
                 await self._bus.emit(Event("error", f"Restore failed: {e}"))
-            finally:
-                await self._control.start()
-                ok = await self._api.wait_until_alive(timeout=240)
-                await self._bus.emit(
-                    Event(
-                        "restore",
-                        "✅ Server back up after restore."
-                        if ok
-                        else "❌ Server did not come back after the restore. Needs a look.",
-                        {"recovered": ok},
+                if not await asyncio.to_thread(cfg.savegames_dir.exists):
+                    # The world is not there. Starting the server now would have
+                    # Palworld generate a brand-new one over the top of the
+                    # problem — players would join it, build in it, and the real
+                    # world would become un-mergeable. Leave the server down and
+                    # say exactly where both copies are instead.
+                    await self._bus.emit(
+                        Event(
+                            "error",
+                            "Restore failed with no world in place, so the server "
+                            "was NOT started — starting it would generate an empty "
+                            f"world over the problem. Look in `{cfg.savegames_dir.parent}` "
+                            f"for `{cfg.savegames_dir.name}.partial-restore` (the backup "
+                            f"being restored) and `{cfg.savegames_dir.name}.pre-restore` "
+                            f"(the world as it was), and in `{cfg.backup_root}` for the "
+                            "`-pre-restore` copies. Put one of them back as "
+                            f"`{cfg.savegames_dir.name}`, then start the server.",
+                            {"savegames": str(cfg.savegames_dir)},
+                        )
                     )
+                    return False
+
+            await self._control.start()
+            ok = await self._api.wait_until_alive(timeout=240)
+            await self._bus.emit(
+                Event(
+                    "restore",
+                    "✅ Server back up after restore."
+                    if ok
+                    else "❌ Server did not come back after the restore. Needs a look.",
+                    {"recovered": ok},
                 )
+            )
+            return True
+
+    async def _confirm_world_is_free(self, cfg: Config) -> bool:
+        """
+        The service says STOPPED — but is anything still holding the world open?
+
+        The same hazard the update path checks for (a hung shutdown, or a
+        leftover second service pointed at the same folder), with a different
+        consequence: a live PalServer writes .sav files while the restore swaps
+        them, and on Windows it also locks them so the swap fails halfway. The
+        update path has guarded against this since the version-mismatch bug;
+        restore — which overwrites the world itself — did not.
+        """
+        pids = await self._live_server_pids(cfg)
+        if not pids:
+            return True
+        await self._bus.emit(
+            Event(
+                "error",
+                "Restore aborted: the service reports STOPPED but a Palworld "
+                f"server is still running from `{cfg.server_root}` (PID "
+                f"{', '.join(str(p) for p in pids)}). Restoring over a world that "
+                "process still holds open corrupts it. Nothing was changed. End "
+                "that process (and check for a second, leftover server service), "
+                "then retry.",
+                {"pids": pids, "server_root": str(cfg.server_root)},
+            )
+        )
+        return False
+
+    async def _live_server_pids(self, cfg: Config) -> list[int]:
+        """PIDs of Palworld server processes still running out of the install."""
+        alive = await asyncio.to_thread(procs.processes_under, cfg.server_root)
+        return [p.pid for p in alive]
 
     # ---------- server update (SteamCMD) ----------
 
@@ -790,10 +972,10 @@ class Scheduler:
         version mismatch. Abort with the cause instead — the world is untouched
         and the server is down, which is a state a human can act on.
         """
-        alive = await asyncio.to_thread(procs.processes_under, cfg.server_root)
+        alive = await self._live_server_pids(cfg)
         if not alive:
             return True
-        pids = ", ".join(str(p.pid) for p in alive)
+        pids = ", ".join(str(p) for p in alive)
         await self._bus.emit(
             Event(
                 "error",
@@ -804,7 +986,7 @@ class Scheduler:
                 "which players meet as a **version mismatch**. Nothing was "
                 "changed. End that process (and check for a second, leftover "
                 "server service in services.msc), then retry.",
-                {"pids": [p.pid for p in alive], "server_root": str(cfg.server_root)},
+                {"pids": alive, "server_root": str(cfg.server_root)},
             )
         )
         return False

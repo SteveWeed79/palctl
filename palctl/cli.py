@@ -25,6 +25,18 @@ def _fmt_uptime(seconds: float) -> str:
     return f"{d}d {h}h {m:02d}m" if d else f"{h}h {m:02d}m"
 
 
+def fmt_countdown(cd: dict) -> str:
+    """The one line that tells an admin a restart/restore is pending and what
+    they can do about it. Without it, `palctl status` said only 'restart in
+    progress' for ten minutes with no clue that it hadn't happened yet."""
+    left = int(cd.get("seconds_remaining") or 0)
+    clock = f"{left // 60}m {left % 60:02d}s" if left >= 60 else f"{left}s"
+    line = f"{cd.get('reason') or cd.get('kind', 'operation')} in {clock}"
+    if cd.get("cancellable"):
+        line += "  (`palctl cancel` to abort, `palctl skip` to go now)"
+    return line
+
+
 def fmt_status(state: dict) -> str:
     lines = []
     alive = state.get("alive")
@@ -32,6 +44,9 @@ def fmt_status(state: dict) -> str:
     lines.append(f"server     {state.get('service', 'UNKNOWN')} ({api})")
     if state.get("operation"):
         lines.append(f"operation  {state['operation']} in progress")
+    cd = state.get("countdown")
+    if cd:
+        lines.append(f"countdown  {fmt_countdown(cd)}")
 
     m = state.get("metrics")
     if m:
@@ -83,6 +98,20 @@ def find_players(players: list[dict], name: str) -> list[dict]:
 # ---------------- commands ----------------
 
 
+def _countdown_seconds(args) -> int | None:
+    """The `seconds` override this invocation asked for, or None for 'use the
+    configured default'. `--now` is just `--in 0` with a friendlier name."""
+    if args.now:
+        return 0
+    return args.in_seconds
+
+
+def _countdown_running(client: DaemonClient) -> bool:
+    """Is a countdown in flight that could still be cut short?"""
+    cd = client.state().get("countdown")
+    return bool(cd and cd.get("cancellable"))
+
+
 def _resolve_target(client: DaemonClient, name: str) -> str:
     players = client.state().get("players", [])
     # An exact user ID passes straight through — it's the only unambiguous
@@ -121,16 +150,40 @@ def main(argv: list[str] | None = None) -> int:
     ev = sub.add_parser("events", help="recent daemon events")
     ev.add_argument("-n", type=int, default=20, help="how many (default 20)")
 
+    def _countdown_flags(parser: argparse.ArgumentParser, what: str) -> None:
+        """`--in`/`--now` on anything that warns players first. Both are
+        overrides for this one call; the default lives in Config so the usual
+        case needs no flag at all."""
+        g = parser.add_mutually_exclusive_group()
+        g.add_argument(
+            "--in", dest="in_seconds", type=int, metavar="SECONDS",
+            help=f"seconds of in-game countdown before the {what} (0 = none)",
+        )
+        g.add_argument(
+            "--now", action="store_true",
+            help=f"no countdown — {what} immediately (or cut short one already "
+                 "running)",
+        )
+
     sub.add_parser("start", help="start the server")
     sub.add_parser("stop", help="save and stop the server")
     r = sub.add_parser("restart", help="restart with an in-game countdown")
     r.add_argument("--reason", default="Admin restart", help="shown to players")
+    _countdown_flags(r, "restart")
     sub.add_parser("save", help="save the world now")
+
+    sub.add_parser(
+        "cancel", help="abort the restart/restore countdown that's running"
+    )
+    sub.add_parser(
+        "skip", help="stop waiting out a countdown and run the operation now"
+    )
 
     sub.add_parser("backup", help="take a backup now")
     sub.add_parser("backups", help="list backups")
     rs = sub.add_parser("restore", help="restore a backup (restarts the server)")
     rs.add_argument("name", help="backup name, as shown by `palctl backups`")
+    _countdown_flags(rs, "restore")
 
     sub.add_parser("update", help="update the server via SteamCMD")
 
@@ -169,20 +222,44 @@ def main(argv: list[str] | None = None) -> int:
             print("Server saved and stopped. (`palctl start` brings it back; "
                   "crash auto-recovery won't fight an intentional stop.)")
         elif args.cmd == "restart":
-            client.action("restart", reason=args.reason)
-            print("Restart with countdown started — follow it with `palctl events`.")
+            # `--now` on a countdown that's already running means "hurry it
+            # up", not "start a second restart" — the daemon would answer 409
+            # busy, which is technically right and useless to the person who
+            # just wants the wait to end.
+            if args.now and _countdown_running(client):
+                client.action("skip-countdown")
+                print("Cutting the countdown short — restarting now.")
+            else:
+                client.action(
+                    "restart", reason=args.reason, seconds=_countdown_seconds(args)
+                )
+                print("Restart started — follow it with `palctl events`. "
+                      "(`palctl cancel` aborts it, `palctl skip` skips the wait.)")
         elif args.cmd == "save":
             client.action("save")
             print("World saved.")
+        elif args.cmd == "cancel":
+            client.action("cancel-countdown")
+            print("Cancelled — the server stays up.")
+        elif args.cmd == "skip":
+            client.action("skip-countdown")
+            print("Skipping the rest of the countdown — going now.")
         elif args.cmd == "backup":
             client.action("backup")
             print("Backup started — it shows up in `palctl backups` when done.")
         elif args.cmd == "backups":
             print(fmt_backups(client.backups()))
         elif args.cmd == "restore":
-            client.action("restore", name=args.name)
-            print(f"Restoring '{args.name}' — the server will restart. A safety "
-                  "copy of the current world is taken first.")
+            if args.now and _countdown_running(client):
+                client.action("skip-countdown")
+                print("Cutting the countdown short — restoring now.")
+            else:
+                client.action(
+                    "restore", name=args.name, seconds=_countdown_seconds(args)
+                )
+                print(f"Restoring '{args.name}' — players are warned first, then "
+                      "the server restarts. A safety copy of the current world is "
+                      "taken too. (`palctl cancel` aborts it while it counts down.)")
         elif args.cmd == "update":
             client.action("update-server")
             print("Update started (backup → SteamCMD → restart) — follow it "

@@ -158,6 +158,48 @@ def test_missing_body_field_is_a_400_with_the_field_name(daemon):
     assert r.json() == {"error": "missing required field: user_id"}
 
 
+def test_state_publishes_the_countdown_slot(daemon):
+    # Every client draws its clock and its Cancel/Now buttons from this key, so
+    # it must exist even when nothing is counting down.
+    r = httpx.get(f"{BASE}/state", headers=_auth(daemon), timeout=5)
+    assert r.status_code == 200
+    assert r.json()["countdown"] is None
+
+
+def test_cancel_and_skip_with_nothing_running_are_409_with_a_reason(daemon):
+    # Not a 500, and not a fake 200: the request made sense, the state didn't
+    # allow it, and the admin gets told which.
+    for what in ("cancel-countdown", "skip-countdown"):
+        r = httpx.post(f"{BASE}/action/{what}", headers=_auth(daemon), json={}, timeout=5)
+        assert r.status_code == 409, what
+        body = r.json()
+        assert body["result"] == "idle"
+        assert "nothing is counting down" in body["error"].lower()
+
+
+def test_restore_of_an_unknown_backup_is_a_400_not_a_cheerful_200(daemon):
+    # The old handler spawned the restore as a background task and answered 200
+    # immediately, so `palctl restore typo` printed "Restoring…" and the only
+    # trace of the failure was an event nobody was watching.
+    r = httpx.post(
+        f"{BASE}/action/restore",
+        headers=_auth(daemon),
+        json={"name": "no-such-backup"},
+        timeout=5,
+    )
+    assert r.status_code == 400
+    assert "no such backup" in r.json()["error"]
+
+
+@pytest.mark.parametrize("bad", [-1, 99_999, "600", 1.5, True])
+def test_restart_rejects_a_nonsense_countdown_length(daemon, bad):
+    r = httpx.post(
+        f"{BASE}/action/restart", headers=_auth(daemon), json={"seconds": bad}, timeout=5
+    )
+    assert r.status_code == 400
+    assert "seconds" in r.json()["error"]
+
+
 def test_malformed_json_body_is_a_400(daemon):
     r = httpx.post(
         f"{BASE}/action/unban",

@@ -34,8 +34,9 @@ This page is the long form.
 | `/save` | Save the world now | **yes** |
 | `/backup` | Take a backup now | **yes** |
 | `/restore <name>` | Restore a backup (asks first; restarts the server) | **yes** |
-| `/restart [reason]` | Restart with an in-game countdown | **yes** |
-| `/cancel` | Cancel an in-progress restart countdown | **yes** |
+| `/restart [reason] [seconds]` | Restart with an in-game countdown (`seconds` overrides its length; `0` = now) | **yes** |
+| `/cancel` | Call off the restart/restore countdown that's running | **yes** |
+| `/now` | Stop waiting out a countdown — run the operation immediately | **yes** |
 | `/update` | Update via SteamCMD (asks first; stops the server) | **yes** |
 | `/kick <name> [reason]` | Kick a player | **yes** |
 | `/ban <name> [reason]` | Ban a player | **yes** |
@@ -194,7 +195,7 @@ looks like "commands work but alerts don't".
 
 ## Step 5 — Set who can run admin commands
 
-Admin-only commands (`/start`, `/stop`, `/announce`, `/restart`, `/cancel`,
+Admin-only commands (`/start`, `/stop`, `/announce`, `/restart`, `/cancel`, `/now`,
 `/kick`, `/ban`, `/save`, `/backup`, `/restore`, `/update`, `/unban`) are gated
 by **`admin_role_id`**.
 

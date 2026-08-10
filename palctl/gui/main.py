@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import netinfo
+from .. import countdown, netinfo
 from ..config import (
     CONFIG_PATH,
     Config,
@@ -458,12 +458,63 @@ class Console(QWidget):
         v.addWidget(restore_btn)
         self._icon_buttons.append((restore_btn, "action-restore"))
 
+        # The countdown bar. Hidden until a restart or restore is actually
+        # counting down, because the two buttons on it are only ever honest
+        # then — and until now there was no way at all to reach them from the
+        # desktop app: the whole action row greys out during an operation, so a
+        # ten-minute countdown was ten minutes of a frozen window.
+        self.cd_box = QGroupBox("Counting down")
+        cd_row = QHBoxLayout(self.cd_box)
+        self.cd_label = QLabel("—")
+        self.cd_label.setStyleSheet("font-size:15px;")
+        cd_row.addWidget(self.cd_label, 1)
+        self.cd_now = QPushButton(icons.load_icon("action-restart"), "Do it now")
+        self.cd_now.setToolTip("Stop waiting and run the operation immediately.")
+        self.cd_now.clicked.connect(lambda: self._countdown_action("skip-countdown"))
+        cd_row.addWidget(self.cd_now)
+        self._icon_buttons.append((self.cd_now, "action-restart"))
+        self.cd_cancel = QPushButton(icons.load_icon("action-stop"), "Cancel")
+        self.cd_cancel.setToolTip("Call it off — the server stays up.")
+        self.cd_cancel.clicked.connect(lambda: self._countdown_action("cancel-countdown"))
+        cd_row.addWidget(self.cd_cancel)
+        self._icon_buttons.append((self.cd_cancel, "action-stop"))
+        self.cd_box.hide()
+        v.addWidget(self.cd_box)
+
         self.log = QTextEdit(readOnly=True)
         v.addWidget(self.log, 1)
 
     def retint(self) -> None:
         for btn, name in self._icon_buttons:
             btn.setIcon(icons.load_icon(name))
+
+    def update_state(self, s: dict) -> None:
+        """Reflect the daemon's live countdown, polled with everything else."""
+        cd = s.get("countdown")
+        self.cd_box.setVisible(bool(cd))
+        if not cd:
+            return
+        left = int(cd.get("seconds_remaining") or 0)
+        clock = f"{left // 60}:{left % 60:02d}" if left >= 60 else f"{left}s"
+        self.cd_label.setText(f"{cd.get('reason') or cd.get('kind', 'Operation')} in {clock}")
+        live = cd.get("cancellable") is not False
+        self.cd_now.setEnabled(live)
+        self.cd_cancel.setEnabled(live)
+
+    def _countdown_action(self, what: str) -> None:
+        # Deliberately synchronous: these return immediately (they only set an
+        # event on the daemon's countdown) and the answer — including "too
+        # late" — is what the admin is standing there waiting to read.
+        try:
+            call(f"/action/{what}", {})
+        except DaemonError as e:
+            self.log.append(f"❌ {e}")
+            return
+        self.log.append(
+            "🚫 Cancelled — the server stays up."
+            if what == "cancel-countdown"
+            else "⏩ Skipping the wait — going now."
+        )
 
     def _call_async(self, path: str, body: dict, ok_line: str, on_ok=None) -> None:
         """Run one daemon call on a worker thread and log the outcome. The UI
@@ -515,7 +566,9 @@ class Console(QWidget):
         confirm = QMessageBox.question(
             self, "Restore?",
             f"Restore '{name}'?\n\nThis overwrites the current world and restarts "
-            "the server. A safety copy of the current world is taken first.",
+            "the server. A safety copy of the current world is taken first.\n\n"
+            "Players are warned in-game first — you can cancel or skip that "
+            "countdown from the bar that appears here.",
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
@@ -845,10 +898,42 @@ class ConfigTab(QWidget):
             "runs after a successful world backup. Untick to update anyway "
             "when the backup fails — no rollback if the update goes bad."
         )
+        self.sch_restart_cd = NoScrollSpinBox()
+        self.sch_restart_cd.setRange(0, countdown.MAX_SECONDS)
+        self.sch_restart_cd.setSuffix(" s")
+        self.sch_restart_cd.setSpecialValueText("no countdown")  # shown at 0
+        self.sch_restart_cd.setValue(
+            countdown.clamp_seconds(cfg.schedule.restart_countdown_seconds)
+        )
+        self.sch_restart_cd.setToolTip(
+            "How long players are warned in-game before a restart takes the "
+            "server down. This is only the default — the Console's Cancel and "
+            "Do-it-now buttons work on any countdown while it runs."
+        )
+        self.sch_restore_cd = NoScrollSpinBox()
+        self.sch_restore_cd.setRange(0, countdown.MAX_SECONDS)
+        self.sch_restore_cd.setSuffix(" s")
+        self.sch_restore_cd.setSpecialValueText("no countdown")
+        self.sch_restore_cd.setValue(
+            countdown.clamp_seconds(cfg.schedule.restore_countdown_seconds)
+        )
+        self.sch_restore_cd.setToolTip(
+            "The same warning before restoring a backup over the live world. "
+            "0 restores immediately, with no window to take back a mis-click."
+        )
+        self.sch_skip_empty = QCheckBox(checked=cfg.schedule.skip_countdown_when_empty)
+        self.sch_skip_empty.setToolTip(
+            "With nobody online — or with the server not answering — the "
+            "countdown is warning an empty room, so shorten it to a few "
+            "seconds. Untick to always wait the full time."
+        )
         sf.addRow("Enabled", self.sch_enabled)
         sf.addRow("Daily restart", self.sch_restart)
         sf.addRow("At", self.sch_time)
         sf.addRow("Or restart every", self.sch_every)
+        sf.addRow("Restart countdown", self.sch_restart_cd)
+        sf.addRow("Restore countdown", self.sch_restore_cd)
+        sf.addRow("Skip the wait when empty", self.sch_skip_empty)
         sf.addRow("Backup every", self.sch_backup)
         sf.addRow("Backups to keep (local)", self.sch_retain)
         sf.addRow("Copies to keep (mirror)", self.sch_mirror_retain)
@@ -1029,6 +1114,9 @@ class ConfigTab(QWidget):
         c.schedule.daily_restart = self.sch_restart.isChecked()
         c.schedule.daily_restart_at = self.sch_time.time().toString("HH:mm")
         c.schedule.restart_every_hours = self.sch_every.value()
+        c.schedule.restart_countdown_seconds = self.sch_restart_cd.value()
+        c.schedule.restore_countdown_seconds = self.sch_restore_cd.value()
+        c.schedule.skip_countdown_when_empty = self.sch_skip_empty.isChecked()
         c.schedule.backup_hours = self.sch_backup.value()
         c.schedule.backup_retain = self.sch_retain.value()
         c.schedule.mirror_retain = self.sch_mirror_retain.value()
@@ -1214,6 +1302,7 @@ class Main(QMainWindow):
     def _on_state(self, s: dict) -> None:
         self.dash.update_state(s)
         self.players.update_state(s)
+        self.console.update_state(s)
         svc = s.get("service", "?")
         n = len(s.get("players", []))
         self.status.showMessage(f"Daemon OK · service {svc} · {n} online")

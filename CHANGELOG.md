@@ -10,6 +10,61 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+### Added
+- **A restart or restore you can cancel — or hurry along — from anywhere.** The
+  countdown was a hard-coded ten minutes with exactly one escape hatch, Discord's
+  `/cancel`, which most installs don't have because the bot ships switched off.
+  So an admin who wanted the restart *sooner* had no answer but to wait, and one
+  who wanted it not to happen at all had none either — the dashboard even greys
+  its buttons out for the duration, which is the app locking you out of the one
+  decision you still wanted to make. Now every surface can do both:
+  - **Cancel** calls the whole thing off; **now** stops waiting and runs it.
+    They are different verbs with different outcomes, and both are on the web
+    dashboard (a bar with the live clock and two buttons), the desktop Console,
+    the CLI (`palctl cancel`, `palctl skip`), and Discord (`/cancel`, `/now`).
+  - The countdown itself is published on `/state`, so every client shows the
+    same clock instead of the countdown being visible only in the Discord
+    channel it announced in.
+  - **Its length is a setting** (`schedule.restart_countdown_seconds`, default
+    600) and can be overridden per call: `palctl restart --in 60`,
+    `palctl restart --now`, `/restart seconds:0`, or `{"seconds": N}` on the
+    HTTP action.
+- **Restores warn players first.** A restore used to drop everyone the instant
+  the button was clicked — which is also why there was never a window in which
+  to take back a mis-click. It now runs the same cancellable countdown
+  (`schedule.restore_countdown_seconds`, default 60; 0 restores the old
+  immediate behaviour).
+- **A countdown with nobody to warn collapses to a few seconds.** Waiting ten
+  minutes to announce a restart to an empty server is the single biggest source
+  of "palctl made me wait for nothing". An unreachable REST API counts as empty
+  for this, because an announcement reaches nobody there either. Off via
+  `schedule.skip_countdown_when_empty`.
+
+### Fixed
+- **A failed restore could leave the server with no world — and then start it.**
+  `restore()` copied the live world to the backup folder and deleted it *before*
+  moving the restored copy into place, so any failure in that window (a full
+  backup volume, a file the game still held open) left `SaveGames` gone. The
+  caller then started the server, and Palworld generated a fresh world over the
+  top of the problem. The swap is now two renames back to back, with the slow
+  archive-the-old-world step moved *after* the live world is already correct; a
+  failure there costs only the convenience copy and says so, instead of
+  reporting a restore that succeeded as a failure. If the world is somehow still
+  missing, the server is deliberately **not** started and the event says exactly
+  where each copy is.
+- **`palctl restore <typo>` reported success.** The daemon answered `200 OK` and
+  spawned the restore, which then failed the name check and emitted an event
+  nobody was watching. Unknown backup names are now a `400` with the reason,
+  before anything is spawned.
+- **Restore didn't check the install was actually free.** The update path has
+  refused to touch a "STOPPED" service with a live PalServer process behind it
+  since the version-mismatch bug; restore — which overwrites the world itself,
+  and which that process is holding open — did not. Same guard, same wording.
+- **"Nothing to cancel" no longer means "you were two seconds late".** Cancel
+  and skip report three outcomes, not a bool, so an admin who just missed the
+  window is told the operation is already under way rather than being told
+  nothing was running, which reads as a broken button.
+
 ## [1.2.6.0] — 2026-08-10
 
 ### Added
