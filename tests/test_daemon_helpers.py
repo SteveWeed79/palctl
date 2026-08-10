@@ -1090,3 +1090,104 @@ def test_the_raids_hint_appears_only_when_raids_are_on(tmp_path):
 
     ini.unlink()
     assert asyncio.run(d._raids_hint()) == "", "an unreadable ini must say nothing"
+
+
+# ---------------- a stop palctl didn't make is still a stop ----------------
+#
+# Auto-recovery decided from one signal — "the REST API stopped answering" —
+# which cannot tell a crash from an admin stopping the service. palctl only knew
+# a stop was deliberate when it did the stopping, so every other stop read as a
+# crash and got undone within seconds. The service could not be turned off by
+# any normal means.
+
+
+def test_a_deliberate_stop_is_recognised():
+    assert daemon_mod.looks_externally_stopped(
+        service_state="STOPPED", busy=False, restarting=False
+    )
+
+
+def test_a_crashed_server_is_not_mistaken_for_a_deliberate_stop():
+    """The distinction the SCM already knows: a crash leaves the service
+    RUNNING (or START_PENDING while the wrapper restarts it) with nothing
+    answering behind it. Only a stop request produces STOPPED."""
+    for state in ("RUNNING", "START_PENDING", "STOP_PENDING", "UNKNOWN"):
+        assert not daemon_mod.looks_externally_stopped(
+            service_state=state, busy=False, restarting=False
+        ), state
+
+
+def test_palctls_own_operations_are_not_mistaken_for_an_admin():
+    """Every restart palctl runs passes through STOPPED on its way back up."""
+    assert not daemon_mod.looks_externally_stopped(
+        service_state="STOPPED", busy=True, restarting=False
+    )
+    assert not daemon_mod.looks_externally_stopped(
+        service_state="STOPPED", busy=False, restarting=True
+    )
+
+
+def _daemon_for_external_stop(service_state: str, *, desired=True):
+    d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+    d.__dict__["_Daemon__desired_running"] = desired
+    d._external_stop_polls = 0
+    d._down_polls = 0
+    d.emitted = []
+    d.control = types.SimpleNamespace(busy=False)
+    d.watchdog = types.SimpleNamespace(is_restarting=False)
+
+    async def _state():
+        return service_state
+
+    d._service_state_cached = _state
+
+    class _Bus:
+        @staticmethod
+        async def emit(e):
+            d.emitted.append(e)
+
+    d.bus = _Bus()
+    return d
+
+
+def _adopted(d):
+    return [e for e in d.emitted if e.data.get("action") == "external_stop"]
+
+
+def test_an_external_stop_is_adopted_only_after_confirmation(monkeypatch, tmp_path):
+    """A restart passes through STOPPED for a moment; sampling one of those must
+    not be read as 'they want it off'."""
+    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
+    d = _daemon_for_external_stop("STOPPED")
+
+    for _ in range(daemon_mod.EXTERNAL_STOP_CONFIRM_POLLS - 1):
+        assert asyncio.run(d._adopt_external_stop()) is True  # skip recovery...
+        assert _adopted(d) == []                              # ...but not decided yet
+        assert d._desired_running is True
+
+    assert asyncio.run(d._adopt_external_stop()) is True
+    assert len(_adopted(d)) == 1
+    assert d._desired_running is False, "the stop must be recorded, not just skipped"
+
+
+def test_a_running_service_lets_recovery_proceed(monkeypatch, tmp_path):
+    """The genuine-crash path has to keep working — that's the whole feature."""
+    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
+    d = _daemon_for_external_stop("RUNNING")
+    assert asyncio.run(d._adopt_external_stop()) is False
+    assert d._desired_running is True
+
+
+def test_a_brief_stopped_blip_does_not_stick(monkeypatch, tmp_path):
+    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
+    d = _daemon_for_external_stop("STOPPED")
+    asyncio.run(d._adopt_external_stop())
+    assert d._external_stop_polls == 1
+
+    async def _running():
+        return "RUNNING"
+
+    d._service_state_cached = _running
+    assert asyncio.run(d._adopt_external_stop()) is False
+    assert d._external_stop_polls == 0, "the streak must reset when it comes back"
+

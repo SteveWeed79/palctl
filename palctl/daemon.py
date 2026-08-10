@@ -193,6 +193,38 @@ def autorecover_phase(
     return "count"
 
 
+def looks_externally_stopped(
+    *, service_state: str, busy: bool, restarting: bool
+) -> bool:
+    """Did somebody stop the server *outside* palctl?
+
+    palctl decides whether to auto-recover from one signal — "the REST API
+    stopped answering" — and that signal cannot tell a crash from an admin
+    stopping the service in services.msc, `sc stop`, or Task Manager. It only
+    knew a stop was deliberate when it did the stopping itself, so every other
+    stop read as a crash and got undone. Stop the service by hand, watch palctl
+    put it straight back, repeat: the server behaves as though it cannot be
+    turned off.
+
+    The service manager already knows the difference and palctl already reads
+    it. A process that crashed leaves the service RUNNING (or briefly
+    START_PENDING while the wrapper's onfailure restarts it) with nothing
+    answering behind it. A deliberate stop is the SCM reporting **STOPPED** —
+    the state nothing but a stop request produces.
+
+    `busy`/`restarting` exclude palctl's own operations, which pass through
+    STOPPED constantly on their way to a restart.
+    """
+    return service_state == "STOPPED" and not busy and not restarting
+
+
+# Consecutive STOPPED readings before palctl concludes an admin meant it. A
+# restart cycle — palctl's own, or the service wrapper's onfailure — passes
+# through STOPPED for a moment, and sampling one of those must not be read as
+# "they want it off".
+EXTERNAL_STOP_CONFIRM_POLLS = 3
+
+
 def should_recover_now(
     *, down_polls: int, confirm_polls: int, recent_restarts: int, cap: int
 ) -> bool:
@@ -369,6 +401,9 @@ class Daemon:
         # One-shot per outage: the server is down and palctl has been told
         # not to restart it. Re-armed by a good poll, like the 401 warning.
         self._recovery_off_warned = False
+        # Consecutive polls where the SCM says STOPPED and palctl didn't do
+        # it — see _adopt_external_stop.
+        self._external_stop_polls = 0
         # One-shot: warn if the server process runs under a different account
         # than the daemon (the watchdog-blinding split — see _maybe_warn_account_mismatch).
         self._account_warned = False
@@ -674,6 +709,7 @@ class Daemon:
         self._api_fail_streak = 0
         self._auth_warned = False  # a good poll re-arms the password warning
         self._recovery_off_warned = False  # ...and the recovery-is-off notice
+        self._external_stop_polls = 0      # a live server isn't a stopped one
         await self._maybe_warn_account_mismatch()
         await self._maybe_warn_wrong_server_root()
 
@@ -786,6 +822,52 @@ class Daemon:
             )
         )
 
+    async def _adopt_external_stop(self) -> bool:
+        """Notice that somebody stopped the server without going through palctl,
+        and take it as the instruction it is. Returns True when this poll should
+        stop here rather than fall through to recovery.
+
+        Recording the intent matters as much as skipping the restart. Without
+        it, auto-recovery defers but the *schedule* doesn't: the daily restart
+        and the auto-update both start a server they believe should be running,
+        so a hand-stopped server still comes back — just later, which is worse
+        for being unpredictable. Adopting the stop puts palctl in the same state
+        as if its own Stop had been pressed, and its own Start undoes it.
+
+        Confirmed over several polls, because palctl's own restarts and the
+        service wrapper's onfailure both pass through STOPPED on the way back
+        up. Never fires while palctl holds the operation lock.
+        """
+        if not self._desired_running:
+            return True  # already know it's meant to be down; nothing to adopt
+        state = await self._service_state_cached()
+        if not looks_externally_stopped(
+            service_state=state,
+            busy=self.control.busy,
+            restarting=self.watchdog.is_restarting,
+        ):
+            self._external_stop_polls = 0
+            return False
+
+        self._external_stop_polls += 1
+        if self._external_stop_polls < EXTERNAL_STOP_CONFIRM_POLLS:
+            return True  # wait for confirmation, but don't recover meanwhile
+
+        self._external_stop_polls = 0
+        self._desired_running = False
+        self._down_polls = 0
+        await self.bus.emit(
+            Event(
+                "server_down",
+                "⏹️ The server was stopped outside palctl (services.msc, "
+                "`sc stop`, or Task Manager). Taking that as deliberate: palctl "
+                "will **not** restart it, and the schedule won't either. Use "
+                "Start in palctl when you want it back.",
+                {"action": "external_stop"},
+            )
+        )
+        return True
+
     async def _maybe_autorecover(self) -> None:
         """
         Called on every poll where the REST API is unreachable. Brings the server
@@ -793,6 +875,8 @@ class Daemon:
         already restarted too many times this hour.
         """
         wd = self.cfg.watchdog
+        if await self._adopt_external_stop():
+            return
         await self._warn_recovery_is_off(wd)
         phase = autorecover_phase(
             enabled=wd.auto_restart_on_crash,

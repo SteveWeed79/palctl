@@ -66,6 +66,19 @@ default (see **Changed**). Neither was reachable by reading files.
   person doesn't re-derive it.
 
 ### Fixed
+- **A stop palctl didn't make is now treated as a stop.** Auto-recovery decided
+  from a single signal — "the REST API stopped answering" — which cannot tell a
+  crash from an admin stopping the service. palctl only knew a stop was
+  deliberate when *it* did the stopping, so stopping the server any other way
+  (services.msc, `sc stop`, Task Manager) read as a crash and was undone within
+  seconds. The server behaved as though it could not be turned off; the only way
+  out was force-removing it. The service manager already knows the difference and
+  palctl already reads it: a crash leaves the service RUNNING with nothing
+  answering behind it, while a deliberate stop is the SCM reporting **STOPPED**.
+  palctl now recognises that (confirmed over several polls, since its own
+  restarts and the wrapper's `onfailure` both pass through STOPPED), records the
+  stop as the intent it is — so the daily restart and auto-update don't bring it
+  back later either — and says so. palctl's own Start undoes it.
 - **The account-split warning could be silenced permanently by one bad look.**
   If the Palworld server runs under a different Windows account than palctl,
   palctl can't read its memory — it lands on the idle launcher, and the leak
