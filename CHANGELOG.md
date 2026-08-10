@@ -10,6 +10,8 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+## [1.2.7.0] — 2026-08-10
+
 ### Added
 - **A restart or restore you can cancel — or hurry along — from anywhere.** The
   countdown was a hard-coded ten minutes with exactly one escape hatch, Discord's
