@@ -10,6 +10,8 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+## [1.2.6.0] — 2026-08-10
+
 ### Added
 - **palctl now records why it is doing nothing.** The event feed says what
   happened; nothing said what palctl *decided* — and every hard-to-diagnose
