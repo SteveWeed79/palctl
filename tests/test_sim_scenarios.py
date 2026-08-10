@@ -155,8 +155,7 @@ def test_a_reboot_brings_back_a_server_that_should_be_running(tmp_path):
         )
         s.wait_for(lambda: s.state()["alive"] is True, timeout=60, what="the server to answer")
     finally:
-        s.stop_daemon()
-        s.systemctl("stop")
+        s.shutdown()
 
 
 def test_a_reboot_leaves_a_deliberately_stopped_server_stopped(tmp_path):
@@ -175,7 +174,7 @@ def test_a_reboot_leaves_a_deliberately_stopped_server_stopped(tmp_path):
         )
         assert s.service_calls() == [], "palctl must not have touched the service"
     finally:
-        s.stop_daemon()
+        s.shutdown()
 
 
 def test_a_daemon_restart_that_is_not_a_boot_starts_nothing(tmp_path):
@@ -194,7 +193,7 @@ def test_a_daemon_restart_that_is_not_a_boot_starts_nothing(tmp_path):
         )
         assert s.service_calls() == []
     finally:
-        s.stop_daemon()
+        s.shutdown()
 
 
 def test_a_server_that_fails_to_start_at_boot_is_not_blamed_on_an_admin(tmp_path):
@@ -224,4 +223,4 @@ def test_a_server_that_fails_to_start_at_boot_is_not_blamed_on_an_admin(tmp_path
         assert not any("stopped outside palctl" in e for e in s.events())
         assert s.read_daemon_state().get("desired_running") is True
     finally:
-        s.stop_daemon()
+        s.shutdown()

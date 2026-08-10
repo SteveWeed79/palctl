@@ -9,6 +9,7 @@ timeouts, the poll loop, the event bus, state persistence) is under test.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import socket
@@ -183,6 +184,20 @@ class Sim:
             time.sleep(0.2)
         raise RuntimeError(f"daemon never came up:\n{self.log()}")
 
+    def shutdown(self) -> None:
+        """Tear the whole simulated machine down: the daemon, then the fake
+        server behind the service.
+
+        Both halves, always. Stopping only the daemon leaves fake_palworld
+        running — it is a child of the fake service manager, not of pytest — and
+        a leaked one outlives the run holding a port. That is a flaky suite
+        waiting to happen, and it is exactly what a stale process from an
+        earlier run looked like the first time it happened here.
+        """
+        self.stop_daemon()
+        with contextlib.suppress(Exception):
+            self.systemctl("stop")
+
     def stop_daemon(self) -> None:
         if not self.proc:
             return
@@ -285,8 +300,7 @@ def sim(tmp_path):
     try:
         yield s
     finally:
-        s.stop_daemon()
-        s.systemctl("stop")
+        s.shutdown()
 
 
 def running_server(s: Sim) -> None:
