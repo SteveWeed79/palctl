@@ -7,6 +7,8 @@ clean skip beats erroring at collection (palctl.daemon imports both — aiohttp
 for its API server, discord via palctl.bot at module level)."""
 
 import asyncio
+import logging
+import time
 import types
 
 import pytest
@@ -1132,6 +1134,11 @@ def _daemon_for_external_stop(service_state: str, *, desired=True):
     d.__dict__["_Daemon__desired_running"] = desired
     d._external_stop_polls = 0
     d._down_polls = 0
+    # A daemon past startup that has seen the server up — the only state in
+    # which "somebody stopped it" is even a possible reading. The two
+    # narrower cases get their own tests below.
+    d._boot_intent_pending = False
+    d._service_seen_up = True
     d.emitted = []
     d.control = types.SimpleNamespace(busy=False)
     d.watchdog = types.SimpleNamespace(is_restarting=False)
@@ -1191,3 +1198,151 @@ def test_a_brief_stopped_blip_does_not_stick(monkeypatch, tmp_path):
     assert asyncio.run(d._adopt_external_stop()) is False
     assert d._external_stop_polls == 0, "the streak must reset when it comes back"
 
+
+
+def test_startup_holds_adoption_until_the_boot_decision_is_made(monkeypatch, tmp_path):
+    """With the game service registered Manual, STOPPED is how every boot
+    starts. Counting those polls would let the daemon adopt its own
+    not-started-yet server as somebody's deliberate stop."""
+    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
+    d = _daemon_for_external_stop("STOPPED")
+    d._boot_intent_pending = True
+
+    for _ in range(daemon_mod.EXTERNAL_STOP_CONFIRM_POLLS + 2):
+        assert asyncio.run(d._adopt_external_stop()) is True  # and no recovery either
+    assert _adopted(d) == []
+    assert d._desired_running is True
+    assert d._external_stop_polls == 0, "nothing may accumulate before startup decides"
+
+
+def test_a_server_that_never_came_up_is_not_an_external_stop(monkeypatch, tmp_path):
+    """STOPPED for this daemon's whole life is a server that failed to start,
+    not one somebody turned off — and the intent must survive it."""
+    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
+    d = _daemon_for_external_stop("STOPPED")
+    d._service_seen_up = False
+
+    for _ in range(daemon_mod.EXTERNAL_STOP_CONFIRM_POLLS + 2):
+        assert asyncio.run(d._adopt_external_stop()) is False  # recovery may try
+    assert _adopted(d) == []
+    assert d._desired_running is True
+
+
+def test_seeing_the_service_up_arms_adoption(monkeypatch, tmp_path):
+    """A server observed running is one a later stop can be attributed to."""
+    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
+    d = _daemon_for_external_stop("RUNNING")
+    d._service_seen_up = False
+    assert asyncio.run(d._adopt_external_stop()) is False
+    assert d._service_seen_up is True
+
+
+# ---------------- boot-time intent restore ----------------
+
+
+def test_is_boot_start_distinguishes_a_reboot_from_a_daemon_restart():
+    boot = 1_000_000.0
+    assert daemon_mod.is_boot_start(boot + 5.0, boot) is True
+    assert daemon_mod.is_boot_start(boot + daemon_mod.BOOT_INTENT_WINDOW, boot) is True
+    # Hours into an uptime: the installer bouncing the daemon, or the health
+    # task restarting it mid-outage. Not a boot, so not ours to act on.
+    assert daemon_mod.is_boot_start(boot + 6 * 3600, boot) is False
+    # A clock that moved backwards must not read as "just booted".
+    assert daemon_mod.is_boot_start(boot - 60.0, boot) is False
+
+
+def _daemon_for_boot_intent(state: str, *, desired=True, after_start="RUNNING"):
+    d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+    d.__dict__["_Daemon__desired_running"] = desired
+    d._boot_intent_pending = True
+    d.log = logging.getLogger("test-boot-intent")
+    d.cfg = types.SimpleNamespace(service_name="PalServer")
+    d.emitted = []
+    d.started = []
+    states = [state, after_start]
+
+    async def _state(ttl=2.0):
+        return states[0] if len(states) == 1 else states.pop(0)
+
+    d._service_state_cached = _state
+
+    async def _start():
+        d.started.append(True)
+        return "ok"
+
+    d.scheduler = types.SimpleNamespace(start_server=_start)
+
+    class _Bus:
+        @staticmethod
+        async def emit(e):
+            d.emitted.append(e)
+
+    d.bus = _Bus()
+    return d
+
+
+def _at_boot(monkeypatch, tmp_path, *, booted_secs_ago=5.0):
+    monkeypatch.setattr(daemon_mod, "_STATE_PATH", tmp_path / "daemon_state.json")
+    monkeypatch.setattr(
+        daemon_mod.procs, "boot_time", lambda: time.time() - booted_secs_ago
+    )
+
+
+def test_boot_restores_a_server_that_should_be_running(monkeypatch, tmp_path):
+    """The other half of registering PalServer Manual: if the SCM no longer
+    starts it at boot, palctl has to."""
+    _at_boot(monkeypatch, tmp_path)
+    d = _daemon_for_boot_intent("STOPPED")
+    asyncio.run(d._restore_boot_intent())
+    assert d.started == [True]
+    assert d._boot_intent_pending is False
+
+
+def test_boot_leaves_a_deliberately_stopped_server_alone(monkeypatch, tmp_path):
+    """The whole point of the change — a Stop that survives a restart."""
+    _at_boot(monkeypatch, tmp_path)
+    d = _daemon_for_boot_intent("STOPPED", desired=False)
+    asyncio.run(d._restore_boot_intent())
+    assert d.started == []
+    assert d._boot_intent_pending is False
+
+
+def test_a_daemon_restart_on_a_running_box_starts_nothing(monkeypatch, tmp_path):
+    """An upgrade or the health task restarting the daemon must not start a
+    server that is down — that is auto-recovery's opt-in call, not this."""
+    _at_boot(monkeypatch, tmp_path, booted_secs_ago=6 * 3600)
+    d = _daemon_for_boot_intent("STOPPED")
+    asyncio.run(d._restore_boot_intent())
+    assert d.started == []
+    assert d._boot_intent_pending is False
+
+
+def test_boot_does_not_touch_an_already_running_service(monkeypatch, tmp_path):
+    _at_boot(monkeypatch, tmp_path)
+    d = _daemon_for_boot_intent("RUNNING")
+    asyncio.run(d._restore_boot_intent())
+    assert d.started == []
+
+
+def test_a_failed_boot_start_is_reported_as_a_failure_to_start(monkeypatch, tmp_path):
+    """Not as somebody stopping it: the intent stays 'should be running', and
+    the message says which of the two this is."""
+    _at_boot(monkeypatch, tmp_path)
+    d = _daemon_for_boot_intent("STOPPED", after_start="STOPPED")
+    asyncio.run(d._restore_boot_intent())
+    assert d.started == [True]
+    assert [e for e in d.emitted if e.data.get("action") == "boot_start_failed"]
+    assert d._desired_running is True
+
+
+def test_boot_intent_always_releases_the_startup_hold(monkeypatch, tmp_path):
+    """A failure here must not leave adoption and recovery blocked forever."""
+    _at_boot(monkeypatch, tmp_path)
+    d = _daemon_for_boot_intent("STOPPED")
+
+    async def _boom(ttl=2.0):
+        raise RuntimeError("sc.exe fell over")
+
+    d._service_state_cached = _boom
+    asyncio.run(d._restore_boot_intent())
+    assert d._boot_intent_pending is False

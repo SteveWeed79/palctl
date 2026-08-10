@@ -480,6 +480,25 @@ def _verify_and_report(plan: SetupPlan, server_registered: bool, log: Log) -> No
     )
 
 
+def server_service_start_mode(daemon_startup: str) -> str:
+    """Who decides that the game server comes up after a reboot: palctl, or the
+    Windows service manager.
+
+    "Manual" hands it to palctl, and is only safe when palctl itself is a boot
+    service — the daemon is then guaranteed to be running before login, and
+    restores whatever state the server was last left in (see
+    daemon._restore_boot_intent). That is what makes an intentional Stop
+    survive a restart: with the old unconditional "Automatic", the SCM started
+    PalServer at boot no matter what palctl wanted, so a server you had
+    deliberately taken down came back on its own.
+
+    Every other startup mode keeps "Automatic". A login-startup daemon isn't
+    there until somebody signs in, and with no daemon at all nothing would ever
+    start a Manual service — in both cases the SCM is the only thing that can
+    bring the server up, and taking that away would strand it."""
+    return "Manual" if daemon_startup == "service" else "Automatic"
+
+
 def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
     """Register the PalServer Windows service. Returns False (skipped) when
     PalServer.exe isn't there yet, so the caller doesn't try to start a service
@@ -520,6 +539,7 @@ def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
     # default 30s on a plain `net stop` or system shutdown risks the save. 90s
     # matches how long palctl itself waits for a stopping server.
     stop_timeout = "90 sec"
+    start_mode = server_service_start_mode(plan.daemon_startup)
 
     # Never bounce a healthy, already-correct server on a wizard re-run. If the
     # service is already registered with exactly the config we'd write,
@@ -530,7 +550,7 @@ def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
     # means the whole re-run never touches the server.
     if winservice.config_is_current(
         bin_dir, plan.service_name, exe, PALSERVER_ARGS, plan.server_root,
-        user=user, stop_timeout=stop_timeout,
+        user=user, stop_timeout=stop_timeout, start_mode=start_mode,
     ):
         log(
             f"  Service '{plan.service_name}' is already registered and unchanged "
@@ -543,12 +563,18 @@ def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
     winservice.install_service(
         winsw, plan.service_name, exe, PALSERVER_ARGS, plan.server_root,
         user=user, password=password, start=False,
-        stop_timeout=stop_timeout,
+        stop_timeout=stop_timeout, start_mode=start_mode,
     )
     log(
         f"  Service '{plan.service_name}' registered"
         + (f" (runs as {user})." if user else ".")
     )
+    if start_mode == "Manual":
+        log(
+            "  Boot start is palctl's to make: after a restart the daemon puts "
+            "the server back the way you left it, so a server you stopped on "
+            "purpose stays stopped."
+        )
     return True
 
 

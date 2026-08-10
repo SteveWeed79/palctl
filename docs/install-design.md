@@ -108,6 +108,39 @@ Login startup remains only where no split is possible: palctl not managing
 the server as a service, or PIN-only/passwordless accounts that cannot hold a
 service logon at all (Error 1069).
 
+### 2c. Boot start is palctl's decision, not the service manager's
+
+palctl's own service is `Automatic` — it has to be up before anyone signs in,
+or nothing watches the server. The **game** service is registered `Manual`
+whenever palctl runs as a boot service
+(`setup_flow.server_service_start_mode`), and the daemon starts it itself at
+boot from the recorded intent (`daemon._restore_boot_intent`).
+
+The reason is that "who wants the server running" is state palctl keeps and
+the SCM knows nothing about. With PalServer on `Automatic`, Windows started it
+at every boot regardless — so a server an admin had deliberately stopped came
+back on its own, which is the same "it won't stay off" complaint that
+`daemon.looks_externally_stopped` fixes for the running case. Moving the
+decision to palctl closes the reboot half of it, and `_desired_running` is
+already persisted for exactly this purpose.
+
+Three constraints keep it honest:
+
+* **Manual only when a boot-service daemon exists.** Login startup isn't there
+  until somebody signs in, and with no background palctl nothing would ever
+  start a Manual service; both keep `Automatic`, because the SCM is then the
+  only thing that can bring the server up.
+* **Only at boot** (`daemon.is_boot_start`). Restoring intent on *any* daemon
+  start would be new behaviour, not a moved one: the installer bounces the
+  daemon on upgrade and the health task restarts it mid-outage, and starting a
+  downed server there would bypass `auto_restart_on_crash` — opt-in precisely
+  because restarting someone's server unasked isn't palctl's call.
+* **A failed boot start is reported as a failure to start**, never adopted as
+  somebody stopping the server. Adoption additionally requires that this daemon
+  has seen the service up (`_service_seen_up`); a service that was STOPPED for
+  the daemon's whole life never started, and saying otherwise sends the admin
+  hunting a culprit that doesn't exist.
+
 ### 3. Success is verified, never assumed
 
 The service manager's opinion is not the success signal — **the daemon's own

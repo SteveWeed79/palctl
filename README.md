@@ -237,6 +237,9 @@ so a setup that failed partway can't strand you in a dead GUI:
   straight to the service manager and is never stored). One account for both is
   what lets the memory watchdog actually read the server process and keeps the
   Discord bot's secrets readable; both start on boot, before anyone signs in.
+  palctl's own service is the one Windows starts — the game server is
+  registered *Manual*, and palctl brings it up at boot only if that's how you
+  left it, so a server you stopped on purpose stays stopped across a restart.
   The wizard refuses combinations that would split the two across accounts —
   that split silently blinds the watchdog. Password-free login startup remains
   for setups that can't host a service (PIN-only accounts) or that don't run

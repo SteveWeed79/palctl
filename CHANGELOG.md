@@ -79,6 +79,20 @@ default (see **Changed**). Neither was reachable by reading files.
   restarts and the wrapper's `onfailure` both pass through STOPPED), records the
   stop as the intent it is — so the daily restart and auto-update don't bring it
   back later either — and says so. palctl's own Start undoes it.
+- **…and a reboot no longer undoes it.** The other half of the same complaint:
+  the game server was registered with the Windows startmode `Automatic`, so the
+  service manager started it at every boot regardless of what palctl — or the
+  admin — wanted. Stop the server on purpose, restart the machine, and it was
+  back. Setup now registers PalServer as **Manual** whenever palctl itself runs
+  as a boot service, and the daemon restores the recorded state at startup: a
+  server that should be running is started, a server you stopped stays stopped.
+  Nothing changes where palctl isn't there to do it — login startup, or no
+  background palctl, keeps `Automatic`, because the SCM is then the only thing
+  that can bring the server up. Restricted to actual boots, so the installer
+  bouncing the daemon on upgrade (or the health task restarting it mid-outage)
+  still can't start a server behind your back, and a server that *fails* to
+  start at boot is reported as that rather than mistaken for someone stopping
+  it. Existing installs pick this up the next time setup runs.
 - **The account-split warning could be silenced permanently by one bad look.**
   If the Palworld server runs under a different Windows account than palctl,
   palctl can't read its memory — it lands on the idle launcher, and the leak

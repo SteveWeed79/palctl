@@ -463,3 +463,32 @@ def test_the_account_password_is_scrubbed_even_when_install_fails(tmp_path, monk
 
     _, xml = winservice.wrapper_paths(tmp_path, "PalServer")
     assert "MyWindowsPassword123" not in xml.read_text(encoding="utf-8")
+
+
+def test_config_xml_start_mode_default_and_override():
+    """Automatic for everything palctl owns of itself; Manual for the game
+    server when palctl is the boot service that will start it."""
+    assert "<startmode>Automatic</startmode>" in winservice.winsw_config_xml("s", "s.exe")
+    manual = winservice.winsw_config_xml("PalServer", "PalServer.exe", start_mode="Manual")
+    assert "<startmode>Manual</startmode>" in manual
+    assert "<startmode>Automatic</startmode>" not in manual
+    # onfailure is orthogonal: a Manual service that palctl started must still
+    # be restarted by the wrapper if it crashes.
+    assert '<onfailure action="restart"' in manual
+
+
+def test_config_is_current_notices_a_start_mode_change(tmp_path, monkeypatch):
+    """Or a wizard re-run would leave PalServer on the old Automatic startmode
+    while reporting it as already up to date."""
+    monkeypatch.setattr(winservice, "service_exists", lambda name: True)
+    svc_xml = tmp_path / "PalServer-service.xml"
+    svc_xml.write_text(
+        winservice.winsw_config_xml("PalServer", "PalServer.exe", start_mode="Automatic"),
+        encoding="utf-8",
+    )
+    assert winservice.config_is_current(
+        tmp_path, "PalServer", "PalServer.exe", start_mode="Automatic"
+    )
+    assert not winservice.config_is_current(
+        tmp_path, "PalServer", "PalServer.exe", start_mode="Manual"
+    )

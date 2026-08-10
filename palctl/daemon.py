@@ -225,6 +225,28 @@ def looks_externally_stopped(
 EXTERNAL_STOP_CONFIRM_POLLS = 3
 
 
+# How long after the machine booted a daemon start still counts as "this is the
+# boot". Generous: the SCM starts services early, but a cold box with a slow
+# disk and a dozen Automatic services can take minutes to get here.
+BOOT_INTENT_WINDOW = 900.0
+
+
+def is_boot_start(now: float, boot_time: float, window: float = BOOT_INTENT_WINDOW) -> bool:
+    """Whether this daemon start is the machine coming up, rather than the
+    daemon being restarted on an already-running box.
+
+    The distinction is what keeps _restore_boot_intent narrow. Restoring the
+    recorded intent at *boot* only moves a start that the SCM's Automatic
+    startmode used to do anyway — same behaviour, decided by palctl instead of
+    Windows. Doing it on any daemon start would be new behaviour, and the wrong
+    kind: the installer bounces the daemon on upgrade and the health task
+    restarts it during an outage, so a server that was down would be started by
+    the side door — bypassing `auto_restart_on_crash`, which is opt-in
+    precisely because restarting someone's server unasked is not palctl's call.
+    """
+    return 0.0 <= now - boot_time <= window
+
+
 def should_recover_now(
     *, down_polls: int, confirm_polls: int, recent_restarts: int, cap: int
 ) -> bool:
@@ -404,6 +426,18 @@ class Daemon:
         # Consecutive polls where the SCM says STOPPED and palctl didn't do
         # it — see _adopt_external_stop.
         self._external_stop_polls = 0
+        # Whether this daemon has seen the server up at all yet. Adoption needs
+        # it: you cannot *stop* something that was never running, so a service
+        # that has been STOPPED for this daemon's whole life is a server that
+        # failed to start, not one somebody turned off — and reporting the
+        # second when it's the first sends the admin looking for a culprit that
+        # doesn't exist. Per-session on purpose (unlike the persisted
+        # _ever_alive), because the question is about *this* stop.
+        self._service_seen_up = False
+        # Cleared once _restore_boot_intent has had its say. Until then a
+        # STOPPED service is the state palctl is about to act on, not evidence
+        # of anything — see the guard in _adopt_external_stop.
+        self._boot_intent_pending = True
         # One-shot: warn if the server process runs under a different account
         # than the daemon (the watchdog-blinding split — see _maybe_warn_account_mismatch).
         self._account_warned = False
@@ -710,6 +744,7 @@ class Daemon:
         self._auth_warned = False  # a good poll re-arms the password warning
         self._recovery_off_warned = False  # ...and the recovery-is-off notice
         self._external_stop_polls = 0      # a live server isn't a stopped one
+        self._service_seen_up = True       # ...and it's one adoption can apply to
         await self._maybe_warn_account_mismatch()
         await self._maybe_warn_wrong_server_root()
 
@@ -822,6 +857,65 @@ class Daemon:
             )
         )
 
+    async def _restore_boot_intent(self) -> None:
+        """After a reboot, put the server back the way it was left.
+
+        Setup registers the game service **Manual** whenever palctl runs as a
+        boot service (setup_flow.server_service_start_mode), which is what lets
+        a deliberate Stop survive a restart — the SCM no longer starts PalServer
+        regardless of intent. This is the other half of that trade: if the
+        recorded intent says the server should be running, palctl now has to be
+        the one to start it, because nothing else will.
+
+        Deliberately not gated on `auto_restart_on_crash`. That setting is about
+        restarting a server that *failed*; this only re-issues the start the
+        SCM's Automatic startmode used to do on its own, so a host who leaves
+        recovery off still gets their server back after a reboot exactly as
+        before. `is_boot_start` keeps it to that: a daemon restarted on a
+        running box (installer upgrade, health task) never starts anything.
+
+        Runs as a spawned task, not inline in run(): start_service waits for the
+        SCM to report RUNNING, and nothing about that should sit in front of
+        READY=1 or the poll loop.
+        """
+        try:
+            if not self._desired_running:
+                self.log.info(
+                    "server was last stopped on purpose — leaving it stopped"
+                )
+                return
+            if not is_boot_start(time.time(), procs.boot_time()):
+                return  # a daemon restart, not a boot; not ours to act on
+            state = await self._service_state_cached(ttl=0)
+            if state != "STOPPED":
+                return  # already up (or the SCM is mid-start) — nothing to do
+            self.log.info(
+                "machine restarted and the server is meant to be running — "
+                "starting the '%s' service", self.cfg.service_name,
+            )
+            # The shared implementation, so this takes the operation lock and
+            # records intent exactly like the GUI's Start button.
+            if await self.scheduler.start_server() == "busy":
+                return
+            if await self._service_state_cached(ttl=0) != "RUNNING":
+                await self.bus.emit(
+                    Event(
+                        "error",
+                        "⚠️ The machine restarted and palctl tried to bring the "
+                        "server back up, but the service didn't reach RUNNING. "
+                        "Check the server in palctl (or services.msc) — palctl "
+                        "still has it recorded as *should be running*, so this "
+                        "is a failure to start, not somebody stopping it.",
+                        {"action": "boot_start_failed"},
+                    )
+                )
+        except Exception:
+            # Never let this take the daemon's startup down with it; the poll
+            # loop and recovery still run either way.
+            self.log.exception("restoring the boot-time server state failed")
+        finally:
+            self._boot_intent_pending = False
+
     async def _adopt_external_stop(self) -> bool:
         """Notice that somebody stopped the server without going through palctl,
         and take it as the instruction it is. Returns True when this poll should
@@ -840,6 +934,13 @@ class Daemon:
         """
         if not self._desired_running:
             return True  # already know it's meant to be down; nothing to adopt
+        if self._boot_intent_pending:
+            # Startup hasn't decided yet. With the game service registered
+            # Manual, STOPPED is exactly how every boot begins — counting those
+            # polls would let the daemon adopt its own not-started-yet server as
+            # somebody's deliberate stop, and latch the intent off. Hold, and
+            # don't recover either: _restore_boot_intent is the thing that acts.
+            return True
         state = await self._service_state_cached()
         if not looks_externally_stopped(
             service_state=state,
@@ -847,6 +948,12 @@ class Daemon:
             restarting=self.watchdog.is_restarting,
         ):
             self._external_stop_polls = 0
+            self._service_seen_up = True  # not STOPPED — there's a stop to notice now
+            return False
+        if not self._service_seen_up:
+            # STOPPED for this daemon's whole life: nothing stopped it, it never
+            # started. Leave the intent alone (so the admin's "should be
+            # running" survives) and let recovery/the error path speak.
             return False
 
         self._external_stop_polls += 1
@@ -1292,6 +1399,12 @@ class Daemon:
 
         if self.cfg.check_for_updates:
             self._spawn(self._check_palctl_update())
+
+        # Before the workers, so the poll loop's first pass already knows
+        # whether a STOPPED service is about to be started (the flag it clears
+        # gates external-stop adoption) — but spawned, because waiting for the
+        # SCM must not delay READY=1.
+        self._spawn(self._supervised("boot intent", self._restore_boot_intent()))
 
         self._start_bot()
         for name, coro in (

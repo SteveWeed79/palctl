@@ -239,6 +239,13 @@ def server_account_mismatch(daemon_user: str) -> str | None:
 _CPU_SAMPLE_SECONDS = 0.3
 
 
+def boot_time() -> float:
+    """Unix timestamp of the last system boot. Wrapped here (rather than calling
+    psutil from the daemon) to keep process/OS queries in one module and to give
+    tests a single seam to move the clock at."""
+    return psutil.boot_time()
+
+
 def proc_stats() -> ProcStats | None:
     p = find_process()
     if p is None:
