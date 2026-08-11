@@ -81,5 +81,8 @@ class WebhookAlerter:
                         r.status_code,
                         r.text[:200],
                     )
-        except Exception as ex:  # noqa: BLE001 — a bad webhook must never affect the daemon
+        except Exception as ex:
+            # Deliberately broad: this is a notification side-channel subscribed
+            # to the event bus, and a bad URL or a down receiver must never
+            # propagate back into the daemon that emitted the event.
             self._log.warning("alert webhook POST failed: %s", ex)

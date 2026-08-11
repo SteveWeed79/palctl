@@ -103,7 +103,7 @@ def test_run_all_scopes_checks_to_intent(tmp_path):
 
 def test_single_instance_ok_with_zero_or_one(monkeypatch):
     procs = pytest.importorskip("palctl.procs")
-    monkeypatch.setattr(procs, "shipping_processes", lambda: [])
+    monkeypatch.setattr(procs, "shipping_processes", list)
     assert preflight.check_single_server_instance().ok is True
 
     monkeypatch.setattr(procs, "shipping_processes", lambda: [types.SimpleNamespace(pid=1)])
@@ -140,3 +140,29 @@ def test_authenticode_status_is_empty_off_windows():
     if sys.platform.startswith("win"):
         return  # on Windows it shells out to PowerShell; nothing to assert here
     assert preflight._authenticode_status(Path("whatever.exe")) == ""
+
+
+def test_authenticode_path_is_quoted_for_powershell():
+    """%TEMP% lives under the user profile, so the installer path carries the
+    account name. On an account like `Sean O'Brien` an interpolated apostrophe
+    closed the PowerShell string early: the command failed to parse, the status
+    came back '', and _signature_is_tampered reads that as 'couldn't check' and
+    lets the installer through — the one integrity anchor behind a binary that
+    can't be hash-pinned, silently skipped."""
+    quoted = preflight._ps_single_quote(r"C:\Users\Sean O'Brien\AppData\Local\Temp\t.exe")
+
+    # Doubling is PowerShell's only escape inside a verbatim single-quoted
+    # string, so the literal is balanced and nothing after it is code.
+    assert quoted.startswith("'") and quoted.endswith("'")
+    assert quoted.count("'") % 2 == 0
+    assert "O''Brien" in quoted
+
+    # And an outright injection attempt stays inside the string.
+    hostile = preflight._ps_single_quote("x'; Remove-Item C:\\ -Recurse; '")
+    assert hostile.count("'") % 2 == 0
+    assert hostile.startswith("'") and hostile.endswith("'")
+    assert "'; Remove-Item" not in hostile[1:-1].replace("''", "\x00")
+
+
+def test_authenticode_quoting_leaves_ordinary_paths_alone():
+    assert preflight._ps_single_quote(r"C:\Users\Bob\Temp\t.exe") == r"'C:\Users\Bob\Temp\t.exe'"

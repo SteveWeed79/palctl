@@ -50,7 +50,51 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B"]
+# The selection used to be E/F/W/I/UP/B, and the code had quietly outgrown it:
+# `# noqa: S310` and `# noqa: BLE001` markers were sitting in the tree for rules
+# that were never switched on, so they read as "checked and accepted" while
+# nothing was checking. RUF100 (below) is what keeps that from drifting back —
+# it fails on a noqa that suppresses nothing.
+#
+# ASYNC is the one that earns its place on merit: this is a daemon whose whole
+# job is an event loop, and a blocking call on it stalls the poll loop, the
+# watchdog and the control API together.
+select = [
+  "E", "F", "W", "I", "UP", "B",
+  "ASYNC",  # blocking calls on the event loop
+  "S",      # bandit: subprocess, temp files, download/verification surfaces
+  "LOG",    # logging misuse
+  "C4",     # comprehension cleanups
+  "PIE",    # small correctness/idiom cleanups
+  "A",      # shadowing a builtin
+  "RUF",    # incl. RUF100, the guard on stale noqa above
+]
+ignore = [
+  # Polling deadlines with an interval, not candidates for `asyncio.timeout`:
+  # these wait on an external state machine (the SCM, the game's REST API) and
+  # report whether it arrived, rather than cancelling a body of work.
+  "ASYNC109",
+  # `assert` is the point in tests, and steamcmd.py asserts a Popen invariant
+  # that mypy/readers both want stated.
+  "S101",
+  # Every subprocess call in this tree passes an argv list with no shell. That
+  # is the correct form; S603 flags it regardless.
+  "S603",
+  # Deliberate, and individually commented at each site: best-effort cleanup
+  # and diagnostics paths that must never take the daemon down with them.
+  "S110", "S112",
+  # "0.0.0.0" is a documented opt-in (LAN dashboard access) with its own startup
+  # warning — see lan_exposure_warning — not an accident.
+  "S104",
+  # Header names and keyring key names, not credentials.
+  "S105", "S106", "S107",
+  # Em dashes and arrows are used deliberately throughout the prose.
+  "RUF001", "RUF002",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests stand up fake servers, fake credentials and temp paths on purpose.
+"tests/*" = ["S"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

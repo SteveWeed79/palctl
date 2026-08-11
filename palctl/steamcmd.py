@@ -261,6 +261,28 @@ def update_command(
     return args
 
 
+def _members_within(t: tarfile.TarFile, dest_dir: Path) -> list[tarfile.TarInfo]:
+    """The members of `t` that land inside `dest_dir`, links dropped.
+
+    Stands in for tarfile's `data` filter on the Pythons that predate it.
+    `requires-python` is >=3.11 but the filter only arrived in 3.11.4, so on
+    3.11.0–3.11.3 the fallback was a plain extractall — which honours `../..`
+    and absolute member names and will happily write outside the destination.
+    An archive that could do that is an archive that could drop a file anywhere
+    the installing user can write, so pre-filtering is what the fallback owes
+    the caller.
+    """
+    root = dest_dir.resolve()
+    keep: list[tarfile.TarInfo] = []
+    for m in t.getmembers():
+        if m.issym() or m.islnk():
+            continue  # a link is a second chance to escape, once followed
+        target = (dest_dir / m.name).resolve()
+        if target == root or root in target.parents:
+            keep.append(m)
+    return keep
+
+
 def extract_steamcmd(archive_path: Path, dest_dir: Path) -> Path:
     """Unpack a steamcmd archive (.zip on Windows, .tar.gz on Linux) and return
     the path to the steamcmd binary."""
@@ -270,10 +292,14 @@ def extract_steamcmd(archive_path: Path, dest_dir: Path) -> Path:
             try:
                 t.extractall(dest_dir, filter="data")  # py3.12+/3.11.4+: safe extract
             except TypeError:
-                t.extractall(dest_dir)
+                t.extractall(dest_dir, members=_members_within(t, dest_dir))  # noqa: S202
     else:
         with zipfile.ZipFile(archive_path) as z:
-            z.extractall(dest_dir)
+            # Safe as-is: ZipFile._extract_member drops the drive, leading
+            # separators and every '..' component from each name before joining,
+            # so a member cannot land outside dest_dir. (Python also writes
+            # symlink members as ordinary files, so there's no link escape.)
+            z.extractall(dest_dir)  # noqa: S202
 
     for name in _STEAMCMD_BINARIES:
         direct = dest_dir / name

@@ -13,9 +13,9 @@ pytest.importorskip("httpx")
 pytest.importorskip("psutil")
 pytest.importorskip("keyring")
 
-from palctl import control as control_mod  # noqa: E402  (after importorskip)
-from palctl.config import Config  # noqa: E402
-from palctl.control import ServerController  # noqa: E402
+from palctl import control as control_mod
+from palctl.config import Config
+from palctl.control import ServerController
 
 
 class FakeApi:

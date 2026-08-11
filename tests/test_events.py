@@ -142,7 +142,7 @@ def test_restart_with_players_online_keeps_session_playtime(tmp_path: Path):
     store.log_metrics({"at": (base + timedelta(minutes=30)).timestamp(), "memory_mb": 1.0})
 
     store2 = SessionStore(db)  # new daemon run runs the migration
-    joined, left = store2._db.execute(
+    _joined, left = store2._db.execute(
         "SELECT joined_at, left_at FROM sessions WHERE user_id='a'"
     ).fetchone()
     assert left is not None  # closed, not left dangling

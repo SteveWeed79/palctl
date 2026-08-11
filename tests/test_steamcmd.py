@@ -20,7 +20,7 @@ from palctl import steamcmd
 
 def test_default_steamcmd_url_by_platform():
     url = steamcmd.default_steamcmd_url()
-    assert url.endswith(".zip") or url.endswith(".tar.gz")
+    assert url.endswith((".zip", ".tar.gz"))
 
 
 def test_extract_steamcmd_from_targz(tmp_path: Path):
@@ -344,3 +344,76 @@ def test_manifest_walk_up_stops_before_unrelated_installs(tmp_path: Path):
     (tmp_path / "steamapps" / "appmanifest_2394010.acf").write_text(ACF)
 
     assert steamcmd.manifest_path(root) is None
+
+
+# ---------------- archive extraction stays inside the destination ----------------
+
+
+def _tar_with(path: Path, names, *, symlink: str | None = None) -> Path:
+    with tarfile.open(path, "w:gz") as t:
+        for name in names:
+            data = b"x"
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            t.addfile(ti, io.BytesIO(data))
+        if symlink:
+            link = tarfile.TarInfo(symlink)
+            link.type = tarfile.SYMTYPE
+            link.linkname = "/etc/passwd"
+            t.addfile(link)
+    return path
+
+
+def test_tar_members_outside_the_destination_are_dropped(tmp_path: Path):
+    """`requires-python` is >=3.11 but tarfile's `data` filter only landed in
+    3.11.4, and the fallback for the versions below it was a plain extractall —
+    which honours `../..` and absolute member names. _members_within is what
+    keeps that fallback from writing outside the install directory."""
+    archive = _tar_with(
+        tmp_path / "s.tar.gz",
+        ["../../escaped.txt", "/abs.txt", "steamcmd.sh", "sub/ok.txt"],
+        symlink="link",
+    )
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    with tarfile.open(archive) as t:
+        kept = [m.name for m in steamcmd._members_within(t, dest)]
+
+    assert sorted(kept) == ["steamcmd.sh", "sub/ok.txt"]
+    assert "../../escaped.txt" not in kept
+    assert "/abs.txt" not in kept
+    assert "link" not in kept  # a link is a second chance to escape, once followed
+
+
+def test_tar_extraction_writes_nothing_outside_the_destination(tmp_path: Path):
+    archive = _tar_with(tmp_path / "s.tar.gz", ["../../escaped.txt", "steamcmd.sh"])
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    with tarfile.open(archive) as t:
+        t.extractall(dest, members=steamcmd._members_within(t, dest))
+
+    assert (dest / "steamcmd.sh").is_file()
+    assert not (tmp_path.parent / "escaped.txt").exists()
+    assert not (tmp_path / "escaped.txt").exists()
+
+
+def test_zip_extraction_cannot_escape_the_destination(tmp_path: Path):
+    """Python's ZipFile strips the drive, leading separators and every '..'
+    component before joining, so the zip path needs no filter of its own — this
+    pins the behaviour the code relies on."""
+    archive = tmp_path / "s.zip"
+    with zipfile.ZipFile(archive, "w") as z:
+        z.writestr("../../escaped.txt", "x")
+        z.writestr("/abs.txt", "x")
+        z.writestr("steamcmd.exe", "x")
+    dest = tmp_path / "dest"
+
+    with zipfile.ZipFile(archive) as z:
+        z.extractall(dest)
+
+    assert not (tmp_path.parent / "escaped.txt").exists()
+    assert {p.name for p in dest.rglob("*") if p.is_file()} == {
+        "escaped.txt", "abs.txt", "steamcmd.exe",
+    }

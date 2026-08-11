@@ -14,9 +14,9 @@ pytest.importorskip("httpx")
 pytest.importorskip("psutil")
 pytest.importorskip("keyring")
 
-from palctl import watchdog as watchdog_mod  # noqa: E402  (after importorskip)
-from palctl.config import Config  # noqa: E402
-from palctl.watchdog import Watchdog  # noqa: E402
+from palctl import watchdog as watchdog_mod
+from palctl.config import Config
+from palctl.watchdog import Watchdog
 
 
 class FakeBus:
@@ -196,6 +196,6 @@ def test_fps_watchdog_off_by_default(monkeypatch):
     # Config defaults leave fps_restart False — the tick must not even call
     # metrics() (the memory-path FakeApi has no metrics(), which is the point).
     api = FakeApi(players=[])
-    wd, bus, restarts = make_watchdog(monkeypatch, memory_mb=1_000, api=api)
+    wd, _bus, restarts = make_watchdog(monkeypatch, memory_mb=1_000, api=api)
     asyncio.run(wd._tick())
     assert restarts == []

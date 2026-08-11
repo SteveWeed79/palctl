@@ -14,12 +14,12 @@ import pytest
 
 pytest.importorskip("discord")
 
-import discord  # noqa: E402
+import discord
 
-import palctl.bot as bot_mod  # noqa: E402
-from palctl.bot import PalBot  # noqa: E402
-from palctl.config import Config  # noqa: E402
-from palctl.events import Event  # noqa: E402
+import palctl.bot as bot_mod
+from palctl.bot import PalBot
+from palctl.config import Config
+from palctl.events import Event
 
 ROLE = 111111111111111111
 USER = 222222222222222222

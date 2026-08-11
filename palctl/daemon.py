@@ -245,16 +245,28 @@ def make_auth_middleware(token: str, exempt: frozenset[str] = frozenset()):
     Rejections are logged (with the peer address) so probing is visible when the
     API is LAN-bound — the token is the only credential there, and silence would
     hide someone guessing at it. Rate-limited so a misconfigured client polling
-    every 2s can't flood the log: the first few are logged, then every 100th."""
+    every 2s can't flood the log: the first few are logged, then every 100th.
+
+    The comparison is done on BYTES, not on the header string. compare_digest
+    refuses str operands that aren't pure ASCII and raises TypeError, so a single
+    non-ASCII byte in the header used to escape this middleware as an unhandled
+    exception: aiohttp answered 500 instead of 401, and — worse — the request
+    never reached the counter above, so the one signal that makes token-guessing
+    visible could be sidestepped by every probe simply by including an accented
+    character. Encoding both sides makes any header value a plain non-match."""
     rejects = {"n": 0}
     log = logging.getLogger("palctl.daemon")
+    # surrogateescape: aiohttp hands us whatever the peer sent, decoded
+    # permissively, so the value can carry lone surrogates that plain .encode()
+    # would itself raise on.
+    expected = token.encode("utf-8", "surrogateescape")
 
     @web.middleware
     async def _auth(request: web.Request, handler):
         if exempt and request.path in exempt:
             return await handler(request)
         sent = request.headers.get(localauth.TOKEN_HEADER, "")
-        if not secrets.compare_digest(sent, token):
+        if not secrets.compare_digest(sent.encode("utf-8", "surrogateescape"), expected):
             rejects["n"] += 1
             n = rejects["n"]
             if n <= 5 or n % 100 == 0:

@@ -391,7 +391,12 @@ class Scheduler:
         glance at the dashboard.
         """
         cfg = self._cfg
-        if not cfg.steamcmd_path or not Path(cfg.steamcmd_path).exists():
+        # Off the loop like every other filesystem touch here: steamcmd_path is
+        # user-supplied and is sometimes a UNC path, where a stat against a dead
+        # share blocks for the SMB timeout rather than microseconds.
+        if not cfg.steamcmd_path or not await asyncio.to_thread(
+            Path(cfg.steamcmd_path).exists
+        ):
             self._record_update_status(state="unknown", detail="no steamcmd configured")
             return False
         installed = await asyncio.to_thread(
@@ -888,7 +893,9 @@ class Scheduler:
         """
         cfg = self._cfg
         steam = Path(cfg.steamcmd_path)
-        if not cfg.steamcmd_path or not steam.exists():
+        # to_thread for the same reason as check_update_available: a UNC path on
+        # a dead share turns this stat into an event-loop stall.
+        if not cfg.steamcmd_path or not await asyncio.to_thread(steam.exists):
             await self._bus.emit(
                 Event(
                     "error",

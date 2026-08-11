@@ -18,10 +18,10 @@ import pytest
 pytest.importorskip("aiohttp")   # palctl.daemon (imported lazily by setup_flow)
 pytest.importorskip("discord")
 
-import palctl.config as config_mod  # noqa: E402
-from palctl.config import Config  # noqa: E402
-from palctl.preflight import Check  # noqa: E402
-from palctl.setup_flow import SetupPlan, run_setup  # noqa: E402
+import palctl.config as config_mod
+from palctl.config import Config
+from palctl.preflight import Check
+from palctl.setup_flow import SetupPlan, run_setup
 
 
 @pytest.fixture
@@ -160,19 +160,19 @@ def env(tmp_path, monkeypatch):
 
 def _plan(tmp_path, **over):
     server_root = str(tmp_path / "server")
-    base = dict(
-        server_root=server_root,
-        steamcmd_path=str(tmp_path / "steamcmd.exe"),
-        api_port=8212,
-        password="secret",
-        install_server=False,
-        install_vcredist=False,
-        register_server_service=False,
-        daemon_startup="none",
-        service_name="PalServer",
-        backup_root=str(tmp_path / "backups"),
-        backup_hours=6,
-    )
+    base = {
+        "server_root": server_root,
+        "steamcmd_path": str(tmp_path / "steamcmd.exe"),
+        "api_port": 8212,
+        "password": "secret",
+        "install_server": False,
+        "install_vcredist": False,
+        "register_server_service": False,
+        "daemon_startup": "none",
+        "service_name": "PalServer",
+        "backup_root": str(tmp_path / "backups"),
+        "backup_hours": 6,
+    }
     base.update(over)
     return SetupPlan(**base)
 

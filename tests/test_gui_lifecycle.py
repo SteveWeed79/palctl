@@ -19,9 +19,9 @@ import pytest
 # Skipping on the submodule covers both "not installed" and "can't initialise".
 pytest.importorskip("PySide6.QtWidgets")
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication
 
-import palctl.gui.main as gui  # noqa: E402
+import palctl.gui.main as gui
 
 
 @pytest.fixture(scope="module")

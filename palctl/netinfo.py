@@ -76,7 +76,9 @@ def public_ip(timeout: float = 4.0) -> str | None:
     """Best-effort public IP via a couple of echo services. None if offline."""
     for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as resp:
+            # S310 suppressed: the URLs are the https:// literals above, not
+            # caller input, so there is no scheme to audit.
+            with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
                 ip = resp.read().decode("utf-8", "replace").strip()
             if ip:
                 return ip

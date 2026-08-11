@@ -8,10 +8,10 @@ import pytest
 
 pytest.importorskip("httpx")
 
-from palctl import alerts as alerts_mod  # noqa: E402
-from palctl.alerts import WebhookAlerter  # noqa: E402
-from palctl.config import Config  # noqa: E402
-from palctl.events import Event, EventBus  # noqa: E402
+from palctl import alerts as alerts_mod
+from palctl.alerts import WebhookAlerter
+from palctl.config import Config
+from palctl.events import Event, EventBus
 
 
 class _FakeResp:

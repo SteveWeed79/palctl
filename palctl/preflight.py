@@ -212,6 +212,25 @@ def run_all(
     return checks
 
 
+def _ps_single_quote(value: str) -> str:
+    """`value` as a PowerShell single-quoted literal.
+
+    A single-quoted PowerShell string is verbatim — no `$` expansion, no
+    backtick escapes — and the only character with any meaning inside it is the
+    quote itself, escaped by doubling. So doubling is the whole job, and it
+    makes the result inert regardless of what the path contains.
+
+    This is not a hypothetical. The path handed to Get-AuthenticodeSignature is
+    a %TEMP% file, and %TEMP% sits under the user profile: on an account named
+    `Sean O'Brien` the interpolated quote closed the string early, PowerShell
+    failed to parse the line, and the function returned '' — which
+    _signature_is_tampered reads as 'couldn't check' and lets through. The one
+    integrity check standing behind an installer that cannot be hash-pinned
+    silently stopped running, on nothing stranger than an apostrophe in a name.
+    """
+    return "'" + value.replace("'", "''") + "'"
+
+
 def _authenticode_status(path: Path) -> str:
     """The Windows Authenticode signature status of `path` ('Valid',
     'HashMismatch', 'NotSigned', …), lower-cased. Returns '' when it can't be
@@ -220,10 +239,15 @@ def _authenticode_status(path: Path) -> str:
     if not sys.platform.startswith("win"):
         return ""
     try:
+        # S607 (partial executable path) is suppressed deliberately:
+        # powershell.exe is resolved from PATH, whose Windows entries are
+        # administrator-writable only, and hard-coding System32 would break the
+        # PowerShell-in-a-different-prefix setups this check is meant to degrade
+        # gracefully on.
         out = subprocess.run(
-            [
+            [  # noqa: S607
                 "powershell", "-NoProfile", "-NonInteractive", "-Command",
-                f"(Get-AuthenticodeSignature -LiteralPath '{path}').Status",
+                f"(Get-AuthenticodeSignature -LiteralPath {_ps_single_quote(str(path))}).Status",
             ],
             capture_output=True, text=True, timeout=30,
         )

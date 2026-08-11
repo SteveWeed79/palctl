@@ -10,20 +10,21 @@ import asyncio
 import logging
 import time
 import types
+from typing import ClassVar
 
 import pytest
 
 pytest.importorskip("aiohttp")
 pytest.importorskip("discord")
 
-import palctl.daemon as daemon_mod  # noqa: E402
-from palctl.daemon import (  # noqa: E402  (after importorskip guard)
+import palctl.daemon as daemon_mod
+from palctl.daemon import (
     _within_window,
     lan_exposure_warning,
     make_auth_middleware,
 )
-from palctl.decisions import DecisionLog  # noqa: E402
-from palctl.localauth import TOKEN_HEADER  # noqa: E402
+from palctl.decisions import DecisionLog
+from palctl.localauth import TOKEN_HEADER
 
 # ---------------- LAN-exposure warning ----------------
 
@@ -89,6 +90,41 @@ def test_auth_middleware_exempts_only_the_named_paths():
     assert asyncio.run(mw(page, _ok_handler)) == "OK"
     data = types.SimpleNamespace(headers={}, path="/state", method="GET", remote="::1")
     assert asyncio.run(mw(data, _ok_handler)).status == 401
+
+
+def test_auth_middleware_rejects_non_ascii_tokens_as_401():
+    """secrets.compare_digest raises TypeError on non-ASCII str operands, so a
+    header with one accented character used to leave the middleware as an
+    unhandled exception — aiohttp answered 500, not 401. The comparison runs on
+    bytes now, which makes any header value a plain non-match."""
+    mw = make_auth_middleware("s3cret")
+    for value in ("évil", "ÿ", "s3creté", "\udcff"):  # incl. a lone surrogate
+        req = types.SimpleNamespace(
+            headers={TOKEN_HEADER: value}, method="GET", path="/state", remote="10.0.0.9"
+        )
+        assert asyncio.run(mw(req, _ok_handler)).status == 401
+
+
+def test_auth_middleware_counts_non_ascii_rejections():
+    """The reject counter is what makes token-guessing visible on a LAN-bound
+    daemon. While non-ASCII blew up before the increment, a prober could stay
+    invisible just by including an accented character in every attempt."""
+    logged = []
+    mw = make_auth_middleware("s3cret")
+    logger = logging.getLogger("palctl.daemon")
+    handler = logging.Handler()
+    handler.emit = lambda record: logged.append(record.getMessage())
+    logger.addHandler(handler)
+    try:
+        for _ in range(3):
+            req = types.SimpleNamespace(
+                headers={TOKEN_HEADER: "évil"}, method="GET", path="/state", remote="10.0.0.9"
+            )
+            assert asyncio.run(mw(req, _ok_handler)).status == 401
+    finally:
+        logger.removeHandler(handler)
+    assert len(logged) == 3
+    assert "rejected request #3" in logged[-1]
 
 
 # ---------------- machine-account detection ----------------
@@ -366,7 +402,7 @@ def test_poll_loop_stamps_liveness_even_when_the_poll_fails():
     class _Stub:
         cfg = types.SimpleNamespace(poll_seconds=1)
         _last_poll_at = 0.0
-        emitted: list = []
+        emitted: ClassVar[list] = []
 
         class bus:
             @staticmethod

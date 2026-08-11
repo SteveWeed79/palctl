@@ -8,7 +8,7 @@ import pytest
 pytest.importorskip("httpx")
 pytest.importorskip("keyring")
 
-from palctl.cli import (  # noqa: E402  (after importorskip)
+from palctl.cli import (
     _countdown_seconds,
     find_players,
     fmt_backups,

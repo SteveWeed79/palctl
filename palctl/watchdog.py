@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 
-from . import procs  # noqa: F401  (tests patch service control through this module)
+from . import procs  # imported as a module: the tests patch service control through it
 from .api import PalApi
 from .config import Config
 from .control import ServerController

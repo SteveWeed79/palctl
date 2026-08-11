@@ -49,10 +49,100 @@ def config_dir() -> Path:
 CONFIG_PATH = config_dir() / "config.json"
 
 
-def _known(cls: type, raw: dict, exclude: tuple[str, ...] = ()) -> dict:
-    """Drop keys written by a different palctl version that this one doesn't know."""
-    names = {f.name for f in fields(cls)} - set(exclude)  # type: ignore[arg-type]
-    return {k: v for k, v in raw.items() if k in names}
+def _coerce(value: object, default: object) -> object:
+    """Convert `value` to the type of `default`, or raise ValueError.
+
+    Every field on these dataclasses defaults to a plain scalar, so the default's
+    type *is* the field's type — and reading it off the value avoids parsing the
+    string annotations that `from __future__ import annotations` leaves behind.
+
+    bool is checked before int because it is a subclass of one: a `true` landing
+    in an int field is a mistake worth rejecting, not a silent 1.
+    """
+    want = type(default)
+    if type(value) is want:
+        return value
+
+    if want is bool:
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            low = value.strip().lower()
+            if low in ("true", "yes", "on", "1"):
+                return True
+            if low in ("false", "no", "off", "0"):
+                return False
+        raise ValueError(f"cannot read {value!r} as a true/false value")
+
+    if want is int:
+        if isinstance(value, bool):
+            raise ValueError(f"expected a number, got the boolean {value!r}")
+        if isinstance(value, float):
+            if value != value or value in (float("inf"), float("-inf")):
+                raise ValueError(f"{value!r} is not a finite number")
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value.strip())
+            except ValueError:
+                return int(float(value.strip()))  # "6.5" -> 6, or raises
+        raise ValueError(f"cannot read {value!r} as a number")
+
+    if want is float:
+        if isinstance(value, bool):
+            raise ValueError(f"expected a number, got the boolean {value!r}")
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            return float(value.strip())
+        raise ValueError(f"cannot read {value!r} as a number")
+
+    if want is str:
+        # An unquoted app_id or port is worth accepting; a list or dict where a
+        # path belongs is a real mistake and must not become its repr().
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+        raise ValueError(f"cannot read {value!r} as text")
+
+    return value
+
+
+def _known(cls: type, raw: object, exclude: tuple[str, ...] = ()) -> dict:
+    """The subset of `raw` this version understands, converted to the field types.
+
+    Two kinds of junk get filtered here, and neither should reach the daemon:
+
+    Keys written by a different palctl version are dropped — that is the original
+    job, and what lets a config survive a downgrade.
+
+    Wrong-typed values are converted where the intent is obvious and otherwise
+    dropped, so the field keeps its default. JSON has no schema and this file is
+    documented as hand-editable ("set watchdog.auto_restart_on_crash to true"),
+    so a quoted number is a routine typo — and dataclasses enforce nothing at
+    runtime, so `"12000"` used to sail all the way into the watchdog and fail
+    there, comparing str to float on every tick. `poll_seconds` was worse: the
+    TypeError landed on the sleep at the bottom of the loop, outside the guard
+    that wraps each tick, so the watchdog task died and the memory leak it exists
+    to catch went unwatched until someone restarted the daemon. Fixing it at the
+    boundary means a bad value costs one field and one log line.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    defaults = {
+        f.name: f.default for f in fields(cls) if f.name not in exclude  # type: ignore[arg-type]
+    }
+    out: dict = {}
+    for key, value in raw.items():
+        if key not in defaults:
+            continue
+        try:
+            out[key] = _coerce(value, defaults[key])
+        except (ValueError, TypeError, OverflowError) as e:
+            logging.getLogger("palctl.config").warning(
+                "config: ignoring %s.%s — %s; using the default %r instead",
+                cls.__name__, key, e, defaults[key],
+            )
+    return out
 
 
 @dataclass
@@ -333,7 +423,7 @@ def _get_secret(name: str) -> str:
         return ""
     except (KeyboardInterrupt, SystemExit):
         raise
-    except BaseException as e:  # noqa: BLE001
+    except BaseException as e:
         # A *broken* keyring backend (not keyring itself) can fail outside the
         # Exception hierarchy, sailing past the guard above. The one seen in the
         # wild: a system `cryptography` with a missing _cffi_backend makes pyo3

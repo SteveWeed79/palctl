@@ -183,3 +183,105 @@ def test_a_corrupt_config_survives_a_failed_quarantine(tmp_path, monkeypatch):
     cfg = Config.load()
     assert isinstance(cfg, Config)  # defaults, not a crash
     assert path.exists(), "the unreadable file is left in place for the user"
+
+
+# ---------------- wrong-typed values in a hand-edited config ----------------
+#
+# config.json is documented as hand-editable ("set watchdog.auto_restart_on_crash
+# to true"), JSON has no schema, and dataclasses enforce nothing at runtime. A
+# quoted number therefore used to load clean and fail much later, in the worker
+# that consumed it — `poll_seconds` as a string killed the whole watchdog task,
+# because the TypeError landed on the sleep at the bottom of the loop rather
+# than inside the guard that wraps each tick.
+
+
+def test_quoted_numbers_are_read_as_numbers(cfg_path: Path):
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "poll_seconds": "10",
+                "watchdog": {"memory_limit_mb": "12000", "poll_seconds": "60"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = Config.load()
+    assert cfg.poll_seconds == 10
+    assert cfg.watchdog.memory_limit_mb == 12_000
+    # The two operations that used to raise TypeError on a live daemon.
+    assert max(1, cfg.watchdog.poll_seconds) == 60
+    assert 5_000.0 < cfg.watchdog.memory_limit_mb
+
+
+def test_stringy_booleans_are_read_as_booleans(cfg_path: Path):
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "check_for_updates": "false",
+                "watchdog": {"auto_restart_on_crash": "true"},
+                "schedule": {"auto_update": "no"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = Config.load()
+    assert cfg.check_for_updates is False
+    assert cfg.watchdog.auto_restart_on_crash is True
+    assert cfg.schedule.auto_update is False
+
+
+def test_unquoted_ids_and_paths_are_read_as_text(cfg_path: Path):
+    """app_id is a string field holding digits, so writing it unquoted is a
+    natural mistake; a Discord snowflake pasted as a string is the mirror case."""
+    cfg_path.write_text(
+        json.dumps({"app_id": 2394010, "discord": {"channel_id": "123456789012345678"}}),
+        encoding="utf-8",
+    )
+    cfg = Config.load()
+    assert cfg.app_id == "2394010"
+    assert cfg.discord.channel_id == 123456789012345678
+
+
+def test_junk_values_fall_back_to_the_default(cfg_path: Path):
+    """Where the intent isn't recoverable the field keeps its default — one bad
+    value must not cost the rest of the file, and a list must never become a
+    path via its repr()."""
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "api_port": 9001,
+                "server_root": ["not", "a", "path"],
+                "watchdog": {"hard_limit_mb": "not a number", "memory_limit_mb": 9000},
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = Config.load()
+    assert cfg.server_root == Config().server_root
+    assert cfg.watchdog.hard_limit_mb == Config().watchdog.hard_limit_mb
+    # ...and the good values around it still land.
+    assert cfg.api_port == 9001
+    assert cfg.watchdog.memory_limit_mb == 9000
+
+
+def test_a_boolean_in_a_number_field_is_rejected(cfg_path: Path):
+    """bool is a subclass of int, so `true` would otherwise become a silent 1 —
+    a memory limit of 1 MB restarts the server on every single poll."""
+    cfg_path.write_text(
+        json.dumps({"watchdog": {"memory_limit_mb": True}}), encoding="utf-8"
+    )
+    assert Config.load().watchdog.memory_limit_mb == Config().watchdog.memory_limit_mb
+
+
+def test_a_wrong_typed_section_does_not_quarantine_the_file(cfg_path: Path):
+    """A nested section that isn't an object used to raise AttributeError inside
+    from_dict, which load() treats as a corrupt file — so one bad key threw away
+    every setting in it."""
+    cfg_path.write_text(
+        json.dumps({"api_port": 9001, "schedule": None, "discord": "nope"}),
+        encoding="utf-8",
+    )
+    cfg = Config.load()
+    assert cfg.api_port == 9001  # the rest of the file survived
+    assert cfg.schedule.backup_hours == Config().schedule.backup_hours
+    assert not cfg_path.with_suffix(".json.broken").exists()
