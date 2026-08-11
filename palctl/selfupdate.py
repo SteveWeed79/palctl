@@ -42,11 +42,11 @@ def is_newer(current: str, latest: str) -> bool:
 
 
 def latest_release(repo: str = REPO, timeout: float = 5.0) -> str | None:
-    # S310 suppressed twice below: the URL is built from the
+    # S310 is suppressed on the urlopen below: the URL is built from the
     # https://api.github.com literal, so the scheme is fixed and there is
     # nothing for the caller to redirect.
     url = f"https://api.github.com/repos/{repo}/releases/latest"
-    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})  # noqa: S310
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             tag = json.load(resp).get("tag_name")

@@ -211,7 +211,15 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.11"
-      - run: pip install ruff
+      # Pinned, and matching the dev extra in pyproject.toml. Unpinned, this job
+      # re-decided what "clean" means on every ruff release: 0.16 narrowed S310
+      # to urlopen alone, which turned a `# noqa: S310` on a Request() call into
+      # an unused directive and failed a commit that changed nothing near it —
+      # while a local ruff a version behind still said clean. The same drift in
+      # the other direction is worse and silent: a rule narrows, and the gate
+      # quietly stops checking what it was added for. Bumping this is a commit,
+      # with the findings it brings resolved in that commit.
+      - run: pip install ruff==0.16.2
       # scripts/ is linted too. It was outside the selection while holding code
       # CI actually runs — the changelog gate and the two smoke checks — so the
       # only Python in the repo that gates a release was the only Python nothing

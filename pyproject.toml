@@ -17,7 +17,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8",
-  "ruff>=0.5",
+  # Pinned, not floored, and kept equal to the version .github/workflows/ci.yml
+  # installs. A linter's output is a gate, so an unpinned one means the gate
+  # changes meaning on someone else's release schedule — and a contributor whose
+  # ruff is a version behind CI's gets "clean" locally for a commit CI rejects.
+  "ruff==0.16.2",
 ]
 
 [project.scripts]
