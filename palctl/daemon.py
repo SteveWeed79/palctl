@@ -441,6 +441,51 @@ class Daemon:
         except Exception as e:  # firewall trouble must never break startup
             self.log.warning("dashboard firewall setup failed: %s", e)
 
+    async def _recover_interrupted_restore(self) -> None:
+        """Put the world back if a restore died with none in place.
+
+        The daemon can be restarted (or the box rebooted) in the middle of a
+        restore's two renames — that is exactly when a crash is most likely,
+        since the operation is the one moving multi-gigabyte directories
+        around. Coming back up and starting a server with no world is the
+        expensive mistake, so this runs before anything can.
+
+        Silent on a healthy install; loud whenever it acts or can't.
+        """
+        savegames = self.cfg.savegames_dir
+        if await asyncio.to_thread(savegames.exists):
+            return
+        strays = await asyncio.to_thread(backups.interrupted_restore, savegames)
+        if not strays:
+            return  # no world and nothing to put back: not our doing, not our fix
+        recovered = await asyncio.to_thread(
+            backups.recover_interrupted_restore, savegames
+        )
+        if recovered is not None:
+            await self.bus.emit(
+                Event(
+                    "restore",
+                    "♻️ palctl restarted during a restore, with no world in "
+                    f"place. Put the previous world back from `{recovered.name}` "
+                    "before starting anything — the backup you were restoring is "
+                    "still there, so the restore can be run again.",
+                    {"recovered_from": str(recovered)},
+                )
+            )
+            return
+        await self.bus.emit(
+            Event(
+                "error",
+                "There is no world at "
+                f"`{savegames}`, and more than one candidate to put back: "
+                + ", ".join(f"`{p.name}`" for p in strays)
+                + ". palctl will not choose between them — starting the server "
+                "would generate an empty world over the problem. Rename the one "
+                f"you want to `{savegames.name}` and start the server.",
+                {"candidates": [str(p) for p in strays]},
+            )
+        )
+
     async def _startup_side_effects(self, host: str) -> None:
         """The two startup chores that shell out, moved off the event loop and
         out of the startup critical path. Neither gates anything, so a slow
@@ -1527,6 +1572,15 @@ class Daemon:
 
         if self.cfg.check_for_updates:
             self._spawn(self._check_palctl_update())
+
+        # AWAITED, and before anything that can start the server. A restore
+        # that died between its two renames leaves the install with no world at
+        # all; the next thing to touch it is normally the boot-intent start
+        # below, and starting Palworld without a world has it generate a fresh
+        # one — players join it, build in it, and the real world becomes
+        # un-mergeable. One `exists()` call when there is nothing to do, so it
+        # costs nothing to put it first.
+        await self._recover_interrupted_restore()
 
         # Before the workers, so the poll loop's first pass already knows
         # whether a STOPPED service is about to be started (the flag it clears

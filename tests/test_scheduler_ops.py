@@ -6,6 +6,7 @@ pinned here with the real orchestration and faked side effects."""
 import asyncio
 from pathlib import Path
 
+from palctl import backups
 from palctl import scheduler as sched_mod
 from palctl.config import Config
 from palctl.events import EventBus
@@ -1367,3 +1368,96 @@ def test_validate_is_available_as_an_explicit_repair(tmp_path, monkeypatch):
     _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(validate=True))
 
     assert ("update", True) in calls
+
+
+# ---------------- a restore that fails must not report success ----------------
+
+
+def _restore_setup(tmp_path, monkeypatch, calls, *, world=True):
+    cfg = _no_countdown(Config())
+    cfg.backup_root = str(tmp_path / "backups")
+    # savegames_dir is derived from server_root, so the world lands under it.
+    cfg.server_root = str(tmp_path / "server")
+    name = "2026-01-01_00-00-00-manual"
+    (Path(cfg.backup_root) / name).mkdir(parents=True)
+    cfg.savegames_dir.parent.mkdir(parents=True, exist_ok=True)
+    if world:
+        cfg.savegames_dir.mkdir(parents=True)
+    _patch_service(monkeypatch, calls)
+    return cfg, name
+
+
+def test_a_failed_restore_reports_failure_not_success(tmp_path, monkeypatch):
+    """The reported fault, and the likeliest failure there is: staging runs out
+    of disk before phase 2 touches the world, so SaveGames survives — and the
+    old code fell straight through to "✅ Server back up after restore" and
+    `return True`. The admin gets a green tick and goes away believing they are
+    on the old save."""
+    calls: list = []
+    cfg, name = _restore_setup(tmp_path, monkeypatch, calls)
+
+    def dies(root, n, savegames):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(sched_mod.backups, "restore", dies)
+
+    bus = EventBus()
+    events = _collect(bus)
+    result = _run(sched_mod.Scheduler(cfg, FakeApi(), bus).restore_backup(name))
+
+    assert result is False, "a restore that did not happen must not return True"
+    assert not any("back up after restore" in e.message for e in events)
+    said = [e.message for e in events if e.kind == "error"]
+    assert any("No space left" in m for m in said), said
+    assert any("did NOT happen" in m for m in said), said
+    # Restarting the untouched world is still right — players should have it back.
+    assert [c[0] for c in calls] == ["stop", "start"]
+
+
+def test_an_interrupted_restore_puts_the_world_back_and_says_so(tmp_path, monkeypatch):
+    """No world at all: the swap moved it aside and nothing landed. Starting the
+    server here has Palworld generate a fresh world over the problem."""
+    calls: list = []
+    cfg, name = _restore_setup(tmp_path, monkeypatch, calls, world=False)
+    aside = cfg.savegames_dir.parent / f"{cfg.savegames_dir.name}{backups.PRE_RESTORE_PREFIX}x"
+    aside.mkdir(parents=True)
+    (aside / "Level.sav").write_bytes(b"the-world")
+
+    def dies(root, n, savegames):
+        raise OSError("the swap was interrupted")
+
+    monkeypatch.setattr(sched_mod.backups, "restore", dies)
+
+    bus = EventBus()
+    events = _collect(bus)
+    result = _run(sched_mod.Scheduler(cfg, FakeApi(), bus).restore_backup(name))
+
+    assert result is False
+    assert (cfg.savegames_dir / "Level.sav").read_bytes() == b"the-world"
+    assert any("put the previous world back" in e.message for e in events)
+    assert [c[0] for c in calls] == ["stop", "start"]
+
+
+def test_two_candidate_worlds_leave_the_server_down_for_a_human(tmp_path, monkeypatch):
+    """Two irreplaceable worlds and no basis to choose. Guessing is worse than
+    staying down and naming both."""
+    calls: list = []
+    cfg, name = _restore_setup(tmp_path, monkeypatch, calls, world=False)
+    for stamp in ("a", "b"):
+        (cfg.savegames_dir.parent
+         / f"{cfg.savegames_dir.name}{backups.PRE_RESTORE_PREFIX}{stamp}").mkdir(parents=True)
+
+    def dies(root, n, savegames):
+        raise OSError("the swap was interrupted")
+
+    monkeypatch.setattr(sched_mod.backups, "restore", dies)
+
+    bus = EventBus()
+    events = _collect(bus)
+    result = _run(sched_mod.Scheduler(cfg, FakeApi(), bus).restore_backup(name))
+
+    assert result is False
+    assert "start" not in [c[0] for c in calls], "must not boot an empty world"
+    msg = next(e.message for e in events if "NOT started" in e.message)
+    assert cfg.savegames_dir.name + backups.PRE_RESTORE_PREFIX + "a" in msg
+    assert cfg.savegames_dir.name + backups.PRE_RESTORE_PREFIX + "b" in msg

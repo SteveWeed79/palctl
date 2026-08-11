@@ -68,6 +68,21 @@ def _stamp() -> str:
 BACKUP_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})(Z?)-")
 
 
+def is_backup_name(name: str) -> bool:
+    """True for a directory palctl itself created and finished.
+
+    One definition, used by everything that reads, restores, deletes or prunes,
+    so those can't disagree about what a backup is — they used to: prune()
+    checked the pattern, restore() and delete() accepted any directory under the
+    root, and listing() showed every one of them.
+
+    `.partial` is a copy still being written (create() and mirror() stage under
+    that suffix and rename on completion), so it is a directory that exists and
+    is not a backup yet.
+    """
+    return bool(BACKUP_NAME_RE.match(name)) and not name.endswith(".partial")
+
+
 def sort_key(name: str) -> datetime:
     """The instant a backup directory name stands for, as aware UTC.
 
@@ -213,7 +228,11 @@ def listing(backup_root: Path) -> list[Backup]:
     out = [
         Backup(d.name, d, _dir_size_mb(d), datetime.fromtimestamp(d.stat().st_mtime))
         for d in backup_root.iterdir()
-        if d.is_dir() and not d.name.endswith(".partial")  # skip in-progress copies
+        # palctl's own finished backups only. This used to be "every directory
+        # that isn't .partial", so a backup root that shares a folder with the
+        # admin's own data — which the retention comments explicitly expect —
+        # offered those folders in the dashboard's restore list.
+        if d.is_dir() and is_backup_name(d.name)
     ]
     # Newest first, by the instant the name stands for rather than by the
     # string — see sort_key. The name breaks ties so the order stays
@@ -236,6 +255,19 @@ def _safe_backup_path(backup_root: Path, name: str) -> Path:
         raise ValueError(f"Invalid backup name: {name!r}")
     if "/" in name or "\\" in name or ".." in name:
         raise ValueError(f"Invalid backup name: {name!r}")
+    if not is_backup_name(name):
+        # Being inside backup_root was the only requirement, which made every
+        # directory under it restorable and deletable — and the backup root is
+        # routinely a folder the admin already had (retention is written to
+        # tolerate exactly that: "a mirror pointed at a populated location").
+        # So `restore("Photos")` would copy their photos over the world, and
+        # `restore("<name>.partial")` would restore a copy that was still being
+        # written. prune() has always filtered on this pattern before deleting
+        # anything; restore and delete now hold to the same rule.
+        raise ValueError(
+            f"Not a palctl backup: {name!r} (expected a directory named like "
+            "2026-08-11_16-00-00Z-scheduled)"
+        )
     src = backup_root / name
     if src.resolve().parent != backup_root.resolve():
         raise ValueError(f"Invalid backup name: {name!r}")
@@ -299,13 +331,32 @@ def restore(backup_root: Path, name: str, savegames: Path) -> str | None:
         raise
 
     # The staged copy is complete — only now touch the live world.
-    aside = savegames.parent / f"{savegames.name}.pre-restore"
-    if aside.exists():
-        shutil.rmtree(aside)  # leftover from a previous failed attempt
+    #
+    # `aside` is timestamped, and nothing here ever deletes an existing one.
+    # It used to be a fixed `.pre-restore` name that was rmtree'd on the way in
+    # as "a leftover from a previous failed attempt" — but between the two
+    # renames below it holds the ONLY copy of the live world (a rename moved it
+    # there; the archive that copies it into backup_root hasn't run yet). So if
+    # the second rename failed and the admin simply retried, that rmtree
+    # destroyed the world as it stood, and the retry then reported success. The
+    # backup being restored survives either way; what was lost was everything
+    # since it, plus the ability to undo.
+    aside = savegames.parent / f"{savegames.name}.pre-restore-{_stamp()}"
     had_world = savegames.exists()
     if had_world:
         os.replace(savegames, aside)  # same directory, so this is a rename
-    os.replace(staged, savegames)
+    try:
+        os.replace(staged, savegames)
+    except BaseException:
+        # The window this exists for: the live world is renamed away and the
+        # restored copy did not land, so there is no world at all. Put the old
+        # one back and fail — the caller then reports a failed restore over an
+        # untouched world, which is true, instead of leaving the server with
+        # nothing for Palworld to do but generate a fresh one.
+        if had_world:
+            with contextlib.suppress(OSError):
+                os.replace(aside, savegames)
+        raise
 
     # From here the live world is already the restored one. Everything below is
     # the undo copy, and must never turn a completed restore into a failure.
@@ -322,6 +373,56 @@ def restore(backup_root: Path, name: str, savegames: Path) -> str | None:
         )
     shutil.rmtree(aside, ignore_errors=True)
     return None
+
+
+# A restore renames the live world aside under this prefix before renaming the
+# restored copy into place. Between those two renames it is the only copy of
+# that world, which is why nothing deletes one automatically.
+PRE_RESTORE_PREFIX = ".pre-restore-"
+
+
+def interrupted_restore(savegames: Path) -> list[Path]:
+    """World copies left beside `savegames` by a restore that didn't finish.
+
+    Empty on a healthy install: a completed restore archives its copy into the
+    backup root and removes it. One appears when the archive step failed (the
+    restore itself succeeded — the caller is told where it is), or when the
+    process died mid-transaction, which is the case worth recovering from.
+    """
+    try:
+        return sorted(
+            p
+            for p in savegames.parent.iterdir()
+            if p.is_dir() and p.name.startswith(savegames.name + PRE_RESTORE_PREFIX)
+        )
+    except OSError:
+        return []
+
+
+def recover_interrupted_restore(savegames: Path) -> Path | None:
+    """Put the world back after a restore died between its two renames.
+
+    That window leaves no world at all, and the next thing to touch the install
+    is usually the daemon starting the server — at which point Palworld makes a
+    brand-new one, players join it, build in it, and the real world becomes
+    un-mergeable. Recovering first is the difference between an interrupted
+    restore and a lost server.
+
+    Deliberately puts back the *old* world rather than the copy that was being
+    restored: the backup still exists in the backup root and the restore can
+    simply be run again, while the old world exists nowhere else. Returns the
+    path it recovered from, or None when there was nothing to do — or when more
+    than one candidate exists, which needs a human to choose rather than a
+    guess between two irreplaceable worlds.
+    """
+    if savegames.exists():
+        return None  # there is a world; nothing was interrupted
+    candidates = interrupted_restore(savegames)
+    if len(candidates) != 1:
+        return None
+    source = candidates[0]
+    os.replace(source, savegames)
+    return source
 
 
 def mirror(backup_path: Path, mirror_root: Path) -> Path:

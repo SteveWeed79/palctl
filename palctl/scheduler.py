@@ -789,10 +789,12 @@ class Scheduler:
             if not await self._confirm_world_is_free(cfg):
                 return False
 
+            restored_ok = False
             try:
                 warning = await asyncio.to_thread(
                     backups.restore, Path(cfg.backup_root), name, cfg.savegames_dir
                 )
+                restored_ok = True
                 await self._bus.emit(
                     Event("restore", f"📥 Restored `{name}`. Starting the server.")
                 )
@@ -801,36 +803,92 @@ class Scheduler:
             except Exception as e:
                 await self._bus.emit(Event("error", f"Restore failed: {e}"))
                 if not await asyncio.to_thread(cfg.savegames_dir.exists):
-                    # The world is not there. Starting the server now would have
-                    # Palworld generate a brand-new one over the top of the
-                    # problem — players would join it, build in it, and the real
-                    # world would become un-mergeable. Leave the server down and
-                    # say exactly where both copies are instead.
+                    # No world at all: the swap moved the live one aside and the
+                    # restored copy didn't land, and even the rollback failed.
+                    # Put the old world back before anything else happens —
+                    # starting the server in this state has Palworld generate a
+                    # brand-new world over the top, players join it, build in
+                    # it, and the real one becomes un-mergeable.
+                    recovered = await asyncio.to_thread(
+                        backups.recover_interrupted_restore, cfg.savegames_dir
+                    )
+                    if recovered is not None:
+                        await self._bus.emit(
+                            Event(
+                                "restore",
+                                "♻️ The restore was interrupted with no world in "
+                                f"place; put the previous world back from "
+                                f"`{recovered.name}`. Nothing was lost — the backup "
+                                "you asked for is still there, so the restore can "
+                                "be run again.",
+                                {"recovered_from": str(recovered)},
+                            )
+                        )
+                if not await asyncio.to_thread(cfg.savegames_dir.exists):
+                    # Recovery couldn't decide (more than one candidate) or
+                    # failed. Leave the server down and say exactly where every
+                    # copy is — a human choosing between two irreplaceable
+                    # worlds is the right outcome here, a guess is not.
+                    strays = await asyncio.to_thread(
+                        backups.interrupted_restore, cfg.savegames_dir
+                    )
+                    where = ", ".join(f"`{p.name}`" for p in strays) or "(none found)"
                     await self._bus.emit(
                         Event(
                             "error",
                             "Restore failed with no world in place, so the server "
                             "was NOT started — starting it would generate an empty "
-                            f"world over the problem. Look in `{cfg.savegames_dir.parent}` "
-                            f"for `{cfg.savegames_dir.name}.partial-restore` (the backup "
-                            f"being restored) and `{cfg.savegames_dir.name}.pre-restore` "
-                            f"(the world as it was), and in `{cfg.backup_root}` for the "
-                            "`-pre-restore` copies. Put one of them back as "
-                            f"`{cfg.savegames_dir.name}`, then start the server.",
-                            {"savegames": str(cfg.savegames_dir)},
+                            f"world over the problem. In `{cfg.savegames_dir.parent}`: "
+                            f"{where} (the world as it was) and "
+                            f"`{cfg.savegames_dir.name}.partial-restore` (the backup "
+                            f"being restored, if the copy got that far); in "
+                            f"`{cfg.backup_root}`, the `-pre-restore` copies. Put one "
+                            f"back as `{cfg.savegames_dir.name}`, then start the server.",
+                            {
+                                "savegames": str(cfg.savegames_dir),
+                                "candidates": [str(p) for p in strays],
+                            },
                         )
                     )
                     return False
 
+            # Reached either because the restore worked, or because it failed
+            # with the live world still intact — the ordinary failure, since
+            # staging runs out of disk before phase 2 ever touches SaveGames.
+            # Starting the server is right in both cases: the world on disk is
+            # a real world and players should have it back.
+            #
+            # What must NOT be the same in both cases is what we say afterwards.
+            # This used to fall through to "✅ Server back up after restore" and
+            # `return True` on a failed restore, so an admin whose restore died
+            # on a full disk got a green tick and went away believing they were
+            # on the old save. The server being up is not the claim they were
+            # waiting on.
             await self._control.start()
             ok = await self._api.wait_until_alive(timeout=240)
+            if not restored_ok:
+                await self._bus.emit(
+                    Event(
+                        "error",
+                        "❌ The restore did NOT happen — the world is exactly as it "
+                        "was before. The server has been started again"
+                        + (
+                            "."
+                            if ok
+                            else ", but it did not come back up and needs a look."
+                        )
+                        + " Fix the cause above and retry the restore.",
+                        {"restored": False, "recovered": ok},
+                    )
+                )
+                return False
             await self._bus.emit(
                 Event(
                     "restore",
                     "✅ Server back up after restore."
                     if ok
                     else "❌ Server did not come back after the restore. Needs a look.",
-                    {"recovered": ok},
+                    {"restored": True, "recovered": ok},
                 )
             )
             return True

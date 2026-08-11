@@ -209,8 +209,13 @@ def test_restore_never_leaves_the_world_missing_if_archiving_fails(tmp_path: Pat
     # ...and it says so, rather than reporting a failure that didn't happen.
     assert warning and "succeeded" in warning
     # The old world is still recoverable, sitting where the caller is told.
-    aside = sg.parent / f"{sg.name}.pre-restore"
-    assert (aside / "0" / "world" / "Level.sav").read_bytes() == b"live-world"
+    # The name is timestamped now (see PRE_RESTORE_PREFIX): a fixed one meant a
+    # retry deleted the previous attempt's copy, which between the two renames
+    # is the only copy of that world there is.
+    asides = backups.interrupted_restore(sg)
+    assert len(asides) == 1, asides
+    assert (asides[0] / "0" / "world" / "Level.sav").read_bytes() == b"live-world"
+    assert asides[0].name in warning, "the warning has to name the path it left behind"
 
 
 def test_restore_reports_no_warning_on_a_clean_run(tmp_path: Path):
@@ -555,3 +560,169 @@ def test_a_directory_that_is_not_ours_never_reorders_anything(tmp_path: Path):
     assert backups.listing(root)[0].name == real.name
     assert backups.prune(root, retain=1) == []
     assert (root / "Photos").exists()
+
+
+# ---------------- the restore transaction ----------------
+#
+# Phase 2 is two renames: the live world aside, then the staged copy into
+# place. Between them there is no world, and the copy that was moved aside is
+# the ONLY one — the archive that copies it into the backup root runs after.
+# Everything here is about that window.
+
+
+def _fail_nth_replace(monkeypatch, n: int):
+    """Let os.replace work, except for the nth call, which raises."""
+    calls = {"n": 0}
+    real = backups.os.replace
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] == n:
+            raise OSError(f"simulated failure on rename #{n}")
+        return real(src, dst)
+
+    monkeypatch.setattr(backups.os, "replace", flaky)
+    return calls
+
+
+def test_a_failed_swap_puts_the_old_world_back(tmp_path: Path, monkeypatch):
+    """The second rename fails, so the restored copy never lands. Leaving it
+    there means no world at all — and the caller's next move is to start the
+    server, which has Palworld generate a fresh one over the top."""
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+    b = backups.create(sg, root, "manual")
+    (sg / "0" / "world" / "Level.sav").write_bytes(b"live-world")
+
+    _fail_nth_replace(monkeypatch, 2)
+    with pytest.raises(OSError):
+        backups.restore(root, b.name, sg)
+
+    assert sg.exists(), "a failed swap must not leave the install with no world"
+    assert (sg / "0" / "world" / "Level.sav").read_bytes() == b"live-world"
+    assert backups.interrupted_restore(sg) == [], "and nothing left stranded beside it"
+
+
+def test_a_retry_after_an_interrupted_swap_keeps_the_old_world(tmp_path: Path, monkeypatch):
+    """The reported fault. The old code named the copy `.pre-restore` and
+    rmtree'd it on the way in as "a leftover from a previous failed attempt" —
+    so a retry deleted the only copy of the world as it stood, then reported
+    success."""
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+    b = backups.create(sg, root, "manual")
+    (sg / "0" / "world" / "Level.sav").write_bytes(b"live-world")
+
+    # Let the world move aside, then fail everything after — including the
+    # rollback — so the transaction really is left broken: no world at all, the
+    # old one stranded beside it. That is the state a retry starts from.
+    real = backups.os.replace
+
+    def only_the_move_aside(src, dst):
+        if backups.PRE_RESTORE_PREFIX in str(dst):
+            return real(src, dst)
+        raise OSError("simulated: the swap and its rollback both fail")
+
+    monkeypatch.setattr(backups.os, "replace", only_the_move_aside)
+    with pytest.raises(OSError):
+        backups.restore(root, b.name, sg)
+    monkeypatch.undo()
+
+    stranded = backups.interrupted_restore(sg)
+    assert not sg.exists() and len(stranded) == 1, (sg.exists(), stranded)
+    assert (stranded[0] / "0" / "world" / "Level.sav").read_bytes() == b"live-world"
+
+    # The retry. It must not touch what is now the only copy of that world.
+    backups.restore(root, b.name, sg)
+    assert (sg / "0" / "world" / "Level.sav").read_bytes() == b"x" * 1024  # restored
+    still_there = backups.interrupted_restore(sg)
+    assert any(
+        (p / "0" / "world" / "Level.sav").read_bytes() == b"live-world" for p in still_there
+    ), "the retry destroyed the only copy of the pre-restore world"
+
+
+def test_recovery_puts_the_world_back_when_it_is_the_only_candidate(tmp_path: Path):
+    sg = make_savegames(tmp_path)
+    aside = sg.parent / f"{sg.name}{backups.PRE_RESTORE_PREFIX}2026-08-11_10-00-00Z"
+    shutil.move(str(sg), str(aside))
+    assert not sg.exists()
+
+    recovered = backups.recover_interrupted_restore(sg)
+
+    assert recovered == aside
+    assert (sg / "0" / "world" / "Level.sav").exists()
+    assert backups.interrupted_restore(sg) == []
+
+
+def test_recovery_refuses_to_choose_between_two_worlds(tmp_path: Path):
+    """Two candidates means two irreplaceable worlds and no basis to pick. A
+    human chooses; the daemon says so and stays out of it."""
+    sg = make_savegames(tmp_path)
+    for stamp in ("2026-08-11_10-00-00Z", "2026-08-11_11-00-00Z"):
+        (sg.parent / f"{sg.name}{backups.PRE_RESTORE_PREFIX}{stamp}").mkdir()
+    shutil.rmtree(sg)
+
+    assert backups.recover_interrupted_restore(sg) is None
+    assert len(backups.interrupted_restore(sg)) == 2
+
+
+def test_recovery_is_a_no_op_when_a_world_is_present(tmp_path: Path):
+    """An archive that failed leaves a copy behind on a perfectly healthy
+    install. Recovery must not mistake that for an interrupted transaction."""
+    sg = make_savegames(tmp_path)
+    (sg.parent / f"{sg.name}{backups.PRE_RESTORE_PREFIX}2026-08-11_10-00-00Z").mkdir()
+    assert backups.recover_interrupted_restore(sg) is None
+    assert (sg / "0" / "world" / "Level.sav").exists()
+
+
+# ---------------- what counts as a backup ----------------
+#
+# Being a directory under backup_root used to be the whole test, so restore()
+# and delete() accepted anything found there — while prune() checked the name
+# pattern before deleting. The backup root is routinely a folder the admin
+# already had; retention is written to tolerate exactly that.
+
+
+def test_an_unrelated_folder_is_not_restorable_or_listed(tmp_path: Path):
+    root = tmp_path / "shared_disk"
+    _mkbackup(root, "2026-08-11_16-00-00Z-scheduled")
+    (root / "Photos").mkdir()
+    (root / "Tax Returns").mkdir()
+
+    assert [b.name for b in backups.listing(root)] == ["2026-08-11_16-00-00Z-scheduled"]
+    assert backups.is_restorable(root, "Photos") is False
+    with pytest.raises(ValueError, match="Not a palctl backup"):
+        backups.restore(root, "Photos", tmp_path / "SaveGames")
+    with pytest.raises(ValueError, match="Not a palctl backup"):
+        backups.delete(root, "Photos")
+    assert (root / "Photos").exists() and (root / "Tax Returns").exists()
+
+
+def test_a_copy_still_being_written_is_not_restorable(tmp_path: Path):
+    """create() and mirror() stage under `.partial` and rename on completion, so
+    a `.partial` directory is one whose files are still arriving. listing() hid
+    it; restore() would take it if you named it."""
+    root = tmp_path / "backups"
+    _mkbackup(root, "2026-08-11_16-00-00Z-scheduled.partial")
+
+    assert backups.listing(root) == []
+    assert backups.is_restorable(root, "2026-08-11_16-00-00Z-scheduled.partial") is False
+    with pytest.raises(ValueError):
+        backups.restore(root, "2026-08-11_16-00-00Z-scheduled.partial", tmp_path / "SaveGames")
+
+
+def test_hand_annotated_backup_names_still_work(tmp_path: Path):
+    """The pattern anchors the timestamp prefix only, so an admin who renames a
+    backup to keep it doesn't lose the ability to restore it."""
+    root = tmp_path / "backups"
+    _mkbackup(root, "2026-08-11_16-00-00Z-manual-BEFORE-THE-BIG-BUILD")
+    assert backups.is_restorable(root, "2026-08-11_16-00-00Z-manual-BEFORE-THE-BIG-BUILD")
+    assert len(backups.listing(root)) == 1
+
+
+def test_legacy_local_time_names_are_still_backups(tmp_path: Path):
+    """Everything written before the switch to UTC stamps."""
+    root = tmp_path / "backups"
+    _mkbackup(root, "2026-01-01_00-00-00-manual")
+    assert backups.is_restorable(root, "2026-01-01_00-00-00-manual")
+    assert len(backups.listing(root)) == 1
