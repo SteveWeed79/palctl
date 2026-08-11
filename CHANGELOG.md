@@ -11,6 +11,13 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Security
+- **Any folder inside the backup folder could be restored over your world.**
+  Restoring and deleting asked only "is this a directory in the backup folder",
+  while retention had always required palctl's own naming before removing
+  anything. Since the backup folder is often one you already had, your own
+  folders appeared in the dashboard's restore list — and a copy that was still
+  being written could be restored by name. All four now agree on what a backup
+  is. Hand-renamed backups and ones taken before this release still restore.
 - **A malformed reply from the Palworld API could leave a sick server
   unrecovered.** The metrics parser coerced with bare `int()`/`float()`, so a
   garbled field raised `ValueError` rather than the `PalApiError` the daemon's
@@ -44,6 +51,52 @@ Installers for every release are on the
   target directory. Members are checked for containment now, and links dropped.
 
 ### Fixed
+- **A restore that failed said it had succeeded.** The likeliest restore
+  failure — running out of disk while staging the copy — never touches the
+  world, and that was the case the handler fell through: it started the server
+  again and reported "✅ Server back up after restore". Restarting the untouched
+  world is still right, but it now says the restore did *not* happen, and every
+  surface reports it as a failure.
+- **A retry after an interrupted restore could destroy the world as it stood.**
+  A restore renames the live world aside, then renames the restored copy into
+  place; between those two the copy set aside is the only one there is. It had a
+  fixed name that the next attempt deleted on the way in, so retrying after an
+  interrupted restore discarded it. Names are timestamped now, nothing deletes
+  one automatically, a failed swap puts the old world straight back, and a
+  restore interrupted anyway is recovered — including when the daemon restarts
+  mid-restore, before anything can start a server with no world and have
+  Palworld generate a fresh one.
+- **A restore no longer starts if there isn't room for it.** It stages a whole
+  second copy of the world beside the live one; nothing checked the drive had
+  space, so a restore onto a nearly-full disk stopped the server, copied until
+  the volume filled, and failed. Checked before the countdown now, so nothing
+  is stopped.
+- **The backup folder can't be set somewhere that eats itself.** Blank (which
+  means "wherever palctl started", for a service somewhere under system32),
+  inside the world folder (every backup would copy the world into itself), or
+  containing the world folder (retention deletes under it) are all refused with
+  the reason.
+- **Memory and CPU could be read from the wrong server.** With two Palworld
+  servers on one box — a test instance, or a leftover second service — palctl
+  matched on executable name alone and monitored whichever one Windows listed
+  last, so the dashboard's figures and the whole memory-leak watchdog could be
+  about the other server. It now follows the configured server folder, and says
+  which processes it found rather than guessing when it genuinely can't tell.
+- **The memory graph lost exactly the period worth looking at.** Memory was
+  only recorded after the game's REST API answered, so a server struggling
+  enough to time out stopped being measured — during the run-up the leak
+  forecast exists to catch. The OS reading is taken either way now, and the
+  chart shows a gap rather than a fake zero.
+- **"Memory — last 2 hours" now shows two hours.** The dashboard was served
+  half of what was kept: one hour at the default poll interval, and a different
+  span at any other. The graph also spaced samples evenly regardless of when
+  they were taken, so an outage was squeezed into the width of a normal gap.
+  Both now go by the timestamps. The desktop app's trend lines no longer draw
+  the same reading five times over.
+- **The dashboard says how an operation ended.** Starting a restore answered
+  "✓ Sent" and never mentioned it again — a failed restore looked exactly like
+  a successful one. `/state` now publishes the last operation's outcome, and
+  the dashboard reports it when it lands.
 - **Backup retention could delete the newer of two backups, once a year.**
   Backup directories were named in local time and retention ordered them by
   name, so through a daylight-saving fall-back — when the local clock repeats an

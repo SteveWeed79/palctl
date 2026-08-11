@@ -3,6 +3,7 @@ systemd. The parsers and command builders are pure, so both platforms' logic is
 checked on whatever OS runs the tests."""
 
 import asyncio
+import os
 import subprocess
 import sys
 import time
@@ -93,11 +94,18 @@ class _FakeEnumProc:
     """Stand-in for psutil.Process during enumeration. `name=None` models a name
     psutil couldn't read across a privilege boundary."""
 
-    def __init__(self, name, *, children=None, owner=None):
+    def __init__(self, name, *, children=None, owner=None, exe=None, pid=0):
         self._name = name
         self.info = {"name": name}
         self._children = children or []
         self._owner = owner
+        self._exe = exe
+        self.pid = pid
+
+    def exe(self):
+        if self._exe is None:
+            raise psutil.AccessDenied()
+        return self._exe
 
     def name(self):
         if self._name is None:
@@ -224,7 +232,7 @@ def test_proc_stats_reports_cpu_on_the_very_first_read(monkeypatch):
     # status` right after start) must still get a real CPU number. proc_stats
     # samples over a real window, so even a brand-new process object reads > 0.
     proc = _FakeMetricsProc(cpu_raw=800.0)  # raw per-core sum
-    monkeypatch.setattr(procs, "find_process", lambda: proc)
+    monkeypatch.setattr(procs, "find_process", lambda _root=None: proc)
     monkeypatch.setattr(procs.psutil, "cpu_count", lambda: 8)
 
     stats = procs.proc_stats()
@@ -238,7 +246,7 @@ def test_proc_stats_samples_cpu_outside_oneshot(monkeypatch):
     # value against itself and reads 0.0. The CPU sample must happen before the
     # oneshot block, or the bug comes straight back.
     proc = _FakeMetricsProc(cpu_raw=100.0)
-    monkeypatch.setattr(procs, "find_process", lambda: proc)
+    monkeypatch.setattr(procs, "find_process", lambda _root=None: proc)
     monkeypatch.setattr(procs.psutil, "cpu_count", lambda: 1)
 
     assert procs.proc_stats() is not None
@@ -246,7 +254,7 @@ def test_proc_stats_samples_cpu_outside_oneshot(monkeypatch):
 
 
 def test_proc_stats_returns_none_when_server_stopped(monkeypatch):
-    monkeypatch.setattr(procs, "find_process", lambda: None)
+    monkeypatch.setattr(procs, "find_process", lambda _root=None: None)
     assert procs.proc_stats() is None
 
 
@@ -407,27 +415,27 @@ def test_wait_for_returns_true_as_soon_as_the_target_is_reached(monkeypatch):
 
 
 def test_account_check_is_inconclusive_when_no_process_is_visible(monkeypatch):
-    monkeypatch.setattr(procs, "find_process", lambda: None)
+    monkeypatch.setattr(procs, "find_process", lambda _root=None: None)
     checked, warning = procs.server_account_check("me")
     assert checked is False and warning is None
 
 
 def test_account_check_is_inconclusive_when_the_owner_cannot_be_read(monkeypatch):
-    monkeypatch.setattr(procs, "find_process", lambda: object())
+    monkeypatch.setattr(procs, "find_process", lambda _root=None: object())
     monkeypatch.setattr(procs, "process_owner", lambda p: None)
     checked, warning = procs.server_account_check("me")
     assert checked is False and warning is None
 
 
 def test_account_check_is_conclusive_when_the_accounts_match(monkeypatch):
-    monkeypatch.setattr(procs, "find_process", lambda: object())
+    monkeypatch.setattr(procs, "find_process", lambda _root=None: object())
     monkeypatch.setattr(procs, "process_owner", lambda p: "DESKTOP\\me")
     checked, warning = procs.server_account_check("me")
     assert checked is True and warning is None
 
 
 def test_account_check_is_conclusive_and_warns_on_a_split(monkeypatch):
-    monkeypatch.setattr(procs, "find_process", lambda: object())
+    monkeypatch.setattr(procs, "find_process", lambda _root=None: object())
     monkeypatch.setattr(procs, "process_owner", lambda p: "NT AUTHORITY\\SYSTEM")
     checked, warning = procs.server_account_check("me")
     assert checked is True
@@ -475,3 +483,71 @@ def test_processes_under_ignores_a_process_it_cannot_attribute(monkeypatch):
     # everyone with that setup. The post-update build check covers it instead.
     _fake_iter(monkeypatch, [_FakeExeProc(None)])
     assert procs.processes_under("/srv/PalServer") == []
+
+
+# ---------- which install is being watched ----------
+#
+# find_process used to collect candidates into a dict keyed by executable name,
+# so two Palworld servers on one box overwrote each other and whichever psutil
+# enumerated last became "the" server. Every memory and CPU reading, and the
+# leak watchdog's entire judgement, was then about a server the admin wasn't
+# looking at — a test instance beside the live one, or the leftover second
+# service the update path already guards against.
+
+# Built natively: _exe_under compares Path.parts, so a Windows-style literal
+# is one opaque part on Linux and would match nothing.
+LIVE_ROOT = os.path.join(os.sep, "PalServer")
+OTHER_ROOT = os.path.join(os.sep, "TestServer")
+LIVE_EXE = os.path.join(LIVE_ROOT, "Pal", "Binaries", "PalServer-Win64-Shipping.exe")
+OTHER_EXE = os.path.join(OTHER_ROOT, "Pal", "Binaries", "PalServer-Win64-Shipping.exe")
+
+
+def test_the_configured_install_is_the_one_watched(monkeypatch):
+    live = _FakeEnumProc("PalServer-Win64-Shipping.exe", exe=LIVE_EXE, pid=100)
+    test_box = _FakeEnumProc("PalServer-Win64-Shipping.exe", exe=OTHER_EXE, pid=200)
+    # Enumeration order deliberately puts the wrong one last — that is what the
+    # old dict handed back.
+    _fake_iter(monkeypatch, [live, test_box])
+
+    assert procs.find_process(LIVE_ROOT) is live
+    assert procs.find_process(OTHER_ROOT) is test_box
+
+
+def test_two_indistinguishable_servers_return_nothing_rather_than_a_guess(monkeypatch):
+    a = _FakeEnumProc("PalServer-Win64-Shipping.exe", exe=LIVE_EXE, pid=100)
+    b = _FakeEnumProc("PalServer-Win64-Shipping.exe", exe=LIVE_EXE, pid=101)
+    _fake_iter(monkeypatch, [a, b])
+
+    assert procs.find_process(LIVE_ROOT) is None, "a coin flip is worse than nothing"
+    # ...and the admin gets told which processes it could not choose between.
+    assert procs.candidates(LIVE_ROOT) == [(100, LIVE_EXE), (101, LIVE_EXE)]
+
+
+def test_an_unreadable_path_is_not_treated_as_someone_elses(monkeypatch):
+    """The cross-account split this module is full of warnings about: server as
+    SYSTEM, palctl as the login user, exe path unreadable. Excluding it would
+    switch the leak watchdog off on exactly the installs that already struggle
+    to see their server."""
+    hidden = _FakeEnumProc("PalServer-Win64-Shipping.exe", exe=None, pid=100)
+    _fake_iter(monkeypatch, [hidden])
+    assert procs.find_process(LIVE_ROOT) is hidden
+    assert procs.candidates(LIVE_ROOT) == [(100, "(path unreadable)")]
+
+
+def test_no_configured_root_still_finds_a_single_server(monkeypatch):
+    """Scoping is an improvement, not a new requirement — an install with no
+    server_root set behaves as before when there is only one server."""
+    only = _FakeEnumProc("PalServer-Win64-Shipping.exe", exe=LIVE_EXE, pid=100)
+    _fake_iter(monkeypatch, [only])
+    assert procs.find_process() is only
+    assert procs.find_process("") is only
+    assert procs.find_process(None) is only
+
+
+def test_a_server_from_another_install_is_not_watched(monkeypatch):
+    """Only the other install is running. Reporting *its* memory as this
+    server's is worse than reporting none."""
+    stranger = _FakeEnumProc("PalServer-Win64-Shipping.exe", exe=OTHER_EXE, pid=200)
+    _fake_iter(monkeypatch, [stranger])
+    assert procs.find_process(LIVE_ROOT) is None
+    assert procs.candidates(LIVE_ROOT) == []

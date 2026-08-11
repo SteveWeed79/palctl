@@ -886,11 +886,18 @@ def test_start_server_when_busy_returns_busy_without_claiming_intent(monkeypatch
 
 
 async def _armed(sched, timeout_ticks: int = 1000):
-    """Yield to the loop until the countdown has registered itself."""
-    for _ in range(timeout_ticks):
+    """Yield to the loop until the countdown has registered itself.
+
+    Bare `sleep(0)` yields to the event loop but never advances the clock, so it
+    can spin its whole budget without an `asyncio.to_thread` in the code under
+    test ever completing — the disk-space preflight restore_backup now runs
+    before arming is exactly that. Zero-sleeps first (nothing is slower for the
+    tests that don't need it), then real ones, so a worker thread gets a chance.
+    """
+    for i in range(timeout_ticks):
         if sched._countdown is not None:
             return True
-        await asyncio.sleep(0)
+        await asyncio.sleep(0 if i < 50 else 0.002)
     return False
 
 

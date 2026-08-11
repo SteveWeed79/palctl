@@ -305,6 +305,10 @@ class Sparkline(QLabel):
 
 
 class Dashboard(QWidget):
+    # Timestamp of the newest daemon sample already plotted, so a poll that
+    # returns the same reading again doesn't redraw it as a new point.
+    _last_sample_at: float | None = None
+
     def __init__(self) -> None:
         super().__init__()
         grid = QGridLayout(self)
@@ -359,11 +363,21 @@ class Dashboard(QWidget):
         self.tiles["In-game day"].setText(str(m.get("days", "—")))
         self.tiles["Base camps"].setText(str(m.get("base_camps", "—")))
 
+        # This window polls every 2s and the daemon samples every `poll_seconds`
+        # (10 by default), so pushing the newest sample on every poll drew each
+        # real reading about five times — a trend line whose x-axis was "how
+        # often this window asked", not time. `at` is what makes a sample new.
         hist = s.get("history") or []
-        if hist:
+        if hist and hist[-1].get("at") != self._last_sample_at:
             last = hist[-1]
-            self.fps_spark.push(float(last.get("fps", 0)))
-            self.mem_spark.push(float(last.get("memory_mb", 0)))
+            self._last_sample_at = last.get("at")
+            # A sample taken while the REST API wasn't answering carries the
+            # OS readings and omits the game ones; a gap is honest where a
+            # fabricated 0 FPS is not.
+            if "fps" in last:
+                self.fps_spark.push(float(last["fps"]))
+            if "memory_mb" in last:
+                self.mem_spark.push(float(last["memory_mb"]))
 
         self.events.clear()
         for e in reversed(s.get("events", [])):

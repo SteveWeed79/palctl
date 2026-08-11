@@ -68,6 +68,101 @@ def _stamp() -> str:
 BACKUP_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})(Z?)-")
 
 
+# Spare room demanded on the live-world volume before a restore stages its copy
+# there. 10% over the backup's own size: the staged copy is the only new thing,
+# but a volume filled to the last byte is one the game can't write a save to
+# either, and running out halfway through is worse than not starting.
+_RESTORE_HEADROOM = 1.10
+
+
+def check_root(backup_root: Path, savegames: Path) -> None:
+    """Raise ValueError if `backup_root` is not a place backups can safely live.
+
+    None of these are exotic — the field is a free-text path in a hand-editable
+    config file and in a GUI text box:
+
+    * Blank. `Path("")` is the current directory, so backups would be written
+      into (and pruned out of) whatever directory the daemon happened to start
+      in — for a Windows service, somewhere under system32.
+    * Inside the world. `create()` copies SaveGames into backup_root, so a root
+      under SaveGames copies the world into itself, and each backup includes
+      every previous one. That fills the disk the world lives on, which is the
+      failure backups exist to survive.
+    * Containing the world. Retention deletes directories under backup_root;
+      SaveGames must never be somewhere retention can reach.
+    """
+    root = Path(backup_root).expanduser()
+    world = Path(savegames).expanduser()
+    # Resolve so `..`, symlinks and drive-relative forms can't hide the overlap.
+    # strict=False: neither path has to exist yet at setup time.
+    root_r, world_r = root.resolve(), world.resolve()
+    # `Path("")` is `Path(".")`, so a blank field can't be caught by looking at
+    # the string — it has to be caught by where it lands, which is wherever the
+    # daemon happened to start. For a Windows service that is somewhere under
+    # system32, and retention would be deleting directories there.
+    if not str(backup_root).strip() or root_r == Path.cwd().resolve():
+        raise ValueError(
+            "The backup folder is blank, so backups would be written into "
+            f"whatever folder palctl started in ({root_r}) — and retention "
+            "would delete folders there. Set a real path (Settings → Backups), "
+            "on a different drive from the server if you can."
+        )
+    if root_r == world_r or world_r in root_r.parents:
+        raise ValueError(
+            f"The backup folder ({root}) is inside the world folder ({world}). "
+            "Every backup would copy the world into itself and fill the drive "
+            "the world lives on. Pick a folder outside the server, ideally on "
+            "another drive."
+        )
+    if root_r in world_r.parents:
+        raise ValueError(
+            f"The world folder ({world}) is inside the backup folder ({root}). "
+            "Backup retention deletes folders under the backup folder, and the "
+            "live world must never be somewhere it can reach."
+        )
+
+
+def _free_bytes(path: Path) -> int | None:
+    """Free bytes on the volume holding `path`, or None if it can't be read —
+    in which case callers proceed rather than refusing on a failed measurement."""
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return None
+
+
+def restore_space_shortfall(backup_root: Path, name: str, savegames: Path) -> str | None:
+    """None if there is room to restore `name`, otherwise a message saying so.
+
+    Restoring stages a whole second copy of the world next to the live one
+    before touching anything. Nothing checked there was room for it, so a
+    restore onto a nearly-full drive stopped the server, copied until the
+    volume filled, failed, and left the admin with an outage that achieved
+    nothing — on a disk now too full for the game to write a save either.
+
+    Separate from restore() so callers can ask *before* they stop the server;
+    restore() asks again as a backstop. Blocking (walks the backup) — call via
+    to_thread.
+    """
+    try:
+        src = _safe_backup_path(backup_root, name)
+    except ValueError:
+        return None  # not our call to report; is_restorable covers this
+    if not src.is_dir():
+        return None
+    need = int(_dir_size_mb(src) * 1_048_576 * _RESTORE_HEADROOM)
+    free = _free_bytes(savegames.parent)
+    if free is None or free >= need:
+        return None
+    gb = 1_073_741_824
+    return (
+        f"Not enough free space to restore `{name}`: it needs about "
+        f"{need / gb:.1f} GB free on the drive holding {savegames.parent}, "
+        f"which has {free / gb:.1f} GB. Nothing was changed. Free some space "
+        "(older backups, or move the backup folder to another drive) and retry."
+    )
+
+
 def is_backup_name(name: str) -> bool:
     """True for a directory palctl itself created and finished.
 
@@ -167,6 +262,7 @@ def create(
         raise FileNotFoundError(
             f"SaveGames not found at {savegames}. Check the server root path."
         )
+    check_root(backup_root, savegames)
 
     backup_root.mkdir(parents=True, exist_ok=True)
     dest = backup_root / f"{_stamp()}-{label}"
@@ -312,9 +408,17 @@ def restore(backup_root: Path, name: str, savegames: Path) -> str | None:
     happens when the live world is already correct, and a failure there costs
     only the convenience of the undo copy, which is left beside SaveGames.
     """
+    check_root(backup_root, savegames)
     src = _safe_backup_path(backup_root, name)
     if not src.is_dir():
         raise ValueError(f"Invalid backup: {name}")
+
+    shortfall = restore_space_shortfall(backup_root, name, savegames)
+    if shortfall:
+        # The backstop. Callers are expected to ask before they stop the server
+        # (the scheduler does), but a direct caller shouldn't get a half-staged
+        # copy and a full disk just for not knowing to.
+        raise ValueError(shortfall)
 
     staged = savegames.parent / f"{savegames.name}.partial-restore"
     if staged.exists():

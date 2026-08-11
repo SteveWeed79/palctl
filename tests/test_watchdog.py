@@ -50,7 +50,7 @@ def make_watchdog(monkeypatch, *, memory_mb, api, skip_if_players_online=True, s
     monkeypatch.setattr(
         watchdog_mod.procs,
         "proc_stats",
-        lambda: types.SimpleNamespace(memory_mb=memory_mb),
+        lambda _root=None: types.SimpleNamespace(memory_mb=memory_mb),
     )
 
     restarts = []
@@ -144,7 +144,7 @@ def make_fps_watchdog(monkeypatch, *, fps_api, min_fps=8, samples=2, memory_mb=1
     wd = Watchdog(cfg, fps_api, bus)
     monkeypatch.setattr(
         watchdog_mod.procs, "proc_stats",
-        lambda: types.SimpleNamespace(memory_mb=memory_mb),  # memory path stays quiet
+        lambda _root=None: types.SimpleNamespace(memory_mb=memory_mb),  # memory path stays quiet
     )
     restarts = []
 

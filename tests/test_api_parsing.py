@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import types
+from typing import ClassVar
 
 import pytest
 
@@ -146,10 +147,18 @@ def test_a_garbled_metrics_reply_still_reaches_auto_recovery():
 
     class _Stub:
         api = _client(json_value={"serverfps": "n/a"})
-        cfg = types.SimpleNamespace(watchdog=types.SimpleNamespace(crash_confirm_polls=3))
+        # server_root: the OS sample taken during REST trouble is scoped to the
+        # configured install, like every other process lookup.
+        cfg = types.SimpleNamespace(
+            watchdog=types.SimpleNamespace(crash_confirm_polls=3), server_root=""
+        )
         _api_fail_streak = 0
         _alive = True
         _last_metrics = object()
+        _history: ClassVar[list] = []
+
+        def _record_os_only_sample(self, _stats):
+            pass
 
         class bus:
             @staticmethod

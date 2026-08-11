@@ -416,7 +416,11 @@ async function act(what, body, confirmOpts) {
     if (r.status === 401) note("The daemon rejected the token — reopen with `palctl ui`.");
     else if (r.status === 409) note(d.error || "Busy — another operation is in progress.");
     else if (!r.ok) note(d.error ? `Failed: ${d.error}` : `Failed (HTTP ${r.status}).`);
-    else note("✓ Sent.");
+    // "Sent" is all that can honestly be said at this point — a restore takes
+    // minutes and the daemon answers as soon as it has accepted the job. The
+    // outcome arrives later on /state as `last_operation`, and render() below
+    // reports it, so a failed restore stops looking like a successful one.
+    else { pendingOp = what; note("✓ Started — watching for the result…"); }
   } catch {
     note("Lost the daemon — is it running?");
   }
@@ -424,6 +428,22 @@ async function act(what, body, confirmOpts) {
 }
 
 let running = false;  // service RUNNING, per the last /state
+// The operation this page started and is still waiting on, and the timestamp of
+// the newest `last_operation` already reported — so an outcome from before this
+// page loaded isn't announced as if it just happened.
+let pendingOp = null, seenOpAt = 0;
+
+function reportOperation(state) {
+  const last = state.last_operation;
+  if (!last || !last.at || last.at <= seenOpAt) return;
+  seenOpAt = last.at;
+  if (!pendingOp) return;          // somebody else's operation, or a stale one
+  pendingOp = null;
+  note(last.ok
+    ? `✓ ${last.op} finished.`
+    : `✗ ${last.op} did NOT complete${last.error ? `: ${last.error}` : ""}. ` +
+      "See the event log below.");
+}
 
 $("a-startstop").addEventListener("click", () => {
   if (running) {
@@ -571,6 +591,7 @@ function render(state) {
   why.textContent = parts.join(" · ");
 
   renderCountdown(state.countdown);
+  reportOperation(state);
 
   running = state.service === "RUNNING";
   $("actions-sec").hidden = false;
@@ -646,10 +667,20 @@ function drawSpark(limitMb) {
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   const ys = histData.map((s) => s.memory_mb);
   const yMax = Math.max(limitMb * 1.05 || 0, ...ys) || 1;
-  const x = (i) => (i / (histData.length - 1)) * W;
+  // Spaced by TIME, not by array index. Index spacing draws every sample the
+  // same distance apart, so a gap — the daemon restarting, or the REST API
+  // going quiet for ten minutes — was compressed into the width of one normal
+  // interval, and the run-up to a crash looked like a smooth line. The
+  // timestamps were already in the data; only the tooltip used them.
+  const t0 = histData[0].at, tN = histData[histData.length - 1].at;
+  const span = Math.max(1, tN - t0);
+  const x = (s, i) =>
+    (s.at ? (s.at - t0) / span : i / (histData.length - 1)) * W;
   const y = (v) => H - PAD - (v / yMax) * (H - 2 * PAD);
 
-  const pts = ys.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`);
+  const pts = histData.map(
+    (s, i) => `${x(s, i).toFixed(1)},${y(s.memory_mb).toFixed(1)}`
+  );
   let inner =
     `<path class="spark-fill" d="M0,${H} L${pts.join(" L")} L${W},${H} Z"></path>` +
     `<polyline class="spark-line" points="${pts.join(" ")}"></polyline>`;
@@ -685,9 +716,22 @@ box.addEventListener("mousemove", (ev) => {
   const svg = $("spark"), cursor = $("cursor"), tip = $("tip");
   const rect = svg.getBoundingClientRect();
   const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
-  const i = Math.round(frac * (histData.length - 1));
+  // Nearest in TIME, matching how the line is now drawn. Picking by index put
+  // the readout on a different sample than the one under the pointer wherever
+  // the intervals weren't even — which is exactly where someone is looking.
+  const t0 = histData[0].at, tN = histData[histData.length - 1].at;
+  const span = Math.max(1, tN - t0);
+  const target = t0 + frac * span;
+  let i = 0, best = Infinity;
+  histData.forEach((sample, k) => {
+    const at = sample.at ?? (t0 + (k / (histData.length - 1)) * span);
+    const d = Math.abs(at - target);
+    if (d < best) { best = d; i = k; }
+  });
   const s = histData[i];
-  const xv = (i / (histData.length - 1)) * svg.viewBox.baseVal.width;
+  // Snap the cursor to the sample, so the line and the readout agree.
+  const sx = s.at ? (s.at - t0) / span : i / (histData.length - 1);
+  const xv = sx * svg.viewBox.baseVal.width;
   cursor.setAttribute("x1", xv); cursor.setAttribute("x2", xv);
   cursor.style.opacity = 1;
   const when = s.at ? new Date(s.at * 1000).toLocaleTimeString() : "";

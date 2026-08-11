@@ -83,7 +83,9 @@ class Watchdog:
         if wd.fps_restart and wd.min_server_fps > 0 and await self._fps_tick():
             return
 
-        stats = await asyncio.to_thread(procs.proc_stats)  # psutil off the event loop
+        stats = await asyncio.to_thread(  # psutil off the event loop
+            procs.proc_stats, self._cfg.server_root
+        )
         if stats is None:
             self._over = 0
             return

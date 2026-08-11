@@ -754,6 +754,16 @@ class Scheduler:
         if not backups.is_restorable(Path(cfg.backup_root), name):
             await self._bus.emit(Event("error", f"Restore aborted: no such backup '{name}'."))
             return False
+        # Asked here, before the countdown and the stop: staging writes a second
+        # copy of the world beside the live one, and discovering mid-copy that
+        # there was never room costs an outage that achieved nothing — on a disk
+        # now too full for the game to save to either.
+        shortfall = await asyncio.to_thread(
+            backups.restore_space_shortfall, Path(cfg.backup_root), name, cfg.savegames_dir
+        )
+        if shortfall:
+            await self._bus.emit(Event("error", f"Restore aborted: {shortfall}"))
+            return False
 
         async with self._control.operation("restore"):
             self._set_intent(True)  # the server is meant to be up after a restore

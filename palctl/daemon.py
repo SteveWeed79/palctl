@@ -42,6 +42,16 @@ from .watchdog import Watchdog
 
 log = logging.getLogger("palctl.daemon")
 
+# How much history /state serves, and how much is kept. A DURATION, not a
+# sample count: it used to keep 720 samples and serve the newest 360, described
+# in the dashboard as "last 2 hours" — true only at the default 10s poll, and
+# the poll interval is a setting. At 30s polling the same 360 samples were
+# three hours of data under a two-hour heading.
+HISTORY_WINDOW_SECONDS = 2 * 3600
+# A ceiling so a very short poll interval can't grow the list without bound. At
+# the default 10s the window holds 720 samples, so this only binds below ~1.5s.
+HISTORY_MAX_SAMPLES = 5000
+
 # How long shutdown waits for cancelled background tasks to unwind before
 # finishing without them. Comfortably inside WinSW's and systemd's own stop
 # timeouts — see _graceful_shutdown for why this can't be unbounded.
@@ -331,6 +341,10 @@ class Daemon:
         # Rolling metrics for the GUI graphs and the leak forecaster. Seeded
         # from SQLite so a daemon restart doesn't blank the graphs.
         self._history: list[dict] = self.store.recent_metrics(720)
+        # How the last server-exclusive operation ended. Published on /state so
+        # a client that accepted a 200 for "restore queued" can find out whether
+        # the restore actually happened — see _record_operation_result.
+        self._last_operation: dict | None = None
         self._tasks: set[asyncio.Task] = set()
 
         # Crash/hang auto-recovery bookkeeping. ("palctl is doing this on
@@ -668,12 +682,41 @@ class Daemon:
 
         async def _run() -> None:
             try:
-                await coro
+                result = await coro
+            except Exception as e:
+                self._record_operation_result(name, ok=False, detail=str(e))
+                raise
+            else:
+                # These coroutines return False for "refused or failed" and True
+                # for "done" (restore_backup, update_server, restart_...); a
+                # None return is an operation with nothing to report, which is
+                # not a failure.
+                self._record_operation_result(
+                    name, ok=result is not False, detail=None
+                )
             finally:
                 self.control.clear_reservation(name)
 
         self._spawn(_run())
         return True
+
+    def _record_operation_result(self, name: str, *, ok: bool, detail: str | None) -> None:
+        """Remember how the last server-exclusive operation ended.
+
+        Accepting one of these answers 200 the moment it is queued, which is
+        the only honest answer — a restore takes minutes. But that left every
+        client saying "✓ Sent" and then having no way to learn what happened:
+        `/state` published `operation` while one was running and nothing at all
+        once it finished, so a restore that failed looked exactly like a
+        restore that worked. The event feed carried the reason, which helps
+        nobody building against the API.
+        """
+        self._last_operation = {
+            "op": name,
+            "ok": ok,
+            "at": time.time(),
+            "error": detail,
+        }
 
     def _countdown_response(self, what: str) -> web.Response:
         """Answer /action/cancel-countdown and /action/skip-countdown.
@@ -787,6 +830,10 @@ class Daemon:
                 # Don't keep serving the last-seen FPS/frametime/uptime next to a
                 # server that's down — /state would read as if it were still up.
                 self._last_metrics = None
+            # The OS can still be asked how much memory the process holds, and
+            # this is precisely when the answer matters — see the docstring.
+            os_stats = await asyncio.to_thread(procs.proc_stats, self.cfg.server_root)
+            self._record_os_only_sample(os_stats)
             await self._maybe_autorecover()
             return
 
@@ -807,7 +854,10 @@ class Daemon:
 
         await self.tracker.update(players)
 
-        stats = await asyncio.to_thread(procs.proc_stats)  # psutil enumeration off the loop
+        # Scoped to the configured install: on a box running two Palworld
+        # servers, matching on executable name alone monitored whichever one
+        # psutil enumerated last.
+        stats = await asyncio.to_thread(procs.proc_stats, self.cfg.server_root)
         self._last_metrics = metrics
 
         if first_poll:
@@ -826,9 +876,59 @@ class Daemon:
             "memory_mb": stats.memory_mb if stats else 0.0,
             "cpu": stats.cpu_percent if stats else 0.0,
         }
-        self._history.append(sample)
-        del self._history[:-720]  # ~2h at 10s polling
+        self._record_sample(sample)
         await asyncio.to_thread(self.store.log_metrics, sample)
+
+    def _record_sample(self, sample: dict) -> None:
+        """Append and trim by AGE, so the retained span means the same thing at
+        any poll interval."""
+        self._history.append(sample)
+        cutoff = sample["at"] - HISTORY_WINDOW_SECONDS
+        # Samples are appended in time order, so the first one inside the window
+        # is where the keepers start.
+        keep = 0
+        for i, s in enumerate(self._history):
+            if s.get("at", 0) >= cutoff:
+                keep = i
+                break
+        else:
+            keep = len(self._history) - 1
+        del self._history[:keep]
+        del self._history[:-HISTORY_MAX_SAMPLES]
+
+    def _history_window(self, now: float | None = None) -> list[dict]:
+        """The samples inside HISTORY_WINDOW_SECONDS of now.
+
+        Filtered on the timestamps rather than sliced by count, so what the
+        dashboard's "last 2 hours" heading claims is what it gets — at any poll
+        interval, and with the gaps left by REST outages still gaps.
+        """
+        cutoff = (time.time() if now is None else now) - HISTORY_WINDOW_SECONDS
+        return [s for s in self._history if s.get("at", 0) >= cutoff]
+
+    def _record_os_only_sample(self, stats) -> None:
+        """A memory/CPU reading taken when the game's REST API wasn't answering.
+
+        The OS sample doesn't depend on the REST API at all, but it was only
+        ever recorded after both REST calls succeeded — so history and the leak
+        forecaster went blind for the whole of any REST trouble. That is the
+        worst possible time to stop measuring memory: a server deep into a leak
+        is exactly a server whose API gets slow and starts timing out, and the
+        gap lands on the run-up the forecast is trying to see.
+
+        The game fields are OMITTED rather than zeroed. A chart that draws 0 FPS
+        and 0 players for an unreachable server is telling the admin something
+        that isn't true; a gap is telling them the truth.
+        """
+        if stats is None:
+            return
+        self._record_sample(
+            {
+                "at": time.time(),
+                "memory_mb": stats.memory_mb,
+                "cpu": stats.cpu_percent,
+            }
+        )
 
     async def _maybe_warn_account_mismatch(self) -> None:
         """Once per daemon run: if the server process runs under a different
@@ -843,7 +943,7 @@ class Daemon:
 
         try:
             checked, warning = await asyncio.to_thread(
-                procs.server_account_check, getpass.getuser()
+                procs.server_account_check, getpass.getuser(), self.cfg.server_root
             )
         except Exception:
             checked, warning = False, None
@@ -1275,7 +1375,9 @@ class Daemon:
             )
 
         async def state(_: web.Request) -> web.Response:
-            stats = await asyncio.to_thread(procs.proc_stats)  # psutil enum off the loop
+            stats = await asyncio.to_thread(  # psutil enum off the loop
+                procs.proc_stats, self.cfg.server_root
+            )
             service = await self._service_state_cached()
             return web.json_response(
                 {
@@ -1283,6 +1385,10 @@ class Daemon:
                     "alive": self._alive,
                     "restarting": self.watchdog.is_restarting,
                     "operation": self.control.current_op,
+                    # Null until one finishes. `operation` says what is running
+                    # now; this says how the last one ended, so "accepted" and
+                    # "succeeded" stop being the same observation.
+                    "last_operation": self._last_operation,
                     # The live restart/restore countdown, or None. Published so
                     # every client shows the same clock and the same two escape
                     # hatches — before this, a countdown was invisible to
@@ -1292,7 +1398,10 @@ class Daemon:
                     "metrics": asdict(self._last_metrics) if self._last_metrics else None,
                     "process": asdict(stats) if stats else None,
                     "players": [asdict(p) for p in self.tracker.online],
-                    "history": self._history[-360:],
+                    # By time, not by count. `[-360:]` was half the retained
+                    # samples — one hour at the default poll — under a
+                    # dashboard heading that says two.
+                    "history": self._history_window(),
                     "events": [
                         {"kind": e.kind, "message": e.message, "at": e.at.isoformat()}
                         for e in self.bus.recent(60)

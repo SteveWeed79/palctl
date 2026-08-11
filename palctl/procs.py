@@ -72,7 +72,28 @@ def _server_child_of(launcher: psutil.Process) -> psutil.Process | None:
     return kids[0] if len(kids) == 1 else None
 
 
-def find_process() -> psutil.Process | None:
+def _is_ours(p: psutil.Process, root: str | Path | None) -> bool:
+    """Whether `p` belongs to the install at `root`.
+
+    True when there is no root to compare against, and — deliberately — when
+    the executable path can't be read. That happens on the cross-account split
+    this module is full of warnings about (server as SYSTEM, palctl as the
+    login user), and treating "can't tell" as "not ours" would switch the leak
+    watchdog off on exactly the installs that already struggle to see their
+    server. Unreadable means unproven, not excluded.
+    """
+    if not root or not str(root).strip():
+        return True
+    try:
+        exe = p.exe()
+    except psutil.Error:
+        return True
+    if not exe:
+        return True
+    return _exe_under(exe, root)
+
+
+def find_process(server_root: str | Path | None = None) -> psutil.Process | None:
     """
     The real Palworld server process — the multi-GB PalServer-Win64-Shipping,
     never the thin launcher that spawns it (watching the launcher means the leak
@@ -84,25 +105,63 @@ def find_process() -> psutil.Process | None:
     fail to read the Shipping process's *name* during enumeration, so it never
     shows up by name and we'd settle for the idle ~7 MB launcher. If all we can
     see is a launcher, follow it to the real child it spawned instead.
+
+    `server_root` scopes the search to one install. Without it this matched on
+    executable name alone and collected candidates into a dict keyed by that
+    name — so a box running two Palworld servers (a test instance beside the
+    live one, or a leftover second service, which the update path already
+    guards against) silently monitored whichever psutil enumerated last. The
+    dashboard's memory and CPU, and the leak watchdog's whole judgement, were
+    then about a different server. Ambiguity that survives the scoping returns
+    None rather than a coin flip: see `candidates()` for what to tell the user.
     """
-    shipping: dict[str, psutil.Process] = {}
+    shipping: list[psutil.Process] = []
     launchers: list[psutil.Process] = []
     for p in psutil.process_iter(["name"]):
         name = p.info.get("name") or ""
         if name in SHIPPING_PROCESS_NAMES:
-            shipping[name] = p
+            shipping.append(p)
         elif name in LAUNCHER_PROCESS_NAMES:
             launchers.append(p)
 
-    for name in SHIPPING_PROCESS_NAMES:  # the real server, seen directly — best
-        if name in shipping:
-            return shipping[name]
+    ours = [p for p in shipping if _is_ours(p, server_root)]
+    if len(ours) == 1:  # the real server, seen directly — best
+        return ours[0]
+    if len(ours) > 1:
+        return None  # two servers we can't tell apart; a guess would be worse
+
+    kids = []
     for launcher in launchers:  # only a launcher visible — follow it to the server
         child = _server_child_of(launcher)
-        if child is not None:
-            return child
+        if child is not None and _is_ours(child, server_root):
+            kids.append(child)
+    if len(kids) == 1:
+        return kids[0]
+    if len(kids) > 1:
+        return None
+
     # A launcher with no reachable child still beats returning nothing.
-    return launchers[0] if launchers else None
+    mine = [p for p in launchers if _is_ours(p, server_root)]
+    return mine[0] if len(mine) == 1 else None
+
+
+def candidates(server_root: str | Path | None = None) -> list[tuple[int, str]]:
+    """(pid, executable path) for every Palworld server process in scope.
+
+    What to show when find_process() returns None with processes running: the
+    admin can see which installs are live and shut the stray one down. Reported
+    rather than resolved on purpose — picking one of two servers to monitor is a
+    decision palctl has no basis to make.
+    """
+    out: list[tuple[int, str]] = []
+    for p in shipping_processes():
+        if not _is_ours(p, server_root):
+            continue
+        try:
+            out.append((p.pid, p.exe() or "(path unreadable)"))
+        except psutil.Error:
+            out.append((p.pid, "(path unreadable)"))
+    return sorted(out)
 
 
 # A single healthy server shows both a launcher and a Shipping process, so
@@ -202,7 +261,9 @@ def account_mismatch_warning(server_owner: str | None, daemon_user: str) -> str 
     )
 
 
-def server_account_check(daemon_user: str) -> tuple[bool, str | None]:
+def server_account_check(
+    daemon_user: str, server_root: str | Path | None = None
+) -> tuple[bool, str | None]:
     """(did we get a definitive answer, warning-or-None).
 
     The caller warns at most once per daemon run, so it needs to know the
@@ -216,7 +277,7 @@ def server_account_check(daemon_user: str) -> tuple[bool, str | None]:
 
     Blocking (psutil enumeration) — call via to_thread.
     """
-    proc = find_process()
+    proc = find_process(server_root)
     if proc is None:
         return False, None  # nothing to compare against yet; ask again later
     owner = process_owner(proc)
@@ -225,13 +286,15 @@ def server_account_check(daemon_user: str) -> tuple[bool, str | None]:
     return True, account_mismatch_warning(owner, daemon_user)
 
 
-def server_account_mismatch(daemon_user: str) -> str | None:
+def server_account_mismatch(
+    daemon_user: str, server_root: str | Path | None = None
+) -> str | None:
     """Find the server process, read its owner, and return
     account_mismatch_warning(...) or None. Blocking (psutil enumeration).
 
     Prefer server_account_check when the caller only reports once — this form
     can't tell "no mismatch" from "couldn't tell"."""
-    return server_account_check(daemon_user)[1]
+    return server_account_check(daemon_user, server_root)[1]
 
 
 # How long proc_stats() samples CPU for. cpu_percent measures work done over a
@@ -246,8 +309,8 @@ def boot_time() -> float:
     return psutil.boot_time()
 
 
-def proc_stats() -> ProcStats | None:
-    p = find_process()
+def proc_stats(server_root: str | Path | None = None) -> ProcStats | None:
+    p = find_process(server_root)
     if p is None:
         return None
     try:

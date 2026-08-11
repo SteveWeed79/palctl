@@ -447,7 +447,7 @@ class PalBot(discord.Client):
         # Both are blocking (sc.exe / a full psutil scan) — keep them off the
         # shared event loop.
         svc = await asyncio.to_thread(procs.service_state, self._cfg.service_name)
-        stats = await asyncio.to_thread(procs.proc_stats)
+        stats = await asyncio.to_thread(procs.proc_stats, self._cfg.server_root)
 
         e = discord.Embed(title="Palworld Server", colour=BLUE)
         e.add_field(name="Service", value=svc)
@@ -1058,7 +1058,7 @@ class PalBot(discord.Client):
         await interaction.followup.send(f"**{display}** — {mins / 60:.1f}h total{suffix}.")
 
     async def _health_embed(self) -> discord.Embed:
-        stats = await asyncio.to_thread(procs.proc_stats)
+        stats = await asyncio.to_thread(procs.proc_stats, self._cfg.server_root)
         wd = self._cfg.watchdog
         # frame_time is milliseconds and arrives as a float; starting both at
         # the same int made the fallback value the wrong type.

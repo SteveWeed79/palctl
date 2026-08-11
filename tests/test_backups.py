@@ -726,3 +726,79 @@ def test_legacy_local_time_names_are_still_backups(tmp_path: Path):
     _mkbackup(root, "2026-01-01_00-00-00-manual")
     assert backups.is_restorable(root, "2026-01-01_00-00-00-manual")
     assert len(backups.listing(root)) == 1
+
+
+# ---------------- where backups may live, and whether they fit ----------------
+
+
+def test_a_blank_backup_folder_is_refused(tmp_path: Path):
+    """Path("") is the current directory — for a Windows service, somewhere
+    under system32. The field is free text in a hand-editable config."""
+    sg = make_savegames(tmp_path)
+    # Path("") is Path("."), so the string is not what gives it away — where it
+    # lands is. Both spellings have to be caught.
+    with pytest.raises(ValueError, match="blank"):
+        backups.check_root(Path(""), sg)
+    with pytest.raises(ValueError, match="blank"):
+        backups.check_root(Path("."), sg)
+    with pytest.raises(ValueError, match="blank"):
+        backups.create(sg, Path(""))
+
+
+def test_a_backup_folder_inside_the_world_is_refused(tmp_path: Path):
+    """create() copies SaveGames into backup_root, so a root under SaveGames
+    copies the world into itself and every backup contains the last one."""
+    sg = make_savegames(tmp_path)
+    with pytest.raises(ValueError, match="inside the world folder"):
+        backups.create(sg, sg / "backups")
+    with pytest.raises(ValueError, match="inside the world folder"):
+        backups.restore(sg / "backups", "2026-08-11_16-00-00Z-manual", sg)
+
+
+def test_the_world_inside_the_backup_folder_is_refused(tmp_path: Path):
+    """Retention deletes directories under backup_root. The live world must
+    never be somewhere it can reach."""
+    sg = make_savegames(tmp_path)
+    with pytest.raises(ValueError, match="inside the backup folder"):
+        backups.check_root(tmp_path, sg)
+
+
+def test_a_backup_folder_beside_the_world_is_fine(tmp_path: Path):
+    sg = make_savegames(tmp_path)
+    backups.check_root(tmp_path / "backups", sg)  # must not raise
+    assert backups.create(sg, tmp_path / "backups").path.exists()
+
+
+def test_a_restore_that_would_not_fit_is_refused_before_anything_moves(
+    tmp_path: Path, monkeypatch
+):
+    """The staged copy is a whole second world. Running out halfway leaves the
+    admin with an outage that achieved nothing, on a disk now too full for the
+    game to write a save to."""
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+    b = backups.create(sg, root, "manual")
+    (sg / "0" / "world" / "Level.sav").write_bytes(b"live-world")
+
+    monkeypatch.setattr(backups, "_free_bytes", lambda p: 1024)  # a KB free
+
+    shortfall = backups.restore_space_shortfall(root, b.name, sg)
+    assert shortfall and "Not enough free space" in shortfall
+    with pytest.raises(ValueError, match="Not enough free space"):
+        backups.restore(root, b.name, sg)
+
+    # Nothing moved: the world is exactly as it was, no staging left behind.
+    assert (sg / "0" / "world" / "Level.sav").read_bytes() == b"live-world"
+    assert not (sg.parent / f"{sg.name}.partial-restore").exists()
+    assert backups.interrupted_restore(sg) == []
+
+
+def test_an_unreadable_volume_does_not_block_a_restore(tmp_path: Path, monkeypatch):
+    """A failed measurement is not a reason to refuse — the check exists to
+    catch a knowable problem, not to add a new way to fail."""
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+    b = backups.create(sg, root, "manual")
+    monkeypatch.setattr(backups, "_free_bytes", lambda p: None)
+    assert backups.restore_space_shortfall(root, b.name, sg) is None
+    assert backups.restore(root, b.name, sg) is None

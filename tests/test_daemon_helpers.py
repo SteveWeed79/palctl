@@ -545,8 +545,10 @@ def test_an_inconclusive_account_check_does_not_burn_the_one_shot():
 
     d.bus = _Bus()
 
+    # The check is scoped to the configured install now, so it takes the root.
+    d.cfg = types.SimpleNamespace(server_root=r"C:\\PalServer")
     results = iter([(False, None), (True, "the server runs as SYSTEM")])
-    daemon_mod.procs.server_account_check = lambda user: next(results)
+    daemon_mod.procs.server_account_check = lambda user, root=None: next(results)
     try:
         asyncio.run(d._maybe_warn_account_mismatch())
         assert d._account_warned is False, "an inconclusive check must not latch"
@@ -800,3 +802,132 @@ def test_a_bad_request_still_names_the_field():
     resp = asyncio.run(handler(_Req("unban")))
     assert resp.status == 400
     assert json.loads(resp.text) == {"error": "missing required field: user_id"}
+
+
+# ---------------- history means a span of time, not a count of samples -------
+
+
+def _hist_daemon():
+    d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+    d._history = []
+    return d
+
+
+def test_history_is_trimmed_by_age_not_by_sample_count():
+    """It kept the newest 720 samples and served the newest 360, described in
+    the dashboard as "last 2 hours" — true only at the default 10s poll, and the
+    poll interval is a setting."""
+    d = _hist_daemon()
+    now = 1_000_000.0
+    for i in range(500):
+        d._record_sample({"at": now - daemon_mod.HISTORY_WINDOW_SECONDS - 100 + i})
+    d._record_sample({"at": now})
+
+    kept = [s["at"] for s in d._history]
+    assert all(a >= now - daemon_mod.HISTORY_WINDOW_SECONDS for a in kept), kept[:3]
+    assert kept[-1] == now
+
+
+def test_history_window_is_served_by_timestamp():
+    d = _hist_daemon()
+    now = 1_000_000.0
+    d._history = [
+        {"at": now - 3 * 3600},  # outside
+        {"at": now - 600},  # inside
+        {"at": now},
+    ]
+    served = d._history_window(now=now)
+    assert [s["at"] for s in served] == [now - 600, now]
+
+
+def test_a_sample_taken_while_the_api_is_down_carries_the_os_readings():
+    """Memory is readable from the OS whether or not the game answers, and a
+    server deep into a leak is exactly the server whose API starts timing out —
+    so the gap landed on the run-up the forecast exists to see."""
+    d = _hist_daemon()
+    d._record_os_only_sample(types.SimpleNamespace(memory_mb=8192.0, cpu_percent=42.0))
+
+    assert len(d._history) == 1
+    sample = d._history[0]
+    assert sample["memory_mb"] == 8192.0 and sample["cpu"] == 42.0
+    # The game fields are absent rather than zeroed: a chart showing 0 FPS and 0
+    # players for an unreachable server states something untrue.
+    assert "fps" not in sample and "players" not in sample
+
+
+def test_no_process_means_no_fabricated_sample():
+    d = _hist_daemon()
+    d._record_os_only_sample(None)
+    assert d._history == []
+
+
+# ---------------- accepted is not the same as succeeded ----------------
+
+
+def _op_daemon():
+    d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+    d._last_operation = None
+    d.control = types.SimpleNamespace(
+        reserve=lambda name: True, clear_reservation=lambda name: None
+    )
+    d._spawn = lambda coro: asyncio.get_event_loop().create_task(coro)
+    return d
+
+
+def _run_op(d, name, coro):
+    async def main():
+        assert daemon_mod.Daemon._spawn_exclusive(d, name, coro) is True
+        for _ in range(50):
+            if d._last_operation is not None:
+                return
+            await asyncio.sleep(0.002)
+
+    asyncio.run(main())
+
+
+def test_a_finished_operation_publishes_its_outcome():
+    """A restore takes minutes, so 200-on-accept is the only honest answer to
+    the request — but /state then published nothing about how it ended, and
+    every client said "✓ Sent" whether it worked or not."""
+
+    async def worked():
+        return True
+
+    d = _op_daemon()
+    _run_op(d, "restore", worked())
+    assert d._last_operation["op"] == "restore"
+    assert d._last_operation["ok"] is True
+    assert d._last_operation["error"] is None
+
+
+def test_an_operation_that_refused_is_not_reported_as_done():
+    """restore_backup returns False for "refused or failed" — the exact case
+    that used to be indistinguishable from success."""
+
+    async def refused():
+        return False
+
+    d = _op_daemon()
+    _run_op(d, "restore", refused())
+    assert d._last_operation["ok"] is False
+
+
+def test_an_operation_that_raised_reports_the_reason():
+    async def exploded():
+        raise OSError("No space left on device")
+
+    d = _op_daemon()
+    _run_op(d, "backup", exploded())
+    assert d._last_operation["ok"] is False
+    assert "No space left" in d._last_operation["error"]
+
+
+def test_an_operation_with_nothing_to_report_is_not_a_failure():
+    """Plenty of these return None; that is "done", not "refused"."""
+
+    async def quiet():
+        return None
+
+    d = _op_daemon()
+    _run_op(d, "reload-config", quiet())
+    assert d._last_operation["ok"] is True
