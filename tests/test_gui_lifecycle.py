@@ -220,11 +220,8 @@ def test_call_does_not_construct_its_own_client(monkeypatch):
     """The regression itself: nothing in call() may reach for httpx.Client."""
     import httpx
 
-    monkeypatch.setattr(
-        httpx, "Client", lambda *a, **k: pytest.fail("call() built its own client")
-    )
     gui.close_http()
-    shared = gui._http()  # made before the guard would matter
+    shared = gui._http()  # built here, deliberately, while Client still works
 
     sent = {}
 
@@ -233,8 +230,13 @@ def test_call_does_not_construct_its_own_client(monkeypatch):
         raise httpx.ConnectError("nothing listening")
 
     monkeypatch.setattr(shared, "get", _get)
-    monkeypatch.setattr(gui, "_http", lambda: shared)
     monkeypatch.setattr(gui, "_auth_headers", dict)
+    # Armed last, and left in call()'s path: _http() returns the client built
+    # above without constructing one, so anything that trips this is call()
+    # reaching for its own again.
+    monkeypatch.setattr(
+        httpx, "Client", lambda *a, **k: pytest.fail("call() built its own client")
+    )
 
     with pytest.raises(gui.DaemonDown):
         gui.call("/state", timeout=2)

@@ -249,12 +249,12 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.12"
-      # The same dependency set the unit matrix installs, deliberately: PySide6
-      # would add a ~150MB download to type-check Qt's own surface, which
-      # `ignore_missing_imports` discards anyway. palctl's own code in
-      # palctl/gui is still checked — the tray attributes it fixed were found
-      # exactly like this. Config, including the win32 platform, lives in
-      # pyproject.toml so a local `mypy` matches this.
+      # The same dependency set the unit matrix installs. PySide6 is left out
+      # and it doesn't matter either way: pyproject.toml excludes palctl/gui
+      # from the check precisely so this answer can't depend on what happens to
+      # be installed — see the comment there. Everything else, including the
+      # win32 platform, lives in that config too, so a local `mypy` gives the
+      # same result as this job.
       - run: pip install httpx psutil keyring aiohttp discord.py certifi mypy
       - run: mypy
 

@@ -138,6 +138,20 @@ exclude_also = [
 [tool.mypy]
 python_version = "3.11"
 files = ["palctl"]
+# The GUI is out of scope, and the reason is the same one that got ruff pinned:
+# a gate whose answer depends on the environment isn't a gate. With PySide6
+# installed mypy reports ~28 findings in these three files; without it, none —
+# so a contributor running `mypy` after `pip install -e .[dev]` would see a
+# failure CI never does. Nearly all of them are Qt stub gaps rather than
+# defects (PySide6 accepts property keyword arguments at construction that its
+# stubs don't declare), so suppressing them would mean carrying ignores that
+# `warn_unused_ignores` then breaks on whenever PySide6 improves its stubs —
+# CI going red on somebody else's release schedule.
+#
+# The GUI is not unguarded: import-smoke imports every module under a real Qt,
+# and tests/test_gui_lifecycle.py drives the thread teardown that used to end
+# quitting the app in a crash dialog.
+exclude = "^palctl/gui/"
 # palctl is a Windows tool. Checked as win32 so `winreg` resolves — on Linux
 # typeshed hides it behind sys.platform and every registry call in startup.py,
 # discovery.py and preflight.py reads as an error against a module that isn't
