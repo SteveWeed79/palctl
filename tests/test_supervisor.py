@@ -27,21 +27,21 @@ from palctl.supervisor import (
 # A server that has crashed: it was up, palctl didn't stop it, the service still
 # reads RUNNING, and recovery is on. Every case below is this with one thing
 # changed, which is the point — the table shows what each input is worth.
-_CRASHED = dict(
-    service_state="RUNNING",
-    desired_running=True,
-    ever_alive=True,
-    seen_service_up=True,
-    busy=False,
-    restarting=False,
-    startup_pending=False,
-    recovery_enabled=True,
-    down_polls=0,
-    external_stop_polls=0,
-    recent_restarts=0,
-    confirm_polls=1,
-    restart_cap=3,
-)
+_CRASHED = {
+    "service_state": "RUNNING",
+    "desired_running": True,
+    "ever_alive": True,
+    "seen_service_up": True,
+    "busy": False,
+    "restarting": False,
+    "startup_pending": False,
+    "recovery_enabled": True,
+    "down_polls": 0,
+    "external_stop_polls": 0,
+    "recent_restarts": 0,
+    "confirm_polls": 1,
+    "restart_cap": 3,
+}
 
 
 def obs(**over) -> Observation:
@@ -183,9 +183,13 @@ def test_a_crashed_server_is_not_mistaken_for_a_deliberate_stop():
         ), state
 
 
-_CLEAR = dict(
-    enabled=True, ever_alive=True, busy=False, restarting=False, desired_running=True
-)
+_CLEAR = {
+    "enabled": True,
+    "ever_alive": True,
+    "busy": False,
+    "restarting": False,
+    "desired_running": True,
+}
 
 
 def test_phase_ignore_when_disabled_or_never_alive():

@@ -10,7 +10,7 @@ from pathlib import Path
 
 # procs is imported as a module, not by name: the tests patch service control
 # through this reference.
-from . import backups, countdown, procs, rclone, steamcmd  # noqa: F401
+from . import backups, countdown, procs, rclone, steamcmd
 from .api import PalApi
 from .config import Config
 from .control import ServerController

@@ -997,7 +997,7 @@ def test_restore_countdown_can_be_cancelled_leaving_the_world_alone(tmp_path, mo
 
 def test_restore_countdown_can_be_skipped(tmp_path, monkeypatch):
     calls: list = []
-    cfg, bus, sched = _countdown_sched(monkeypatch, calls)
+    cfg, _bus, sched = _countdown_sched(monkeypatch, calls)
     cfg.backup_root = str(tmp_path / "backups")
     cfg.server_root = str(tmp_path / "server")
     name = "2026-01-01_00-00-00-manual"

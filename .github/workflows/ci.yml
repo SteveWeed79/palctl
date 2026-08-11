@@ -50,7 +50,13 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install httpx psutil keyring aiohttp discord.py pytest
+      # PALCTL_NO_SKIPS makes a skipped scenario fail the job. pytest exits 0
+      # when every test it selected skips, so "the environment didn't come up"
+      # and "twelve end-to-end scenarios passed" were the same green check —
+      # on the one job whose whole purpose is to run tests that skip elsewhere.
       - run: pytest -v -m sim
+        env:
+          PALCTL_NO_SKIPS: "1"
 
   install-lifecycle:
     # Exercises the REAL install state machine against a real Windows SCM — the
@@ -206,7 +212,11 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install ruff
-      - run: ruff check palctl tests
+      # scripts/ is linted too. It was outside the selection while holding code
+      # CI actually runs — the changelog gate and the two smoke checks — so the
+      # only Python in the repo that gates a release was the only Python nothing
+      # checked.
+      - run: ruff check palctl tests scripts
 
   import-smoke:
     # The unit tests deliberately skip the GUI, daemon, and bot. This job proves
@@ -231,6 +241,17 @@ jobs:
           QT_QPA_PLATFORM: offscreen
           PYTHON_KEYRING_BACKEND: keyring.backends.null.Keyring
         run: python scripts/import_smoke.py
+      # The commands users type. Every other job reaches the daemon as
+      # `python -m palctl.daemon`, which resolves a module and never reads
+      # [project.scripts] — so a stale target there (module renamed, pyproject
+      # not followed) passes ruff, the unit suite and the import smoke, and
+      # ships a `palctl-daemon` that dies on launch. This is the only job with
+      # the package pip-installed, so it's the only one that can ask.
+      - name: The declared console scripts must exist and start
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHON_KEYRING_BACKEND: keyring.backends.null.Keyring
+        run: python scripts/entrypoint_smoke.py
       # The GUI's thread lifecycle needs a real QApplication, so it can only run
       # where Qt is installed — here. Quitting used to destroy the still-running
       # Poller, which makes Qt abort the process: the user's last interaction

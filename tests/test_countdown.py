@@ -9,6 +9,7 @@ down.
 """
 
 import asyncio
+from itertools import pairwise
 
 import pytest
 
@@ -51,7 +52,7 @@ def test_marks_sum_to_the_total():
     # them plus the final leg must add up to exactly the requested wait.
     for total in (10, 45, 90, 600, 1800):
         marks = countdown.marks_for(total)
-        gaps = [a - b for a, b in zip(marks, marks[1:], strict=False)]
+        gaps = [a - b for a, b in pairwise(marks)]
         assert sum(gaps) + marks[-1] == total
 
 

@@ -19,8 +19,8 @@ import pytest
 pytest.importorskip("aiohttp")
 pytest.importorskip("discord")
 
-import palctl.daemoncli as cli_mod  # noqa: E402
-from palctl.daemoncli import service_target  # noqa: E402
+import palctl.daemoncli as cli_mod
+from palctl.daemoncli import service_target
 
 
 def test_the_runtime_names_stay_importable_from_palctl_daemon():
@@ -95,7 +95,7 @@ def test_service_target_frozen_falls_back_when_daemon_exe_absent(tmp_path, monke
 
 def test_service_target_dev_uses_module_invocation(monkeypatch):
     monkeypatch.setattr(cli_mod.sys, "frozen", False, raising=False)
-    exe, args, _ = service_target()
+    _exe, args, _ = service_target()
     assert args == "-m palctl.daemon"
 
 

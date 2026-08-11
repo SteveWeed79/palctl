@@ -19,7 +19,7 @@ import pytest
 pytest.importorskip("aiohttp")
 pytest.importorskip("discord")
 
-from tests.sim.harness import Sim, running_server  # noqa: E402
+from tests.sim.harness import Sim, running_server
 
 pytestmark = [
     pytest.mark.skipif(

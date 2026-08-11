@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from check_changelog import check, normalize, sections  # noqa: E402
+from check_changelog import check, normalize, sections
 
 GOOD = """# Changelog
 

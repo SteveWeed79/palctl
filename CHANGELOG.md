@@ -10,6 +10,39 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+### Security
+- **A single non-ASCII character in the token header returned 500, not 401.**
+  `secrets.compare_digest` refuses non-ASCII `str` operands, so an accented
+  character left the daemon's auth middleware as an unhandled exception — and
+  did so *before* the rejection counter incremented, which is the one signal
+  that makes token-guessing visible on a LAN-bound daemon. A prober could stay
+  invisible just by including an accent in every attempt.
+- **Installer signature verification switched itself off for some account
+  names.** The VC++ installer path was interpolated into a single-quoted
+  PowerShell string and `%TEMP%` sits under the user profile, so on an account
+  like `Sean O'Brien` the quote closed the string early, the command failed to
+  parse, and the empty result reads as "couldn't check" — which lets the
+  installer through. It is the only integrity anchor behind a binary that
+  can't be hash-pinned.
+- **The SteamCMD tar fallback extracted without a filter** on Python
+  3.11.0–3.11.3, which `requires-python = ">=3.11"` permits (tarfile's `data`
+  filter arrived in 3.11.4), so a crafted archive could write outside the
+  target directory. Members are checked for containment now, and links dropped.
+
+### Fixed
+- **The libraries' failures never reached the log file.** Log handlers were
+  attached to the `palctl` logger alone, so aiohttp's request errors,
+  discord.py's rejected tokens and httpx's transport failures all fell through
+  to stderr — which the service wrapper discards. The 2am trail was missing
+  precisely the entries that explain an unresponsive daemon.
+- **A quoted number in `config.json` killed the memory-leak watchdog.** The
+  file is documented as hand-editable and nothing checked types at load, so
+  `"60"` for `poll_seconds` failed at the `sleep` at the *bottom* of the loop —
+  outside the guard wrapping each tick. The task died and the leak it exists to
+  catch went unwatched until someone restarted the daemon. Values are coerced
+  at the boundary now, and one that can't be read costs one field and one log
+  line.
+
 ## [1.2.7.0] — 2026-08-10
 
 ### Added
