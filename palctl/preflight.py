@@ -121,7 +121,7 @@ def is_elevated() -> bool | None:
     try:
         import ctypes
 
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except (ImportError, AttributeError, OSError):
         return None
 

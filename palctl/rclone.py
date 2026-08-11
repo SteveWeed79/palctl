@@ -18,7 +18,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .backups import BACKUP_NAME_RE
+from .backups import BACKUP_NAME_RE, sort_key
 
 # An rclone remote is `name:path`, where name is [A-Za-z0-9_-]+. A *single*
 # letter before the colon is a Windows drive (D:\Backups), not a remote — the
@@ -119,7 +119,11 @@ def listing(remote: str) -> list[str]:
     out = _run(["lsf", "--dirs-only", remote], timeout=_META_TIMEOUT).stdout
     names = [line.rstrip("/") for line in out.splitlines() if line.strip()]
     names = [n for n in names if BACKUP_NAME_RE.match(n)]
-    return sorted(names, reverse=True)
+    # Same ordering rule as backups.listing, from the same function: the remote
+    # can't be stat'd for a creation time the way a local directory can, so the
+    # name is all there is — and it has to be read as an instant, not a string,
+    # or remote retention purges the wrong copy through a DST fall-back.
+    return sorted(names, key=lambda n: (sort_key(n), n), reverse=True)
 
 
 def prune(remote: str, retain: int) -> list[str]:

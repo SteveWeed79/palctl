@@ -129,7 +129,7 @@ def _known(cls: type, raw: object, exclude: tuple[str, ...] = ()) -> dict:
     if not isinstance(raw, dict):
         return {}
     defaults = {
-        f.name: f.default for f in fields(cls) if f.name not in exclude  # type: ignore[arg-type]
+        f.name: f.default for f in fields(cls) if f.name not in exclude
     }
     out: dict = {}
     for key, value in raw.items():

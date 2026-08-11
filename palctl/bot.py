@@ -257,7 +257,9 @@ class PalBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         # One gate in front of every command, present and future — a per-handler
         # check would be one forgotten decorator away from a hole.
-        self.tree.interaction_check = self._guild_check
+        # Replacing the method IS discord.py's documented way to install a
+        # global check; there is no hook that takes a callable.
+        self.tree.interaction_check = self._guild_check  # type: ignore[method-assign]
         self._cfg = cfg
         self._api = api
         self._bus = bus
@@ -1036,6 +1038,9 @@ class PalBot(discord.Client):
             (p for p in online if p.name.lower() == name.lower() or p.user_id == name),
             None,
         )
+        # Declared before the branch: the online path always finds an id, the
+        # offline lookup may not, and the check below is what reconciles them.
+        uid: str | None
         if match is not None:
             uid, display, suffix = match.user_id, match.name, f", currently level {match.level}"
         else:
@@ -1055,7 +1060,9 @@ class PalBot(discord.Client):
     async def _health_embed(self) -> discord.Embed:
         stats = await asyncio.to_thread(procs.proc_stats)
         wd = self._cfg.watchdog
-        fps = frame_time = 0
+        # frame_time is milliseconds and arrives as a float; starting both at
+        # the same int made the fallback value the wrong type.
+        fps, frame_time = 0, 0.0
         try:
             m = await self._api.metrics()
             fps, frame_time = m.server_fps, m.server_frame_time

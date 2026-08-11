@@ -1,4 +1,5 @@
 import shutil
+from datetime import UTC
 from pathlib import Path
 
 import pytest
@@ -467,3 +468,90 @@ def test_prune_still_ignores_directories_that_are_not_ours(tmp_path):
     backups.prune(root, retain=1)
 
     assert mine.exists(), "a populated backup root must never lose the user's data"
+
+
+# ---------------- ordering through a DST fall-back ----------------
+#
+# Retention deletes from the end of the ordering, so the ordering is a
+# data-safety property, not a display one. The names used to be naive local
+# time: through a fall-back the local clock repeats an hour, so a backup taken
+# at 01:15 EST sorted as OLDER than one taken half an hour earlier at 01:45
+# EDT — and prune() deleted the newer copy while keeping the older, once a
+# year, silently.
+
+
+def test_the_stamp_is_utc_and_says_so():
+    """The `Z` is what makes a name readable as an instant later — and what
+    tells sort_key it doesn't have to guess a timezone."""
+    from datetime import datetime
+
+    name = backups._stamp()
+    assert name.endswith("Z"), name
+    parsed = datetime.strptime(name[:-1], "%Y-%m-%d_%H-%M-%S").replace(tzinfo=UTC)
+    assert abs((datetime.now(UTC) - parsed).total_seconds()) < 60
+    assert backups.BACKUP_NAME_RE.match(f"{name}-scheduled")
+
+
+def test_the_repeated_hour_no_longer_inverts_the_order():
+    """The exact scenario, in the zone where it bites: US Eastern, 2026-11-01.
+    01:45 EDT is 05:45 UTC; 01:15 EST, thirty minutes LATER, is 06:15 UTC.
+    Under the old local-time names ('01-45' vs '01-15') the later backup sorted
+    first, so prune kept it and deleted the newer one."""
+    earlier = "2026-11-01_05-45-00Z-scheduled"  # 01:45 EDT
+    later = "2026-11-01_06-15-00Z-scheduled"  # 01:15 EST, half an hour on
+    assert backups.sort_key(earlier) < backups.sort_key(later)
+    # ... while the naive local strings they replace are the wrong way round.
+    assert "2026-11-01_01-45-00-scheduled" > "2026-11-01_01-15-00-scheduled"
+
+
+def test_prune_keeps_the_newest_across_the_repeated_hour(tmp_path: Path):
+    root = tmp_path / "backups"
+    older = _mkbackup(root, "2026-11-01_05-45-00Z-scheduled")  # 01:45 EDT
+    newer = _mkbackup(root, "2026-11-01_06-15-00Z-scheduled")  # 01:15 EST
+
+    doomed = backups.prune(root, retain=1)
+
+    assert doomed == [older.name]
+    assert newer.exists(), "retention deleted the newer backup and kept the older"
+
+
+def test_legacy_names_still_sort_against_new_ones(tmp_path: Path, monkeypatch):
+    """An existing backup folder doesn't get renamed, so old and new names sit
+    side by side for one retention cycle. A legacy name is naive local time and
+    has to be read as such, or every pre-upgrade backup would sort as though it
+    were UTC and jump position by the size of the offset."""
+    import time
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("TZ can only be forced on POSIX")
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        # 2026-08-11 12:00 EDT == 16:00 UTC. The legacy name records the local
+        # reading; the new name records the UTC one. Same instant, so a new
+        # backup one minute later must sort after it.
+        legacy = backups.sort_key("2026-08-11_12-00-00-scheduled")
+        modern = backups.sort_key("2026-08-11_16-01-00Z-scheduled")
+        assert legacy < modern
+        assert legacy.utcoffset().total_seconds() == 0  # normalised to UTC
+
+        root = tmp_path / "backups"
+        old = _mkbackup(root, "2026-08-11_12-00-00-scheduled")
+        new = _mkbackup(root, "2026-08-11_16-01-00Z-scheduled")
+        assert [b.name for b in backups.listing(root)] == [new.name, old.name]
+        assert backups.prune(root, retain=1) == [old.name]
+    finally:
+        monkeypatch.delenv("TZ", raising=False)
+        time.tzset()
+
+
+def test_a_directory_that_is_not_ours_never_reorders_anything(tmp_path: Path):
+    """sort_key returns 'oldest' for a name it can't read. prune filters those
+    out before it ever gets here, but listing() shows them, and they must not
+    displace a real backup."""
+    root = tmp_path / "backups"
+    _mkbackup(root, "Photos")
+    real = _mkbackup(root, "2026-08-11_16-00-00Z-scheduled")
+    assert backups.listing(root)[0].name == real.name
+    assert backups.prune(root, retain=1) == []
+    assert (root / "Photos").exists()

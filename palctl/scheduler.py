@@ -931,7 +931,7 @@ class Scheduler:
         from .config import get_admin_password
         from .serversetup import ensure_rest_api, restore_user_settings
 
-        if ini_backup and await asyncio.to_thread(is_blank, ini):
+        if ini_backup is not None and await asyncio.to_thread(is_blank, ini):
             await asyncio.to_thread(shutil.copy2, ini_backup, ini)
             await self._bus.emit(
                 Event(

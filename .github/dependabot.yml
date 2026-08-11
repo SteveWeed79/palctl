@@ -1,0 +1,40 @@
+# Dependency updates.
+#
+# The workflows pin every third-party action by full commit SHA — the release
+# job runs with `contents: write` and produces the shipped binaries, so a
+# retargeted tag on any of them would be a supply-chain foothold. A SHA pin is
+# only half the job though: nothing was moving those pins, so a pinned action
+# with a known advisory would have stayed pinned to it indefinitely. Same for
+# the six runtime dependencies of a tool that ships as a Windows binary —
+# nothing scanned them, and nothing proposed an upgrade.
+#
+# Dependabot rewrites a SHA pin and updates the trailing `# vX.Y.Z` comment
+# with it, so the pinning convention survives the update.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      # One PR for the lot: these move together and each one costs a full CI
+      # run to review.
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: monthly
+    # The floors in pyproject.toml are deliberately low — palctl is installed
+    # into whatever environment the user already has, so raising a floor is a
+    # compatibility decision, not a routine bump. Security updates are the
+    # exception and are always worth seeing.
+    open-pull-requests-limit: 5
+    groups:
+      dev-tooling:
+        patterns: ["pytest*", "ruff", "mypy", "coverage*"]
+    commit-message:
+      prefix: "deps"

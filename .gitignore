@@ -4,6 +4,10 @@ __pycache__/
 *.db
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+# Coverage's data file and any report it writes.
+.coverage
+htmlcov/
 *.egg-info/
 dist/
 build/

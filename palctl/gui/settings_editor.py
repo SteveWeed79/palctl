@@ -393,7 +393,7 @@ class SettingsEditor(QWidget):
             selected = value if isinstance(value, list) else [str(value)] if value else []
             return MultiSelect(MULTI_CHOICES[key], selected)
 
-        lo, hi = RANGES.get(key, (None, None))  # type: ignore[assignment]
+        lo, hi = RANGES.get(key, (None, None))
 
         if kind == ValueKind.BOOL:
             w = QCheckBox()
@@ -403,7 +403,8 @@ class SettingsEditor(QWidget):
         if kind == ValueKind.INT:
             w = NoScrollSpinBox()
             w.setRange(int(lo) if lo is not None else -1, int(hi) if hi is not None else 1_000_000)
-            w.setValue(int(value))  # type: ignore[arg-type]
+            # object, narrowed by `kind` a few lines up — see inifile.render.
+            w.setValue(int(value))  # type: ignore[call-overload]
             return w
 
         if kind == ValueKind.FLOAT:

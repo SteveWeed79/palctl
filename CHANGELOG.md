@@ -11,6 +11,20 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Security
+- **A malformed reply from the Palworld API could leave a sick server
+  unrecovered.** The metrics parser coerced with bare `int()`/`float()`, so a
+  garbled field raised `ValueError` rather than the `PalApiError` the daemon's
+  poll handler catches. Auto-recovery was skipped entirely and the log filled
+  with "Poll failed" while nothing restarted the server. A body that isn't JSON
+  is now a failure too — it used to parse into an object full of defaults, so a
+  proxy error page served with HTTP 200 read as a healthy server with 0 players.
+- **A failed action no longer reports internal paths to the caller.** The
+  `/action` handler returned `str(e)` with a 500, which on an unexpected
+  exception carries filesystem paths and library internals to whoever holds the
+  token — the only boundary on a LAN-bound dashboard. The detail (with the
+  traceback) goes to the log; messages written *for* the admin, like the
+  Palworld API's "RESTAPIEnabled=True must be set in the LIVE
+  PalWorldSettings.ini", still come through unchanged.
 - **A single non-ASCII character in the token header returned 500, not 401.**
   `secrets.compare_digest` refuses non-ASCII `str` operands, so an accented
   character left the daemon's auth middleware as an unhandled exception — and
@@ -30,6 +44,26 @@ Installers for every release are on the
   target directory. Members are checked for containment now, and links dropped.
 
 ### Fixed
+- **Backup retention could delete the newer of two backups, once a year.**
+  Backup directories were named in local time and retention ordered them by
+  name, so through a daylight-saving fall-back — when the local clock repeats an
+  hour — a backup taken at 01:15 EST sorted as older than one taken half an hour
+  earlier at 01:45 EDT, and prune deleted the wrong end. New backups are stamped
+  in UTC and marked with `Z`; existing directories keep their names and are
+  still read correctly, and the same ordering now applies to the rclone remote.
+- **The update check never worked on the machines it was written for.** It
+  called `urlopen` directly instead of going through palctl's own download
+  helper, so it skipped the certifi fallback that exists because certificate
+  verification fails outright on a lot of real Windows boxes (antivirus doing
+  HTTPS interception, a stripped certificate store) — and a bare `except`
+  ensured nobody found out. It also read the response without a size limit.
+- **The desktop app opened a new connection to the daemon every two seconds.**
+  It built a fresh HTTP client per request while polling at 2s — roughly 1,800
+  connect/teardown cycles an hour, each leaving a socket in `TIME_WAIT`. One
+  client is now shared, as the daemon's own API client already did.
+- **`certifi` is a declared dependency.** It is the fallback certificate bundle
+  behind every palctl download, and it arrived only indirectly, through another
+  package's requirements.
 - **The libraries' failures never reached the log file.** Log handlers were
   attached to the `palctl` logger alone, so aiohttp's request errors,
   discord.py's rejected tokens and httpx's transport failures all fell through

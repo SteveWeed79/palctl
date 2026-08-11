@@ -7,6 +7,7 @@ clean skip beats erroring at collection (palctl.daemon imports both — aiohttp
 for its API server, discord via palctl.bot at module level)."""
 
 import asyncio
+import json
 import logging
 import time
 import types
@@ -687,3 +688,115 @@ def test_boot_intent_always_releases_the_startup_hold(monkeypatch, tmp_path):
     d._service_state_cached = _boom
     asyncio.run(d._restore_boot_intent())
     assert d._boot_intent_pending is False
+
+
+# ---------------- what a failed action tells the caller ----------------
+#
+# The handler used to end in `except Exception as e: {"error": str(e)}` with a
+# 500. On an unexpected exception that string carries filesystem paths, the
+# config directory layout and library internals — to whoever holds the token,
+# which on a LAN-bound dashboard is the only boundary there is.
+
+
+def _action_handler(stub):
+    """Pull the real /action handler out of the real router.
+
+    _routes() only touches self._token while building; every handler is a
+    closure, so a stub is enough to get at the genuine article rather than a
+    re-implementation of it.
+    """
+    app = daemon_mod.Daemon._routes(stub)
+    for route in app.router.routes():
+        if getattr(route.resource, "canonical", None) == "/action/{what}":
+            return route.handler
+    raise AssertionError("the /action route is gone")
+
+
+class _Req:
+    can_read_body = False
+
+    def __init__(self, what):
+        self.match_info = {"what": what}
+
+    async def json(self):
+        return {}
+
+
+def _failing_daemon(exc):
+    """A daemon whose "backup" action blows up with `exc`.
+
+    The raise lives in _spawn_exclusive, not in backup_now: Python resolves
+    `self._spawn_exclusive` before it evaluates the argument, so an exception
+    raised while building the argument never gets to be the interesting one.
+    """
+
+    def _spawn_exclusive(_name, _coro):
+        raise exc
+
+    return types.SimpleNamespace(
+        _token="t",
+        _spawn_exclusive=_spawn_exclusive,
+        scheduler=types.SimpleNamespace(backup_now=lambda _who: None),
+    )
+
+
+def test_an_unexpected_failure_does_not_hand_back_internals():
+    leaky = OSError(r"[Errno 13] Permission denied: 'C:\Users\Steve\AppData\Roaming\palctl'")
+    handler = _action_handler(_failing_daemon(leaky))
+
+    resp = asyncio.run(handler(_Req("backup")))
+
+    assert resp.status == 500
+    body = json.loads(resp.text)
+    assert "AppData" not in body["error"], body["error"]
+    assert "Errno 13" not in body["error"], body["error"]
+    assert "backup" in body["error"]
+    assert "log" in body["error"].lower(), "it has to say where the reason went"
+
+
+def test_the_reason_still_reaches_the_log():
+    """Genericising the reply only works if the detail is kept somewhere the
+    admin can actually read it — with the traceback, which str(e) never had."""
+    handler = _action_handler(_failing_daemon(OSError("disk went away")))
+    records = []
+    logger = logging.getLogger("palctl.daemon")
+    h = logging.Handler()
+    h.emit = records.append
+    logger.addHandler(h)
+    try:
+        asyncio.run(handler(_Req("backup")))
+    finally:
+        logger.removeHandler(h)
+
+    assert any("disk went away" in (r.exc_info[1].args[0] if r.exc_info else "") for r in records)
+    assert any(r.exc_info for r in records), "logged without the traceback"
+
+
+def test_a_palworld_api_failure_still_says_what_to_fix():
+    """The other half, and the reason this isn't a blanket rule. PalApiError
+    messages are written FOR the admin — 'RESTAPIEnabled=True must be set in
+    the LIVE PalWorldSettings.ini' is the answer to their question. Replacing
+    those with 'see the log' would take the answer away at the moment it's
+    needed."""
+    from palctl.api import PalApiUnreachable
+
+    guidance = "Can't reach the Palworld REST API. RESTAPIEnabled=True must be set."
+    handler = _action_handler(_failing_daemon(PalApiUnreachable(guidance)))
+
+    resp = asyncio.run(handler(_Req("backup")))
+
+    assert resp.status == 500
+    assert json.loads(resp.text)["error"] == guidance
+
+
+def test_a_bad_request_still_names_the_field():
+    """400s are authored too, and must not be swept into the generic reply."""
+    async def _unban(_user_id):  # never reached: require() raises first
+        raise AssertionError("unban should not have been called")
+
+    handler = _action_handler(
+        types.SimpleNamespace(_token="t", api=types.SimpleNamespace(unban=_unban))
+    )
+    resp = asyncio.run(handler(_Req("unban")))
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "missing required field: user_id"}

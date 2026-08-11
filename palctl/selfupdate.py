@@ -10,11 +10,14 @@ downloads or installs anything on its own.
 from __future__ import annotations
 
 import json
+import logging
 import urllib.request
 
-from . import __version__
+from . import __version__, fetch
 
 REPO = "SteveWeed79/palctl"
+
+log = logging.getLogger(__name__)
 
 
 def _parse_version(v: str) -> tuple[int, ...]:
@@ -41,17 +44,38 @@ def is_newer(current: str, latest: str) -> bool:
     return a > b
 
 
+# GitHub's release payload is a few KB; release notes make it variable, so the
+# cap is generous. It exists because `json.load(resp)` reads until EOF, and
+# "how much will the other end send" is not a question this module gets to
+# assume the answer to — a hung or hostile endpoint could otherwise stream
+# until the daemon runs out of memory.
+_MAX_BYTES = 1 << 20
+
+
 def latest_release(repo: str = REPO, timeout: float = 5.0) -> str | None:
-    # S310 is suppressed on the urlopen below: the URL is built from the
-    # https://api.github.com literal, so the scheme is fixed and there is
-    # nothing for the caller to redirect.
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-            tag = json.load(resp).get("tag_name")
+        # Through fetch.open_url, not urlopen: that module exists because
+        # certificate verification fails outright on a lot of real Windows
+        # boxes (AV doing HTTPS interception, a stripped cert store), and it
+        # retries against certifi's bundle. Calling urlopen directly meant the
+        # update check got none of that — so it silently never worked on
+        # precisely the machines fetch.py was written for, which are also the
+        # machines most likely to be running an old build.
+        with fetch.open_url(req, timeout=timeout) as resp:
+            body = resp.read(_MAX_BYTES + 1)
+        if len(body) > _MAX_BYTES:
+            log.debug("update check: release payload over %d bytes, ignoring", _MAX_BYTES)
+            return None
+        tag = json.loads(body).get("tag_name")
         return tag or None
-    except Exception:
+    except Exception as e:
+        # Best-effort by contract: a failed update check must never take the
+        # daemon down or block startup. It shouldn't be *invisible* either —
+        # this used to swallow the reason entirely, which is why the fallback
+        # above was missing for so long without anyone noticing.
+        log.debug("update check failed: %s: %s", e.__class__.__name__, e)
         return None
 
 

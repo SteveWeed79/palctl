@@ -10,8 +10,10 @@ a stripped-down cert store, or a server that sends an incomplete chain (Python
 doesn't do AIA fetching; browsers do, which is why "it works in Chrome").
 
 So: try the system trust first, and on a *verification* failure retry once
-against the CA bundle `certifi` ships (already installed — httpx depends on
-it). If both fail, raise with the actual story and what to do about it, instead
+against the CA bundle `certifi` ships (a declared dependency: it used to arrive
+only through httpx's own requirements, which made the one code path written for
+broken certificate environments rest on another package's transitive graph).
+If both fail, raise with the actual story and what to do about it, instead
 of the bare `_ssl.c:1010` that stops setup dead. Verification is never
 disabled — a failure still fails closed.
 """
@@ -23,9 +25,14 @@ import urllib.error
 import urllib.request
 
 
-def open_url(url: str, timeout: float):
+def open_url(url: str | urllib.request.Request, timeout: float):
     """urlopen with a certifi fallback on certificate-verification failure.
-    Returns the response object (caller uses it as a context manager)."""
+    Returns the response object (caller uses it as a context manager).
+
+    Takes a Request as well as a plain URL — urlopen always did, and the update
+    check needs one to send its Accept header. Passing the same object to both
+    attempts is safe: urlopen doesn't mutate it.
+    """
     try:
         return urllib.request.urlopen(url, timeout=timeout)  # noqa: S310
     except urllib.error.URLError as e:

@@ -138,8 +138,12 @@ class Option:
         """Produce the raw text for a new value, preserving Palworld's formatting."""
         if self.kind == ValueKind.BOOL:
             return "True" if value else "False"
+        # `value` is object because an ini value is whatever `kind` says it is;
+        # the kind check above IS the narrowing, and a checker can't follow it.
+        # (The suppressions here used to name [arg-type], a code neither line
+        # ever raised — written for a checker that was never run.)
         if self.kind == ValueKind.INT:
-            return str(int(value))  # type: ignore[arg-type]
+            return str(int(value))  # type: ignore[call-overload]
         if self.kind == ValueKind.FLOAT:
             # Palworld writes 6 decimal places. Match it, or the game may not parse.
             return f"{float(value):.6f}"  # type: ignore[arg-type]

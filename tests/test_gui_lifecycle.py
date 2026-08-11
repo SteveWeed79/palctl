@@ -185,3 +185,60 @@ def test_the_editor_warns_only_when_a_world_option_actually_exists(app, tmp_path
     assert "WorldOption.sav" in note
     assert "ExpRate" in note, "it should name the settings that will be ignored"
     assert "WorldOption.sav" in note.split("\n")[-1], "and give the path"
+
+
+# ---------------- one HTTP client, not one per request ----------------
+
+
+def test_the_daemon_client_is_shared_across_calls():
+    """call() used to build an httpx.Client per request while the Poller hits
+    /state every 2s — ~1,800 connect/teardown cycles an hour, each leaving a
+    socket in TIME_WAIT. PalApi already reuses one client and documents why."""
+    gui.close_http()
+    try:
+        first = gui._http()
+        assert gui._http() is first
+        assert not first.is_closed
+    finally:
+        gui.close_http()
+
+
+def test_closing_it_is_idempotent_and_it_rebuilds_afterwards():
+    """aboutToQuit can fire on a GUI that never made a call, and a client closed
+    at quit must not poison a client made after it."""
+    gui.close_http()
+    gui.close_http()  # no-op, must not raise
+    first = gui._http()
+    gui.close_http()
+    assert first.is_closed
+    second = gui._http()
+    assert second is not first and not second.is_closed
+    gui.close_http()
+
+
+def test_call_does_not_construct_its_own_client(monkeypatch):
+    """The regression itself: nothing in call() may reach for httpx.Client."""
+    import httpx
+
+    monkeypatch.setattr(
+        httpx, "Client", lambda *a, **k: pytest.fail("call() built its own client")
+    )
+    gui.close_http()
+    shared = gui._http()  # made before the guard would matter
+
+    sent = {}
+
+    def _get(url, **kw):
+        sent["timeout"] = kw.get("timeout")
+        raise httpx.ConnectError("nothing listening")
+
+    monkeypatch.setattr(shared, "get", _get)
+    monkeypatch.setattr(gui, "_http", lambda: shared)
+    monkeypatch.setattr(gui, "_auth_headers", dict)
+
+    with pytest.raises(gui.DaemonDown):
+        gui.call("/state", timeout=2)
+    # The per-call timeout has to survive the move off the constructor: /state
+    # polls at 2s and /action/stop can legitimately take 180.
+    assert sent["timeout"] == 2
+    gui.close_http()

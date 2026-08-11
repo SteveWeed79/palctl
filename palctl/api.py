@@ -32,6 +32,27 @@ class PalApiUnreachable(PalApiError):
     pass
 
 
+def _parse(what: str, build, data):
+    """Build a dataclass from a payload, turning malformed data into PalApiError.
+
+    Every caller of this client catches PalApiError and nothing else. The
+    builders below coerce with bare int()/float(), so a garbled field raised
+    ValueError (or TypeError, for a null where a number belongs) straight past
+    the daemon's poll handler: `except PalApiError` didn't match, so
+    _maybe_autorecover() was skipped entirely and the outer loop logged "Poll
+    failed" forever while a sick server was never recovered. The failure mode
+    this guards is a server that answers badly, which is exactly the server
+    recovery exists for.
+    """
+    try:
+        return build(data)
+    except (ValueError, TypeError, AttributeError, KeyError) as e:
+        raise PalApiError(
+            f"the Palworld API returned a {what} payload palctl could not read "
+            f"({e.__class__.__name__}: {e})"
+        ) from e
+
+
 @dataclass(frozen=True)
 class Metrics:
     server_fps: int
@@ -152,21 +173,36 @@ class PalApi:
         if not r.content:
             return {}
         try:
-            return r.json()
-        except ValueError:
-            return {"raw": r.text}
+            data = r.json()
+        except ValueError as e:
+            # This used to return {"raw": r.text}. Every from_json below reads
+            # its fields with .get(..., default), so that dict parsed cleanly
+            # into an object full of zeros — a proxy error page or a captive
+            # portal served with HTTP 200 came back as "0 players, 0 FPS,
+            # server up" rather than as a failure. A body we can't read is a
+            # failed read, and the callers already know what to do with one.
+            raise PalApiError(
+                f"{method} {path} did not return JSON (got {r.text[:120]!r})"
+            ) from e
+        if not isinstance(data, dict):
+            raise PalApiError(
+                f"{method} {path} returned a JSON {type(data).__name__}, expected an object"
+            )
+        return data
 
     # ---------- reads ----------
 
     async def info(self) -> ServerInfo:
-        return ServerInfo.from_json(await self._request("GET", "info"))
+        return _parse("info", ServerInfo.from_json, await self._request("GET", "info"))
 
     async def metrics(self) -> Metrics:
-        return Metrics.from_json(await self._request("GET", "metrics"))
+        return _parse("metrics", Metrics.from_json, await self._request("GET", "metrics"))
 
     async def players(self) -> list[Player]:
         data = await self._request("GET", "players")
-        return [Player.from_json(p) for p in data.get("players", [])]
+        return _parse(
+            "players", lambda d: [Player.from_json(p) for p in d.get("players", [])], data
+        )
 
     async def settings(self) -> dict:
         """Live active settings, read-only. Useful for detecting ini/runtime drift."""

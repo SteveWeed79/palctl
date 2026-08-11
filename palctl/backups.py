@@ -8,7 +8,7 @@ import re
 import shutil
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 # palctl's own settings/history, snapshotted INTO every backup so a dead disk
@@ -38,8 +38,25 @@ class Backup:
     consistent: bool = True
 
 
+_STAMP_FMT = "%Y-%m-%d_%H-%M-%S"
+
+
 def _stamp() -> str:
-    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    """The timestamp a backup directory is named for — UTC, marked with `Z`.
+
+    It used to be naive local time, and retention orders backups by name, so
+    through a DST fall-back the ordering stopped matching real time: the local
+    clock repeats an hour, and a backup taken at 01:15 EST sorts as older than
+    one taken half an hour earlier at 01:45 EDT. prune() deletes from the tail
+    of that order, so for one hour a year it deleted the newer copy and kept
+    the older — on the safety net, and silently.
+
+    UTC never repeats, so the name is monotonic and the string order is the
+    real order. Names written before this change carry no `Z` and are still
+    read (see `sort_key`), so an existing backup folder keeps working and
+    keeps sorting correctly against new ones.
+    """
+    return datetime.now(UTC).strftime(_STAMP_FMT) + "Z"
 
 
 # A palctl backup directory is "<stamp>-<label>" (see _stamp above). This
@@ -47,7 +64,33 @@ def _stamp() -> str:
 # location — a mirror on the user's whole drive, or an rclone remote with the
 # user's other folders in it — only ever prunes what palctl created, never the
 # user's own data. rclone.py imports this same pattern for the cloud mirror.
-BACKUP_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-")
+# `Z` is optional: directories created before the switch to UTC don't have it.
+BACKUP_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})(Z?)-")
+
+
+def sort_key(name: str) -> datetime:
+    """The instant a backup directory name stands for, as aware UTC.
+
+    Ordering backups is a data-safety operation — prune() deletes from the end
+    of it — so it runs on an instant rather than on the string. A `Z` name is
+    read as UTC. A legacy name is naive local time, which `astimezone` resolves
+    against the machine's zone; that is still ambiguous inside a repeated hour,
+    but such a name cannot record which side of the change it came from, so no
+    reading of it can do better. New names are exact.
+
+    A name that isn't ours sorts oldest. prune() never sees one — it filters on
+    BACKUP_NAME_RE first — so this only affects display order.
+    """
+    m = BACKUP_NAME_RE.match(name)
+    if not m:
+        return datetime.min.replace(tzinfo=UTC)
+    try:
+        dt = datetime.strptime(m.group(1), _STAMP_FMT)
+    except ValueError:  # matched the shape but isn't a real date (month 13)
+        return datetime.min.replace(tzinfo=UTC)
+    if m.group(2):
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)  # naive == local, by Python's rule
 
 
 def _dir_size_mb(path: Path) -> float:
@@ -172,7 +215,10 @@ def listing(backup_root: Path) -> list[Backup]:
         for d in backup_root.iterdir()
         if d.is_dir() and not d.name.endswith(".partial")  # skip in-progress copies
     ]
-    return sorted(out, key=lambda b: b.name, reverse=True)
+    # Newest first, by the instant the name stands for rather than by the
+    # string — see sort_key. The name breaks ties so the order stays
+    # deterministic when two backups share a second.
+    return sorted(out, key=lambda b: (sort_key(b.name), b.name), reverse=True)
 
 
 def _safe_backup_path(backup_root: Path, name: str) -> Path:

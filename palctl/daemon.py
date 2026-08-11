@@ -28,7 +28,7 @@ from aiohttp import web
 
 from . import backups, countdown, inifile, leak, localauth, netinfo, procs, supervisor
 from .alerts import WebhookAlerter
-from .api import PalApi, PalApiError, PalApiUnauthorized
+from .api import Metrics, PalApi, PalApiError, PalApiUnauthorized
 from .bot import run_bot
 from .client import DAEMON_PORT
 from .config import Config, config_dir, get_admin_password
@@ -39,6 +39,8 @@ from .logging_setup import setup_logging
 from .scheduler import Scheduler
 from .supervisor import Action, Observation, is_boot_start
 from .watchdog import Watchdog
+
+log = logging.getLogger("palctl.daemon")
 
 # How long shutdown waits for cancelled background tasks to unwind before
 # finishing without them. Comfortably inside WinSW's and systemd's own stop
@@ -61,7 +63,7 @@ def sd_notify(state: str) -> None:
 
         # An abstract-namespace socket path starts with '@' -> leading NUL.
         path = "\0" + addr[1:] if addr.startswith("@") else addr
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:  # type: ignore[attr-defined]
             s.connect(path)
             s.sendall(state.encode("utf-8"))
     except OSError:
@@ -322,7 +324,10 @@ class Daemon:
         # None = haven't polled yet; don't announce "up" just because the
         # daemon (not the server) was restarted.
         self._alive: bool | None = None
-        self._last_metrics = None
+        # Metrics | None, not None: the poll assigns a Metrics here, and
+        # /state reads it back. Left unannotated, a checker infers None from
+        # this line alone and calls every later assignment an error.
+        self._last_metrics: Metrics | None = None
         # Rolling metrics for the GUI graphs and the leak forecaster. Seeded
         # from SQLite so a daemon restart doesn't blank the graphs.
         self._history: list[dict] = self.store.recent_metrics(720)
@@ -1408,9 +1413,37 @@ class Daemon:
                 else:
                     return web.json_response({"error": f"unknown action {what}"}, status=400)
             except _BadRequest as e:
+                # Deliberate, and written for the admin: "'seconds' must be a
+                # whole number", "busy: restore is in progress". Saying exactly
+                # what to fix is the whole job of a 400.
                 return web.json_response({"error": str(e)}, status=400)
-            except Exception as e:
+            except PalApiError as e:
+                # palctl's own type, and its messages are written for the admin
+                # to act on ("RESTAPIEnabled=True is set in the LIVE
+                # PalWorldSettings.ini, not DefaultPalWorldSettings.ini"). They
+                # name the loopback URL the caller already knows and nothing
+                # else, so they pass through: replacing them with "see the log"
+                # would take away the answer at the moment it's needed.
+                log.warning("action %r failed: %s", what, e)
                 return web.json_response({"error": str(e)}, status=500)
+            except Exception:
+                # Everything else. str(e) on an *unexpected* exception carries
+                # filesystem paths, config directory layout and library
+                # internals, and this reply goes to whoever holds the token —
+                # which, on a LAN-bound dashboard, is the only boundary there
+                # is. Keep the detail (with the traceback, which str(e) never
+                # had anyway) in the log the admin can read, and hand back
+                # something that says where to look.
+                log.exception("action %r failed", what)
+                return web.json_response(
+                    {
+                        "error": (
+                            f"'{what}' failed unexpectedly. The reason is in the "
+                            "palctl log (Diagnostics → Open log folder)."
+                        )
+                    },
+                    status=500,
+                )
 
             return web.json_response({"ok": True})
 

@@ -9,7 +9,9 @@ server PC, which is exactly the situation you're trying to get out of.
 
 from __future__ import annotations
 
+import contextlib
 import sys
+import threading
 import weakref
 from collections import deque
 from collections.abc import Callable
@@ -78,6 +80,43 @@ def _auth_headers() -> dict:
     return {TOKEN_HEADER: _token_cache}
 
 
+# One client for the whole GUI, so the connection to the daemon is kept alive
+# instead of being rebuilt for every request. call() used to construct an
+# httpx.Client per call while the Poller hits /state every 2s — roughly 1,800
+# connect/teardown cycles an hour, each leaving a socket in TIME_WAIT, which on
+# Windows is the machine's most limited networking resource. PalApi already
+# reuses a single client and says why; this is the same reasoning at five times
+# the rate.
+#
+# httpx.Client is documented as thread-safe, which is what makes this usable
+# from the worker threads. Built lazily under a lock so two workers starting at
+# once can't each make one.
+_client: httpx.Client | None = None
+_client_lock = threading.Lock()
+
+
+def _http() -> httpx.Client:
+    global _client
+    with _client_lock:
+        if _client is None or _client.is_closed:
+            # No default timeout here: every call passes its own, and they
+            # range from 2s for a poll to 180s for a stop.
+            _client = httpx.Client()
+        return _client
+
+
+def close_http() -> None:
+    """Drop the shared connection. Wired to aboutToQuit next to the worker
+    drain — a live socket at interpreter shutdown is a noisy teardown on
+    Windows, and quit is exactly when the last poll has just finished."""
+    global _client
+    with _client_lock:
+        if _client is not None and not _client.is_closed:
+            with contextlib.suppress(Exception):
+                _client.close()
+        _client = None
+
+
 class DaemonError(RuntimeError):
     """A daemon call didn't succeed — always shown to the user as its own
     message, never a raw socket error or a bare HTTP status line."""
@@ -90,13 +129,13 @@ class DaemonDown(DaemonError):
 
 def call(path: str, body: dict | None = None, *, timeout: float = 10) -> dict:
     headers = _auth_headers()
+    c = _http()
     try:
-        with httpx.Client(timeout=timeout) as c:
-            r = (
-                c.post(f"{DAEMON}{path}", json=body or {}, headers=headers)
-                if body is not None or path.startswith("/action")
-                else c.get(f"{DAEMON}{path}", headers=headers)
-            )
+        r = (
+            c.post(f"{DAEMON}{path}", json=body or {}, headers=headers, timeout=timeout)
+            if body is not None or path.startswith("/action")
+            else c.get(f"{DAEMON}{path}", headers=headers, timeout=timeout)
+        )
     except httpx.RequestError as e:
         # Connection refused etc. — nothing is listening on the daemon port.
         raise DaemonDown(
@@ -526,7 +565,11 @@ class Console(QWidget):
         if on_ok is not None:
             w.ok.connect(lambda _line: on_ok())
         w.fail.connect(lambda err: self.log.append(f"❌ {err}"))
-        w.finished.connect(lambda: (self._workers.discard(w), w.deleteLater()))
+        def _retire() -> None:
+            self._workers.discard(w)
+            w.deleteLater()
+
+        w.finished.connect(_retire)
         w.start()
 
     def _announce(self) -> None:
@@ -1171,6 +1214,15 @@ class ConfigTab(QWidget):
 
 
 class Main(QMainWindow):
+    # Declared here rather than only where _tray() first assigns them. The tray
+    # is built well after the methods that read it, so a checker reading the
+    # class top-down can't work out what `self.tray` is and calls every use an
+    # error. `_tray_setup_action` is genuinely conditional — the tray menu only
+    # offers Setup on Windows — which is why its readers guard with hasattr.
+    tray: QSystemTrayIcon
+    _tray_state: str | None = None
+    _tray_setup_action: QAction
+
     def __init__(self) -> None:
         super().__init__()
         self.cfg = Config.load()
@@ -1340,7 +1392,6 @@ class Main(QMainWindow):
         self._set_tray_state("error", "palctl — can't reach the daemon")
 
     def _tray(self) -> None:
-        self._tray_state: str | None = None
         self.tray = QSystemTrayIcon(icons.tray_icon("idle"), self)
         self._tray_state = "idle"
         menu = QMenu()
@@ -1486,6 +1537,8 @@ def main() -> None:
     # Poller — which by design is always running — gets destroyed mid-run and Qt
     # aborts the process, so the last thing the user sees on "Quit" is a crash.
     app.aboutToQuit.connect(stop_all_workers)
+    # After the workers, not before: a poll still in flight needs the client.
+    app.aboutToQuit.connect(close_http)
 
     w = Main()
     guard.set_activation_target(w)
