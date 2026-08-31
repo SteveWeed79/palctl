@@ -396,6 +396,103 @@ def remove_service(name: str) -> None:
     _run(["sc.exe", "delete", name])
 
 
+# ---------------- start mode ----------------
+#
+# Setup registers the GAME service Manual whenever palctl runs as a boot service,
+# because palctl then owns starting it (see setup_flow.server_service_start_mode
+# and daemon._restore_boot_intent). That is a contract with two sides, and only
+# one of them was written down: nothing ever handed the job back. Switching
+# palctl to login startup, or removing it, left PalServer Manual with nothing
+# alive to start it — a server that silently never comes up again after a
+# reboot. These are what let the daemon lifecycle honour the other side.
+
+# `sc qc` prints e.g. "START_TYPE : 3   DEMAND_START". Only the modes palctl
+# can meaningfully act on; anything else reads as None ("don't touch it").
+_SC_START_TYPES = {
+    "AUTO_START": "Automatic",
+    "DEMAND_START": "Manual",
+    "DISABLED": "Disabled",
+}
+_SC_START_ARGS = {"Automatic": "auto", "Manual": "demand", "Disabled": "disabled"}
+
+
+def parse_start_mode(sc_qc_output: str) -> str | None:
+    """The start type from `sc qc` output, or None when it can't be read.
+
+    Pure, so the parsing is tested off Windows. DELAYED_AUTO_START is reported
+    by sc as AUTO_START too, which is the right answer here — both mean the SCM
+    starts it at boot.
+    """
+    for line in sc_qc_output.splitlines():
+        if "START_TYPE" not in line:
+            continue
+        for token, mode in _SC_START_TYPES.items():
+            if token in line:
+                return mode
+        return None
+    return None
+
+
+def start_mode_of(name: str) -> str | None:
+    """The service's current start mode, or None (off Windows, unknown service,
+    unparseable output)."""
+    if not sys.platform.startswith("win"):
+        return None
+    return parse_start_mode(_run(["sc.exe", "qc", name]).stdout)
+
+
+def set_start_mode(name: str, mode: str) -> bool:
+    """Change a registered service's start type in place.
+
+    `sc config` and not a WinSW re-registration on purpose: re-registering means
+    stop → delete → install, which would bounce a running game server and drop
+    its players, for a change that only concerns what happens at the NEXT boot.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    arg = _SC_START_ARGS.get(mode)
+    if arg is None:
+        raise ValueError(f"unknown start mode: {mode!r}")
+    # The space after `start=` is required by sc.exe's argument parser.
+    return _run(["sc.exe", "config", name, "start=", arg]).returncode == 0
+
+
+def sync_config_start_mode(cache_dir: Path, name: str, mode: str) -> bool:
+    """Point the stored WinSW config at `mode` too, so the file and the SCM
+    agree. True if the file was changed.
+
+    WinSW reads <startmode> only at install time, so this changes no behaviour
+    on its own — but config_is_current() compares this file byte-for-byte to
+    decide whether a wizard re-run can leave a healthy server alone. Leaving the
+    file saying Manual after sc.exe was told Automatic would make the next
+    re-run believe the registration is stale and stop, delete and re-create the
+    service — bouncing a live server for a difference palctl itself created.
+
+    A single line is substituted rather than the file regenerated, because
+    regenerating needs every original argument (account, args, timeouts) and
+    getting one of them subtly wrong here would rewrite the service definition
+    as a side effect of a start-mode change.
+    """
+    _, svc_xml = wrapper_paths(cache_dir, name)
+    try:
+        text = svc_xml.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    desired = f"  <startmode>{escape(mode)}</startmode>"
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.strip().startswith("<startmode>"):
+            if line.rstrip("\r\n") == desired:
+                return False  # already agrees
+            lines[i] = desired + line[len(line.rstrip("\r\n")):]
+            try:
+                svc_xml.write_text("".join(lines), encoding="utf-8")
+            except OSError:
+                return False
+            return True
+    return False
+
+
 def bundled_winsw(*, sha256: str = WINSW_SHA256) -> Path | None:
     """The WinSW copy shipped inside the frozen build (packaging places a
     hash-verified winsw.exe next to palctl's own exes at build time). ``None``

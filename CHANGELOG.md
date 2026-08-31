@@ -11,6 +11,28 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Fixed
+- **palctl took over starting your server at boot, then could give that job up
+  without handing it back.** Setup registers the PalServer service **Manual**
+  when palctl itself runs as a boot service, on purpose: palctl's daemon then
+  starts the server after a reboot, which is what lets a server you deliberately
+  stopped stay stopped. That trade only holds while a boot-time daemon exists to
+  keep its half — and nothing ever gave the job back. `palctl-daemon
+  install-startup` (switching to login startup) left a daemon that does not
+  exist until somebody signs in, so the server came up only if a human logged in
+  within fifteen minutes of boot, and on a headless box never. `palctl-daemon
+  uninstall-service`, and unticking background startup in setup, left PalServer
+  Manual with nothing alive to start it at all — a server that silently never
+  came back after any reboot, with no message anywhere and nothing in palctl
+  that checked for it. Those paths now set the service back to Automatic and say
+  so, so Windows resumes the job palctl is no longer doing. Only **Manual** is
+  touched: Automatic already boots, and **Disabled is left alone** — that is
+  somebody deliberately turning the server off, and quietly re-enabling it on
+  the way out would be palctl making a decision that isn't its to make. When the
+  change needs an administrator and palctl doesn't have one, it prints the exact
+  `sc config` command rather than leaving the server silently unbootable. The
+  stored WinSW config is updated to match, so a later setup re-run doesn't see a
+  stale registration and bounce a live server over it. Windows-only; on Linux
+  palctl never registers the game service.
 - **A daemon that could never start was restarted forever, invisibly.** Both
   service wrappers were told to restart on failure and never told when to stop.
   Some startup failures are permanent — another daemon already holding the
