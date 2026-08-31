@@ -30,11 +30,34 @@ def unit_file(
     event loop has *wedged* while the process stays alive. The daemon sends
     READY=1 once it's serving and WATCHDOG=1 every half-interval (see
     daemon.sd_notify / _liveness_loop); if the pings stop, systemd restarts it.
-    on-failure still covers real crashes."""
+    on-failure still covers real crashes.
+
+    StartLimit* is the other half of that, and without it Restart=on-failure is
+    a trap. Some startup failures are permanent: another daemon already holds
+    the control port (daemon.run logs it and re-raises), a config directory that
+    can't be written, a Python environment broken by a half-finished upgrade.
+    systemd would then restart the daemon every RestartSec forever — and at one
+    restart per 5s it stays *under* systemd's own default rate limiter (5 starts
+    per 10s), so the unit never reaches `failed` and never appears in
+    `systemctl --failed`. An operator sees a service that claims to be
+    activating, a game server nobody is supervising, and no clue why. A loop
+    that cannot succeed is not "keeping the daemon up"; it is hiding the reason
+    it is down.
+
+    Five failures inside five minutes is a crash loop by any reading, so the
+    unit stops and says so. A daemon that stays up longer than that clears the
+    count on its own, so a genuinely transient crash still recovers untouched.
+    The cause is already in the rotating file log (daemon.run and daemoncli.main
+    both write it there before exiting), so `systemctl status` plus that log is
+    enough to act on."""
     lines = [
         "[Unit]",
         f"Description={description or name}",
         "After=network.target",
+        # These two are [Unit] options, not [Service] ones — they moved in
+        # systemd 229 and are silently ignored under [Service] on anything newer.
+        "StartLimitIntervalSec=300",
+        "StartLimitBurst=5",
         "",
         "[Service]",
         "Type=notify",

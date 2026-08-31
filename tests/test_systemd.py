@@ -81,3 +81,52 @@ def test_a_hung_systemctl_reads_as_failure_not_an_exception(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert systemd._run(["systemctl", "start", "palctl"]).returncode != 0
+
+
+# ---------- the restart policy must be able to give up ----------
+
+
+def _section(unit: str, name: str) -> str:
+    """The body of one [Section] of a unit file. Placement matters here: the
+    StartLimit* directives moved to [Unit] in systemd 229 and are silently
+    ignored under [Service] on anything newer, so a test that only greps the
+    whole file would pass on a unit where they do nothing."""
+    blocks = unit.split("\n[")
+    for b in blocks:
+        head = b.lstrip("[").split("]", 1)
+        if head[0] == name:
+            return head[1] if len(head) > 1 else ""
+    raise AssertionError(f"no [{name}] section in:\n{unit}")
+
+
+def test_a_daemon_that_can_never_start_stops_instead_of_looping_forever():
+    """Restart=on-failure alone is a trap. Some startup failures are permanent —
+    another daemon already holds the control port, an unwritable config dir, a
+    half-upgraded environment — and RestartSec=5 then restarts forever. At one
+    restart per 5s that stays UNDER systemd's own default limiter (5 per 10s),
+    so the unit never reaches `failed`, never shows in `systemctl --failed`, and
+    the operator sees a service that looks like it is activating while nothing
+    supervises their server."""
+    unit = systemd.unit_file("palctl-daemon", "/usr/bin/python3 -m palctl.daemon")
+    u = _section(unit, "Unit")
+    assert "StartLimitIntervalSec=" in u, "no start rate limit — restarts forever"
+    assert "StartLimitBurst=" in u
+    # ...and the window must actually bite at RestartSec=5: the burst has to be
+    # reachable inside the interval, or the limiter never trips.
+    interval = int(u.split("StartLimitIntervalSec=")[1].split("\n")[0])
+    burst = int(u.split("StartLimitBurst=")[1].split("\n")[0])
+    restart_sec = int(unit.split("RestartSec=")[1].split("\n")[0])
+    assert burst * restart_sec < interval, (
+        f"{burst} restarts at {restart_sec}s each cannot fit in {interval}s — "
+        "the limiter would never trip"
+    )
+    # A daemon that stays up past the window clears its count, so an occasional
+    # transient crash is not walked toward give-up.
+    assert interval >= 60
+
+
+def test_start_limit_directives_are_not_hidden_in_the_service_section():
+    """They are [Unit] options since systemd 229; under [Service] they parse as
+    unknown and do nothing, which looks identical to this fix being present."""
+    unit = systemd.unit_file("palctl-daemon", "/usr/bin/true")
+    assert "StartLimit" not in _section(unit, "Service")

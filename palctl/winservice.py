@@ -148,7 +148,33 @@ def winsw_config_xml(
         lines.append(f'  <env name="APPDATA" value="{q(appdata)}"/>')
     lines += [
         f"  <startmode>{escape(start_mode)}</startmode>",
+        # Escalating retries, then stop — NOT an unbounded 5-second loop.
+        #
+        # WinSW applies the Nth <onfailure> to the Nth failure and repeats the
+        # last one forever, so a single `restart delay="5 sec"` entry restarts
+        # the daemon every five seconds for as long as it keeps failing. Some
+        # startup failures never stop failing: another daemon already holds the
+        # control port (daemon.run logs that and re-raises), an unwritable
+        # config dir, a Python environment broken by a half-finished upgrade.
+        # The service then sits in a permanent restart loop that accomplishes
+        # nothing, and services.msc shows it flickering rather than stopped, so
+        # the reason never surfaces.
+        #
+        # Three tries over ~85 seconds covers anything genuinely transient (a
+        # port not yet released, a volume still mounting). After that the
+        # service stops and stays stopped, which is a state a human can see —
+        # and on Windows it is not the end of the story anyway: the health task
+        # runs `palctl-daemon health-check` every five minutes and will try to
+        # start it again (daemoncli._heal_daemon), so recovery continues at a
+        # sane cadence instead of hammering.
         '  <onfailure action="restart" delay="5 sec"/>',
+        '  <onfailure action="restart" delay="20 sec"/>',
+        '  <onfailure action="restart" delay="60 sec"/>',
+        '  <onfailure action="none"/>',
+        # WinSW's default reset window is a day, which would let four unrelated
+        # crashes spread across it add up to "give up". An hour of clean uptime
+        # means the last failure is not part of a loop.
+        "  <resetfailure>1 hour</resetfailure>",
         # How long the wrapper waits on stop before killing the process. The
         # default suits the daemon; the GAME service gets longer (see
         # install_service callers) — PalServer flushes the world on the way

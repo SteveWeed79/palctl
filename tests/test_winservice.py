@@ -492,3 +492,35 @@ def test_config_is_current_notices_a_start_mode_change(tmp_path, monkeypatch):
     assert not winservice.config_is_current(
         tmp_path, "PalServer", "PalServer.exe", start_mode="Manual"
     )
+
+
+# ---------- the restart policy must be able to give up ----------
+
+
+def test_a_daemon_that_can_never_start_stops_instead_of_restarting_forever():
+    """WinSW applies the Nth <onfailure> to the Nth failure and repeats the LAST
+    one forever. A lone `restart delay="5 sec"` therefore restarts a daemon that
+    can never start — port already held, unwritable config dir, half-finished
+    upgrade — every five seconds for good. services.msc shows it flickering
+    rather than stopped, so the reason never surfaces, and nothing supervises
+    the game server the whole time."""
+    xml = winservice.winsw_config_xml("palctl-daemon", "palctl-daemon.exe")
+    failures = xml.count("<onfailure")
+    assert failures > 1, "a single onfailure entry repeats forever"
+    assert '<onfailure action="none"/>' in xml, "the ladder never gives up"
+    # The terminal entry must be last, or WinSW repeats a restart instead.
+    assert xml.rindex("<onfailure") == xml.rindex('<onfailure action="none"/>')
+    # Retries escalate rather than hammering at a fixed 5s.
+    delays = [
+        int(chunk.split('delay="')[1].split(" ")[0])
+        for chunk in xml.split("<onfailure")[1:]
+        if 'delay="' in chunk
+    ]
+    assert delays == sorted(delays) and len(set(delays)) > 1, delays
+
+
+def test_clean_uptime_resets_the_failure_count():
+    """WinSW's default reset window is a day, which would let four unrelated
+    crashes spread across it add up to 'give up'."""
+    xml = winservice.winsw_config_xml("palctl-daemon", "palctl-daemon.exe")
+    assert "<resetfailure>" in xml

@@ -11,6 +11,23 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Fixed
+- **A daemon that could never start was restarted forever, invisibly.** Both
+  service wrappers were told to restart on failure and never told when to stop.
+  Some startup failures are permanent — another daemon already holding the
+  control port, an unwritable config directory, a half-finished upgrade — and
+  the daemon would then be relaunched every five seconds for good. On Linux one
+  restart per 5 s stays *under* systemd's own default rate limiter (5 starts per
+  10 s), so the unit never reached `failed` and never appeared in
+  `systemctl --failed`; on Windows, WinSW repeats its last `<onfailure>` entry
+  indefinitely, so services.msc showed a service flickering rather than a
+  stopped one. Either way the operator saw a service that looked like it was
+  starting, a game server nobody was supervising, and no indication why. The
+  systemd unit now carries `StartLimitIntervalSec=300` / `StartLimitBurst=5` (in
+  `[Unit]`, where they have been since systemd 229 — under `[Service]` they are
+  silently ignored), and the WinSW config escalates 5 s → 20 s → 60 s and then
+  stops, with `<resetfailure>1 hour</resetfailure>` so clean uptime clears the
+  count. A transient failure still recovers untouched; a permanent one stops and
+  says so, and on Windows the five-minute health task keeps trying from there.
 - **The CPU reading was being divided into invisibility before you saw it.**
   Twice before, this was reported as "CPU always shows 0%" and twice it was fixed
   in the *sampling* — and the sampling has been right since. The number was then
