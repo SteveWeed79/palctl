@@ -425,6 +425,11 @@ class SetupWizard(QDialog):
                 register_server_service=self.reg_server.isChecked(),
                 daemon_startup=self._daemon_startup(),
             ),
+            # Same reason as setup_flow._preflight: a host whose server service
+            # was left Manual by an older uninstall has nothing starting it at
+            # boot, and the wizard is where they come looking.
+            service_name=self._cfg.service_name or "PalServer",
+            daemon_startup=self._daemon_startup(),
         )
         for c in checks:
             self.log.append(f"  {c.icon} {c.name}: {c.detail}")

@@ -407,8 +407,9 @@ def test_install_service_registers_the_health_task(monkeypatch):
     monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda: True)
     monkeypatch.setattr(cli_mod, "_stop_daemon_process", lambda: None)
 
-    def _register(exe, args="", *, every_minutes=5, as_system=False):
+    def _register(exe, args="", *, every_minutes=5, as_system=False, app_dir=None):
         registered["as_system"] = as_system
+        registered["app_dir"] = app_dir
         return True
 
     monkeypatch.setattr(wintask, "register_health_task", _register)
@@ -686,3 +687,33 @@ def test_both_exit_paths_hand_the_boot_start_back():
 
     assert "_hand_back_server_boot" in inspect.getsource(cli_mod.install_startup)
     assert "_hand_back_server_boot" in inspect.getsource(cli_mod.uninstall_service)
+
+
+def test_a_source_install_gives_the_health_task_somewhere_to_run(monkeypatch):
+    """service_target() yields `python -m palctl.daemon` outside a frozen build,
+    and a scheduled task runs from System32 — so without a working directory the
+    health check failed with "No module named palctl" every five minutes while
+    reporting success. The frozen build (absolute exe, no arguments) must stay
+    on the plain command it has always had."""
+    from palctl import wintask
+
+    seen: dict = {}
+
+    def _register(exe, args="", *, every_minutes=5, as_system=False, app_dir=None):
+        seen["exe"], seen["args"], seen["app_dir"] = exe, args, app_dir
+        return True
+
+    monkeypatch.setattr(wintask, "register_health_task", _register)
+    monkeypatch.setattr(cli_mod.sys, "platform", "win32")
+
+    monkeypatch.setattr(
+        cli_mod, "service_target", lambda: ("py.exe", "-m palctl.daemon", r"C:\src")
+    )
+    cli_mod._register_health_task(as_system=False)
+    assert seen["app_dir"] == r"C:\src", "a source install needs its checkout"
+
+    monkeypatch.setattr(
+        cli_mod, "service_target", lambda: (r"C:\app\palctl-daemon.exe", "", r"C:\app")
+    )
+    cli_mod._register_health_task(as_system=True)
+    assert seen["app_dir"] is None, "the frozen build resolves from anywhere"

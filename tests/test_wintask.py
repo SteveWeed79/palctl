@@ -88,3 +88,44 @@ def test_a_hung_schtasks_reads_as_failure_not_an_exception(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setattr(wintask, "_on_windows", lambda: True)
     assert wintask._run(["schtasks", "/Query"]).returncode != 0
+
+
+# ---------- the task has to be able to actually run ----------
+
+
+def test_a_frozen_install_needs_no_working_directory():
+    """An absolute exe with no arguments resolves from anywhere, so the
+    majority case keeps the plain command it has always had — no shell in front
+    of it."""
+    run = wintask.task_run_string(r"C:\app\palctl-daemon.exe")
+    assert run == r'"C:\app\palctl-daemon.exe" health-check'
+    assert "cmd" not in run
+
+
+def test_a_source_install_gets_a_working_directory():
+    """`schtasks /Create` has no working-directory option — that lives in the
+    task XML — so a task runs from the scheduler's own directory (System32).
+    For `python -m palctl.daemon` that means "No module named palctl", every
+    five minutes, forever, while register_health_task reported success because
+    schtasks had registered the task perfectly well."""
+    run = wintask.task_run_string(
+        r"C:\Python\python.exe", "-m palctl.daemon", r"C:\src\palctl"
+    )
+    assert run == (
+        r'cmd /c cd /d "C:\src\palctl" && "C:\Python\python.exe" '
+        r"-m palctl.daemon health-check"
+    )
+    # /d so it changes drive as well as directory.
+    assert "cd /d" in run
+
+
+def test_create_task_command_carries_the_working_directory():
+    cmd = wintask.create_task_command(
+        "py.exe", "-m palctl.daemon", app_dir=r"C:\src", as_system=True
+    )
+    tr = cmd[cmd.index("/TR") + 1]
+    assert tr.startswith('cmd /c cd /d "C:\\src" && ')
+    assert tr.endswith("health-check")
+    # The scheduling flags are unaffected by the wrapper.
+    assert "/SC" in cmd and "MINUTE" in cmd
+    assert "/RU" in cmd and "SYSTEM" in cmd

@@ -10,7 +10,32 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+### Added
+- **Setup now checks that something will actually start your server after a
+  reboot.** palctl sets the game service to Manual only when its own daemon runs
+  as a boot service and takes that job on; in every other arrangement Manual
+  means nothing starts the server, on any reboot, forever — and it produces no
+  error, because the daemon whose absence causes it isn't running to complain.
+  The readiness checks (both the CLI setup flow and the GUI wizard) now compare
+  the service's real start type against how palctl itself is set to start, and
+  say plainly which of the two is supposed to be doing it. This is what catches
+  anyone already left in that state by an uninstall from before the handback
+  existed. A Disabled service is reported but never called a failure — that is
+  somebody deliberately turning the server off.
+
 ### Fixed
+- **The hung-daemon health task could never run in a source install.**
+  `schtasks /Create` has no working-directory option — that lives in the task
+  XML — so a scheduled task runs from the scheduler's own directory. For a
+  frozen build that is harmless (an absolute path to `palctl-daemon.exe`, no
+  arguments), but a pip or source install runs `python -m palctl.daemon`, which
+  resolves `-m` against the current directory: the health check failed with "No
+  module named palctl" every five minutes, forever. Nothing noticed, because
+  `register_health_task` returned success — schtasks had registered the task
+  perfectly well; it was the task that could not run. So those installs had no
+  wedged-daemon recovery at all while being told they did. The command now
+  carries its checkout directory when it needs one; the frozen path is
+  unchanged.
 - **palctl took over starting your server at boot, then could give that job up
   without handing it back.** Setup registers the PalServer service **Manual**
   when palctl itself runs as a boot service, on purpose: palctl's daemon then

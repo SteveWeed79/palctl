@@ -280,6 +280,11 @@ def _preflight(plan: SetupPlan, log: Log) -> bool:
             register_server_service=plan.register_server_service,
             daemon_startup=plan.daemon_startup,
         ),
+        # Catches the state a pre-handback uninstall leaves behind: the game
+        # service still Manual, with no boot-time palctl left to start it. Setup
+        # is where such a host comes back, so it is where they have to be told.
+        service_name=plan.service_name,
+        daemon_startup=plan.daemon_startup,
     )
     blocking = False
     for c in checks:

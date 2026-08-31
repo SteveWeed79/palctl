@@ -378,8 +378,14 @@ def _register_health_task(*, as_system: bool) -> None:
         return
     from . import wintask
 
-    exe, args, _ = service_target()
-    if wintask.register_health_task(exe, args, as_system=as_system):
+    exe, args, app_dir = service_target()
+    # A source install's command is `python -m palctl.daemon`, which only
+    # resolves from the checkout — and a scheduled task runs from System32
+    # unless told otherwise. The frozen build needs no directory (absolute exe,
+    # no -m), so only pass one when there are arguments to resolve.
+    if wintask.register_health_task(
+        exe, args, as_system=as_system, app_dir=app_dir if args else None
+    ):
         print(
             "[daemon] health watchdog scheduled: every 5 minutes palctl checks "
             "itself and auto-restarts a hung daemon."
