@@ -48,9 +48,25 @@ LAUNCHER_PROCESS_NAMES = ("PalServer.exe", "PalServer.sh")
 class ProcStats:
     pid: int
     memory_mb: float
+    # Share of the WHOLE machine, 0-100. Unchanged in meaning, because it is what
+    # every existing client reads — but on its own it is not a usable reading of
+    # a game server, which is why cpu_cores rides beside it. See proc_stats().
     cpu_percent: float
     threads: int
     uptime_seconds: float
+    # CPU-cores-equivalent: 1.0 means "one core, fully busy", 2.5 means two and a
+    # half. The figure that survives the box it is measured on — see proc_stats()
+    # for why a percentage of the machine does not.
+    cpu_cores: float = 0.0
+    # Logical CPUs, so a client can say "of 32" without asking the OS itself.
+    cpu_count: int = 1
+    # How many Palworld server processes are running. > 1 is the leftover-second-
+    # service collision, and it means these numbers describe only one of them.
+    instances: int = 1
+    # True when we could only reach the thin launcher, not the real server behind
+    # it. The launcher idles at a few MB and ~0% forever, so its numbers are not
+    # the server's and must never be shown as though they were.
+    measured_launcher: bool = False
 
 
 def _server_child_of(launcher: psutil.Process) -> psutil.Process | None:
@@ -72,12 +88,84 @@ def _server_child_of(launcher: psutil.Process) -> psutil.Process | None:
     return kids[0] if len(kids) == 1 else None
 
 
-def find_process() -> psutil.Process | None:
+def _exe_or_none(p: psutil.Process) -> str | None:
+    """A process's image path, or None when it can't be read (the cross-account
+    split). _exe_under treats None as 'not a match', which is what we want: an
+    unattributable process falls through to the memory tiebreak rather than
+    being claimed for a root it may not belong to."""
+    try:
+        return p.exe()
+    except psutil.Error:
+        return None
+
+
+def _rss_or_zero(p: psutil.Process) -> int:
+    """RSS in bytes, or 0 for a process we can't read. Used only to rank
+    candidates, so an unreadable one sorting last is the right answer."""
+    try:
+        return p.memory_info().rss
+    except psutil.Error:
+        return 0
+
+
+def _pick_server(
+    candidates: list[psutil.Process], server_root: str | Path | None
+) -> psutil.Process:
+    """Which of several Palworld server processes is the one palctl manages.
+
+    Two instances used to collapse into one before anything could choose between
+    them: they were collected into a dict keyed by process *name*, which they
+    share, so each later one overwrote the earlier — and psutil enumerates in
+    ascending pid order, so the survivor was whichever server started LAST. That
+    is exactly backwards. The leftover is usually the one started last (a stale
+    service registration firing at boot, or a second copy started on top of a
+    server that has been up for days), so palctl reported the idle instance's 0%
+    CPU and few MB of memory as the server's while the real one did the work —
+    and the leak watchdog watched the idle one, so it could never fire. Measured:
+    with a busy instance and an idle one, find_process() returned the idle one
+    five times out of five.
+
+    Choosing properly, in order:
+
+      1. **The install palctl actually manages.** ``server_root`` is the folder
+         palctl updates and the service starts, so a process running out of it is
+         the server by definition — no heuristic required. This is the case that
+         produces two instances most often (two installs, two service
+         registrations), and it is exactly decidable.
+      2. **Resident memory**, when the root can't separate them — the same
+         install started twice, or an exe path psutil won't show us across an
+         account boundary. The live server holds the world and grows into the
+         gigabytes; an instance that lost the race for port 8211 stays small.
+      3. **Lower pid**, so repeated calls agree with each other rather than
+         flipping the displayed numbers between two processes.
+
+    Never returns nothing: a process we cannot attribute to the configured root
+    is still more useful than no reading, and `instances` tells the caller the
+    answer was ambiguous.
+    """
+    if len(candidates) == 1:
+        return candidates[0]  # nothing to choose between; don't pay for ranking
+    pool = candidates
+    if server_root:
+        # Only worth the syscalls when there is genuinely a choice to make:
+        # reading exe() per candidate costs a /proc (or handle) round trip, and
+        # with one server there is nothing to disambiguate.
+        pool = [
+            p for p in candidates if _exe_under(_exe_or_none(p), server_root)
+        ] or candidates
+    return min(pool, key=lambda p: (-_rss_or_zero(p), p.pid))
+
+
+def find_process(server_root: str | Path | None = None) -> psutil.Process | None:
     """
     The real Palworld server process — the multi-GB PalServer-Win64-Shipping,
     never the thin launcher that spawns it (watching the launcher means the leak
     watchdog watches a process that never grows, so it never fires — the whole
     point of this module).
+
+    Pass ``server_root`` (the caller's ``cfg.server_root``) when you have it: with
+    more than one Palworld server running it is what tells them apart, and
+    without it the choice falls back to a heuristic. See _pick_server.
 
     Also handles the privilege split that silently blinds the watchdog: when the
     server runs as a SYSTEM service and palctl runs as the login user, psutil can
@@ -85,24 +173,38 @@ def find_process() -> psutil.Process | None:
     shows up by name and we'd settle for the idle ~7 MB launcher. If all we can
     see is a launcher, follow it to the real child it spawned instead.
     """
-    shipping: dict[str, psutil.Process] = {}
+    return _find_server(server_root)[0]
+
+
+def _find_server(
+    server_root: str | Path | None = None,
+) -> tuple[psutil.Process | None, bool, int]:
+    """(process, is_it_only_the_launcher, how_many_servers_are_running).
+
+    find_process() is the plain form the rest of palctl uses; proc_stats() needs
+    the other two facts as well, because publishing a number without them is how
+    the launcher's idle 0% and a leftover instance's idle 0% both got shown as
+    the server's own.
+    """
+    shipping: list[psutil.Process] = []
     launchers: list[psutil.Process] = []
     for p in psutil.process_iter(["name"]):
         name = p.info.get("name") or ""
         if name in SHIPPING_PROCESS_NAMES:
-            shipping[name] = p
+            shipping.append(p)
         elif name in LAUNCHER_PROCESS_NAMES:
             launchers.append(p)
 
-    for name in SHIPPING_PROCESS_NAMES:  # the real server, seen directly — best
-        if name in shipping:
-            return shipping[name]
+    if shipping:  # the real server, seen directly — best
+        return _pick_server(shipping, server_root), False, len(shipping)
     for launcher in launchers:  # only a launcher visible — follow it to the server
         child = _server_child_of(launcher)
         if child is not None:
-            return child
-    # A launcher with no reachable child still beats returning nothing.
-    return launchers[0] if launchers else None
+            return child, False, 1
+    # A launcher with no reachable child still beats returning nothing — for
+    # "is it running?". Its memory and CPU are its own, not the server's, so the
+    # caller is told which it got rather than left to assume.
+    return (launchers[0], True, 1) if launchers else (None, False, 0)
 
 
 # A single healthy server shows both a launcher and a Shipping process, so
@@ -239,6 +341,29 @@ def server_account_mismatch(daemon_user: str) -> str | None:
 _CPU_SAMPLE_SECONDS = 0.3
 
 
+def format_cpu(
+    cpu_cores: float, cpu_percent: float, *, measured_launcher: bool = False
+) -> str:
+    """The server's CPU load as every surface should print it.
+
+    Cores first, because that is the reading that means something: Palworld's
+    server saturates one game-tick thread long before it saturates a box, so
+    "1.00 cores" is the number that says it is at its ceiling. The machine share
+    follows in brackets for anyone comparing against Task Manager.
+
+    Shared rather than formatted at each call site because there are four of them
+    (desktop GUI, web dashboard, CLI, Discord bot) and they were already drifting
+    — all four printed the machine share with no decimals, which rendered a fully
+    busy core as "3%" on a 32-core box and an idle-but-running server as "0%" on
+    anything with 16 or more.
+    """
+    if measured_launcher:
+        # The launcher idles at ~0% forever; printing that as the server's load
+        # is worse than admitting we couldn't reach the server.
+        return "unavailable (launcher only)"
+    return f"{cpu_cores:.2f} cores ({cpu_percent:.1f}%)"
+
+
 def boot_time() -> float:
     """Unix timestamp of the last system boot. Wrapped here (rather than calling
     psutil from the daemon) to keep process/OS queries in one module and to give
@@ -246,8 +371,36 @@ def boot_time() -> float:
     return psutil.boot_time()
 
 
-def proc_stats() -> ProcStats | None:
-    p = find_process()
+def proc_stats(server_root: str | Path | None = None) -> ProcStats | None:
+    """Live CPU/memory for the Palworld server process, or None if it isn't running.
+
+    ``server_root`` is the caller's ``cfg.server_root``; pass it whenever it is to
+    hand, so that a box running two Palworld servers is measured on the one
+    palctl manages rather than on whichever psutil listed last. See _pick_server.
+
+    Blocking (it samples CPU over a real window) — every caller runs it via
+    asyncio.to_thread.
+
+    On the CPU figure, and why there are two of them. `cpu_percent` is the share
+    of the whole machine, and that number alone is what made this reading useless
+    on the boxes people actually host on. psutil reports a per-core percentage —
+    one fully busy core is 100.0 whether the box has four cores or sixty-four —
+    and dividing it by the core count compresses the entire interesting range
+    into 100/N. Every surface then renders it with no decimals, so the two
+    compound: a Palworld server pegging a core reads "25%" on a 4-core box, "6%"
+    on 16, "3%" on 32, and an idle-but-running server reads "0%" on anything with
+    16 or more. Two previous fixes here both addressed why the *sample* was zero;
+    the sample has been right since, and the result was still divided into
+    invisibility before anyone saw it.
+
+    So `cpu_cores` rides beside it: CPU-cores-equivalent, where 1.0 means one core
+    fully busy. It is the same measurement, expressed in the unit that survives
+    the machine it was taken on — and it is the one that answers the question a
+    host is actually asking, because Palworld's server bottlenecks on a single
+    game-tick thread long before it runs out of cores. "1.0 cores" says the
+    server is at its ceiling; "3% of the machine" says nothing at all.
+    """
+    p, is_launcher, instances = _find_server(server_root)
     if p is None:
         return None
     try:
@@ -272,17 +425,21 @@ def proc_stats() -> ProcStats | None:
         # interval sample taken inside it diffs a value against itself and reads
         # 0.0 — exactly the bug we're fixing.
         cpu_raw = p.cpu_percent(interval=_CPU_SAMPLE_SECONDS)
-        # Raw psutil cpu_percent sums across cores (can exceed 100% on an N-core
-        # box). Normalize to 0-100% of the whole machine — that's what a "CPU"
-        # status tile reads as.
-        cpu = cpu_raw / (psutil.cpu_count() or 1)
+        # Raw psutil cpu_percent is per-core: it sums across cores and can exceed
+        # 100% on an N-core box. Both derived figures come from it — see the
+        # docstring for why publishing only the machine share was the bug.
+        cores = psutil.cpu_count() or 1
         with p.oneshot():
             return ProcStats(
                 pid=p.pid,
                 memory_mb=p.memory_info().rss / 1_048_576,
-                cpu_percent=cpu,
+                cpu_percent=cpu_raw / cores,
                 threads=p.num_threads(),
                 uptime_seconds=max(0.0, time.time() - p.create_time()),
+                cpu_cores=cpu_raw / 100.0,
+                cpu_count=cores,
+                instances=instances,
+                measured_launcher=is_launcher,
             )
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return None

@@ -50,7 +50,9 @@ def make_watchdog(monkeypatch, *, memory_mb, api, skip_if_players_online=True, s
     monkeypatch.setattr(
         watchdog_mod.procs,
         "proc_stats",
-        lambda: types.SimpleNamespace(memory_mb=memory_mb),
+        # takes cfg.server_root now, so the leak is watched on the install
+        # palctl manages rather than on whichever server psutil listed last.
+        lambda root=None: types.SimpleNamespace(memory_mb=memory_mb),
     )
 
     restarts = []
@@ -144,7 +146,7 @@ def make_fps_watchdog(monkeypatch, *, fps_api, min_fps=8, samples=2, memory_mb=1
     wd = Watchdog(cfg, fps_api, bus)
     monkeypatch.setattr(
         watchdog_mod.procs, "proc_stats",
-        lambda: types.SimpleNamespace(memory_mb=memory_mb),  # memory path stays quiet
+        lambda root=None: types.SimpleNamespace(memory_mb=memory_mb),  # memory path quiet
     )
     restarts = []
 
@@ -237,7 +239,7 @@ def _watchdog_over_the_line(monkeypatch, control):
     wd = Watchdog(cfg, FakeApi(players=[]), FakeBus(), control)
     monkeypatch.setattr(
         watchdog_mod.procs, "proc_stats",
-        lambda: types.SimpleNamespace(memory_mb=13_000),
+        lambda root=None: types.SimpleNamespace(memory_mb=13_000),
     )
     monkeypatch.setattr(watchdog_mod.asyncio, "sleep", _no_sleep)
     return wd

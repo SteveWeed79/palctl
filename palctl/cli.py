@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import localauth
+from . import localauth, procs
 from .client import DAEMON_PORT, DaemonClient, DaemonError
 
 # ---------------- formatting (pure, tested) ----------------
@@ -58,7 +58,21 @@ def fmt_status(state: dict) -> str:
     p = state.get("process")
     if p:
         lines.append(f"memory     {p['memory_mb']:,.0f} MB")
-        lines.append(f"cpu        {p['cpu_percent']:.0f}%")
+        lines.append(
+            "cpu        "
+            + procs.format_cpu(
+                p.get("cpu_cores", 0.0),
+                p.get("cpu_percent", 0.0),
+                measured_launcher=bool(p.get("measured_launcher")),
+            )
+        )
+        if p.get("instances", 1) > 1:
+            # These numbers describe ONE of them. Saying which is impossible;
+            # saying that there is more than one is the part that matters.
+            lines.append(
+                f"           ⚠ {p['instances']} Palworld server processes are "
+                "running — the readings above are from the largest one"
+            )
     return "\n".join(lines)
 
 

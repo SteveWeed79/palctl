@@ -147,6 +147,7 @@ def _health_fields(
     fps: int,
     frame_time: float,
     ttl_minutes: float | None,
+    cpu_cores: float = 0.0,
 ) -> tuple[list[tuple[str, str]], bool]:
     """(embed fields, is_warning) for /health. `ttl_minutes` is the leak
     forecaster's minutes-to-limit (None = not trending up). Pure — the
@@ -154,7 +155,7 @@ def _health_fields(
     pct = (memory_mb / limit_mb * 100) if limit_mb else 0.0
     fields = [
         ("Memory", f"{memory_mb:,.0f} MB · {pct:.0f}% of the {limit_mb:,} MB watchdog limit"),
-        ("CPU", f"{cpu:.0f}%"),
+        ("CPU", procs.format_cpu(cpu_cores, cpu)),
         ("Server FPS", str(fps)),
         ("Frame time", f"{frame_time:.1f} ms"),
     ]
@@ -445,7 +446,7 @@ class PalBot(discord.Client):
         # Both are blocking (sc.exe / a full psutil scan) — keep them off the
         # shared event loop.
         svc = await asyncio.to_thread(procs.service_state, self._cfg.service_name)
-        stats = await asyncio.to_thread(procs.proc_stats)
+        stats = await asyncio.to_thread(procs.proc_stats, self._cfg.server_root)
 
         e = discord.Embed(title="Palworld Server", colour=BLUE)
         e.add_field(name="Service", value=svc)
@@ -468,7 +469,14 @@ class PalBot(discord.Client):
                 name="Memory",
                 value=f"{stats.memory_mb:,.0f} MB ({pct:.0f}% of watchdog limit)",
             )
-            e.add_field(name="CPU", value=f"{stats.cpu_percent:.0f}%")
+            e.add_field(
+                name="CPU",
+                value=procs.format_cpu(
+                    stats.cpu_cores,
+                    stats.cpu_percent,
+                    measured_launcher=stats.measured_launcher,
+                ),
+            )
 
         # The leak forecast, when there is one — so the live status embed (and
         # /status) answers "is a restart coming?" at a glance, not just /health.
@@ -1053,7 +1061,7 @@ class PalBot(discord.Client):
         await interaction.followup.send(f"**{display}** — {mins / 60:.1f}h total{suffix}.")
 
     async def _health_embed(self) -> discord.Embed:
-        stats = await asyncio.to_thread(procs.proc_stats)
+        stats = await asyncio.to_thread(procs.proc_stats, self._cfg.server_root)
         wd = self._cfg.watchdog
         fps = frame_time = 0
         try:
@@ -1073,6 +1081,7 @@ class PalBot(discord.Client):
             memory_mb=stats.memory_mb if stats else 0.0,
             limit_mb=wd.memory_limit_mb,
             cpu=stats.cpu_percent if stats else 0.0,
+            cpu_cores=stats.cpu_cores if stats else 0.0,
             fps=fps,
             frame_time=frame_time,
             ttl_minutes=ttl,

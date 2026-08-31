@@ -607,7 +607,15 @@ function render(state) {
     fill.style.width = `${Math.min(100, frac * 100).toFixed(1)}%`;
     fill.className = frac >= 0.9 ? "crit" : frac >= 0.75 ? "warn" : "";
   }
-  $("t-cpu").textContent = p ? `${Math.round(p.cpu_percent)}%` : "–";
+  // Cores first — mirrors procs.format_cpu, and for the same reason: a share of
+  // an N-core machine divides the whole interesting range by N, so a server
+  // pegging a core rendered as "3%" on a 32-core host and an idle-but-running
+  // one rendered as "0%" on anything with 16 or more.
+  $("t-cpu").textContent = !p
+    ? "–"
+    : p.measured_launcher
+      ? "unavailable"
+      : `${(p.cpu_cores ?? 0).toFixed(2)} cores (${(p.cpu_percent ?? 0).toFixed(1)}%)`;
   $("t-up").textContent = m ? fmtUp(m.uptime) : "–";
   $("t-day").textContent = m ? `day ${m.days}` : "–";
   $("t-camps").textContent = m ? `${m.base_camps} base camps` : "";

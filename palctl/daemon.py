@@ -745,7 +745,9 @@ class Daemon:
 
         await self.tracker.update(players)
 
-        stats = await asyncio.to_thread(procs.proc_stats)  # psutil enumeration off the loop
+        stats = await asyncio.to_thread(  # psutil enumeration off the loop
+            procs.proc_stats, self.cfg.server_root
+        )
         self._last_metrics = metrics
 
         if first_poll:
@@ -1228,7 +1230,9 @@ class Daemon:
             )
 
         async def state(_: web.Request) -> web.Response:
-            stats = await asyncio.to_thread(procs.proc_stats)  # psutil enum off the loop
+            stats = await asyncio.to_thread(  # psutil enum off the loop
+                procs.proc_stats, self.cfg.server_root
+            )
             service = await self._service_state_cached()
             return web.json_response(
                 {

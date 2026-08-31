@@ -11,6 +11,49 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Fixed
+- **The CPU reading was being divided into invisibility before you saw it.**
+  Twice before, this was reported as "CPU always shows 0%" and twice it was fixed
+  in the *sampling* — and the sampling has been right since. The number was then
+  normalised to a share of the whole machine and rendered with no decimals, and
+  those two compound: the entire meaningful range for one busy core is 100/N on
+  an N-core box. A Palworld server pegging a core showed **25%** on a 4-core box,
+  **6%** on 16, **3%** on 32 and **2%** on 64; an idle-but-running server showed
+  a flat **0%** on anything with 16 cores or more, next to a Memory tile and an
+  FPS tile that were both live. So the reading looked broken on exactly the
+  hardware people host on.
+  palctl now reports **CPU-cores-equivalent** alongside the machine share —
+  `1.00 cores (3.1%)` — because that is the figure that survives the box it was
+  measured on, and because Palworld saturates one game-tick thread long before it
+  runs out of cores, so "1.00 cores" is the number that says the server is at its
+  ceiling. Same reading on the desktop GUI, the web dashboard, `palctl status`
+  and Discord `/health`, from one shared formatter.
+- **palctl could measure the wrong server entirely.** Candidate processes were
+  collected into a dictionary keyed by process *name* — which they share — so
+  with two Palworld servers running, each later one overwrote the earlier, and
+  since psutil enumerates in ascending PID order the survivor was whichever
+  server started **last**. That is precisely the leftover: a stale service
+  registration firing at boot, or a second copy started on top of a server that
+  has been up for days. Measured with a busy instance and an idle one, palctl
+  picked the idle one five times out of five and reported its 0% CPU and few MB
+  of memory as the server's — **and the memory-leak watchdog watched that
+  instance too, so it could never fire.** The choice is now made properly: the
+  install `server_root` points at wins outright (a second service is usually a
+  second install, so this is exact rather than a guess), then resident memory,
+  then the lower PID so repeated readings agree. `/state` also publishes how many
+  server processes are running, so a surface can say so instead of quietly
+  describing one of them.
+- **The thin launcher's idle 0% was published as if it were the server's.** When
+  palctl can only reach `PalServer.exe`/`PalServer.sh` and not the real binary
+  behind it, it used to hand that process's numbers to every surface. It now says
+  the reading is unavailable, which is the truth.
+
+### Added
+- **A CPU trend line in the desktop dashboard.** The CPU series was already
+  sampled every poll, stored in SQLite and published on `/state` — and drawn by
+  nothing, leaving the tile as a lone 0.3-second sample of a process whose work
+  arrives in bursts. It now sits beside the FPS and Memory sparklines.
+
+### Fixed
 - **palctl blamed you for stops it made itself.** Three paths deliberately stop
   the server and then refuse to go on: an update or a restore that finds a
   PalServer process still holding the files, and a restore that fails with no
