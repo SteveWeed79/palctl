@@ -274,12 +274,74 @@ class PalSettings:
         """
         bak: Path | None = None
         if backup and path.exists():
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            bak = path.with_suffix(f".ini.{stamp}.bak")
-            shutil.copy2(path, bak)
+            bak = timestamped_backup(path)
 
         _write_text_atomic(path, self.render())
         return bak
+
+
+# How many timestamped `.bak` copies of a settings file to keep beside it.
+#
+# Every path that rewrites PalWorldSettings.ini takes one first, and there are
+# several: the pre-update snapshot, restore_user_settings putting the admin's
+# values back, ensure_rest_api re-asserting the REST settings afterwards, and
+# every Save in the settings editor. A single server update therefore leaves up
+# to three, and with scheduled auto-updates on that is roughly a thousand files
+# a year piling up in the server's own Config folder, none of which anything
+# ever removed. Ten is comfortably more history than a rollback has ever needed
+# and small enough that the folder stays readable.
+BACKUP_RETAIN = 10
+
+
+def timestamped_backup(
+    path: Path, *, dest_dir: Path | None = None, retain: int = BACKUP_RETAIN
+) -> Path:
+    """Take a `<name>.<stamp>.bak` copy of `path`, then trim the older ones.
+
+    `dest_dir` puts the copy somewhere other than beside the original, and
+    matters for exactly one caller: the snapshot taken before SteamCMD rewrites
+    the server install. PalWorldSettings.ini lives *inside* that install, so a
+    sibling .bak is the one copy that makes a bad update undoable sitting in the
+    blast radius of the thing it protects. The update path stashes it in
+    palctl's own config directory instead, where the updater cannot reach it.
+
+    The copy is the point and is never skipped; the trim is housekeeping and is
+    best-effort — a .bak that won't delete must not fail the save it was taken
+    to protect.
+    """
+    dest_dir = dest_dir or path.parent
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    bak = dest_dir / f"{path.name}.{stamp}.bak"
+    shutil.copy2(path, bak)
+    prune_backups(path, retain, dest_dir=dest_dir)
+    return bak
+
+
+def prune_backups(
+    path: Path, retain: int = BACKUP_RETAIN, *, dest_dir: Path | None = None
+) -> list[Path]:
+    """Keep the newest `retain` `<path.name>.<stamp>.bak` copies in `dest_dir`
+    (default: beside `path`), delete the rest. Returns what was deleted. Never
+    raises — see timestamped_backup.
+
+    The stamp is `%Y%m%d-%H%M%S`, so sorting the names sorts them by age.
+    """
+    retain = max(1, retain)
+    try:
+        found = sorted(
+            (dest_dir or path.parent).glob(f"{path.name}.*.bak"), reverse=True
+        )
+    except OSError:
+        return []
+    deleted: list[Path] = []
+    for old in found[retain:]:
+        try:
+            old.unlink()
+            deleted.append(old)
+        except OSError:
+            continue
+    return deleted
 
 
 def _write_text_atomic(path: Path, text: str) -> None:

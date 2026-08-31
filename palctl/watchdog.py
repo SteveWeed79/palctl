@@ -167,6 +167,20 @@ class Watchdog:
             await self._locked_restart(op, memory_mb, player_count, hard, warn)
         finally:
             self._restarting = False
+            # The cooldown belongs to the *attempt*, not to the success.
+            #
+            # It used to be stamped only after restart_cycle returned, so a
+            # restart that raised anywhere along the way — an event subscriber
+            # failing on a full disk, a malformed /metrics payload while we wait
+            # for the server to come back — left `_last_restart` at None and
+            # `_over` still above the threshold. run() catches the exception and
+            # sleeps one poll interval; the next tick then finds memory still
+            # over the line, no cooldown to respect, and restarts again. Every
+            # minute. Forever, kicking players each time, on a server nobody had
+            # asked to be restarted more than once. A watchdog that misfires
+            # like that is worse than no watchdog, which is this module's own
+            # first principle.
+            self._last_restart = datetime.now(UTC)
 
     async def _locked_restart(
         self, op, memory_mb: float, player_count: int, hard: bool, warn: int
@@ -200,7 +214,6 @@ class Watchdog:
                     Event("watchdog", f"🔨 {m}", {"action": "force_stop"})
                 ),
             )
-            self._last_restart = datetime.now(UTC)
             self._over = 0
             self._hold_notified = False
 
@@ -296,7 +309,6 @@ class Watchdog:
                         Event("watchdog", f"🔨 {msg}", {"action": "force_stop"})
                     ),
                 )
-                self._last_restart = datetime.now(UTC)
                 self._fps_low = 0
                 self._fps_hold_notified = False
                 await self._bus.emit(
@@ -311,3 +323,4 @@ class Watchdog:
                 )
         finally:
             self._restarting = False
+            self._last_restart = datetime.now(UTC)  # see _restart: cooldown on attempt

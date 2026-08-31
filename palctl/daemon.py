@@ -802,17 +802,32 @@ class Daemon:
         different folder than the one palctl updates, say so. That split makes
         every update land on a copy nobody runs — the update reports success and
         the live server stays on its old build, which players meet as a version
-        mismatch. psutil enumeration runs off the event loop."""
+        mismatch. psutil enumeration runs off the event loop.
+
+        The one-shot is only spent on a *conclusive* reading, for the same
+        reason as the account check above — and it is the same trap, because it
+        is the same psutil call underneath. `server_root_from_process` answers
+        None both for "no server process to read" and for "found it, couldn't
+        read its image path", and the second is routine: an AccessDenied on
+        `proc.exe()` is exactly what a server running as SYSTEM under a
+        login-user daemon produces. Latching before the check ran meant one
+        early poll — the first successful one, while the game process is still
+        settling — silenced this warning for the life of the daemon. Silencing
+        it is expensive: a wrong server root is the reason updates land on an
+        install nobody starts, and this is the only thing in palctl that says
+        so."""
         if self._root_warned:
             return
-        self._root_warned = True
         from . import discovery
 
         try:
             running = await asyncio.to_thread(discovery.server_root_from_process)
-            warning = discovery.root_mismatch_warning(self.cfg.server_root, running)
         except Exception:
-            warning = None
+            running = None
+        if running is None:
+            return  # inconclusive — ask again on the next poll
+        self._root_warned = True
+        warning = discovery.root_mismatch_warning(self.cfg.server_root, running)
         if warning:
             self.log.warning("%s", warning)
             await self.bus.emit(Event("error", "⚠️ " + warning))

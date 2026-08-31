@@ -26,7 +26,6 @@ import threading
 import time
 import zipfile
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 
 APP_ID = "2394010"
@@ -307,18 +306,26 @@ def download_steamcmd(dest_dir: Path, *, url: str | None = None) -> Path:
         tmp_path.unlink(missing_ok=True)
 
 
-def backup_file(path: Path) -> Path | None:
+def backup_file(path: Path, *, dest_dir: Path | None = None) -> Path | None:
     """
     Timestamped side copy of a single file. Used to guard PalWorldSettings.ini
     across a ``validate`` — a plain copy, not a parse, so it works even when the
     ini is blank or malformed.
+
+    Bounded, and — with ``dest_dir`` — out of the way. This runs on every
+    update, and the ini's own writers take a copy each as well, so without
+    retention they pile up several per update with nothing clearing them out
+    (see inifile.BACKUP_RETAIN). ``dest_dir`` matters more: PalWorldSettings.ini
+    lives inside the install SteamCMD is about to rewrite, so the default
+    sibling copy is the one thing that makes a bad update undoable, stored in
+    the blast radius of the thing it protects. The update path passes palctl's
+    own config directory.
     """
     if not path.exists():
         return None
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    bak = path.with_suffix(path.suffix + f".{stamp}.bak")
-    shutil.copy2(path, bak)
-    return bak
+    from . import inifile
+
+    return inifile.timestamped_backup(path, dest_dir=dest_dir)
 
 
 def run_update(

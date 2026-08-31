@@ -10,6 +10,72 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+### Fixed
+- **palctl blamed you for stops it made itself.** Three paths deliberately stop
+  the server and then refuse to go on: an update or a restore that finds a
+  PalServer process still holding the files, and a restore that fails with no
+  world left in place. All three are right to leave the server down — but none
+  of them recorded that palctl was the one who stopped it. The daemon reads
+  "should be running" plus "the service says STOPPED and palctl isn't busy" as
+  somebody stopping the server behind its back, so a few polls later it
+  announced exactly that — *"The server was stopped outside palctl (services.msc,
+  `sc stop`, or Task Manager)"* — about a stop it had performed seconds earlier,
+  and quietly flipped the intent to "stay down" while the real reason scrolled
+  past. Those aborts now record the stop as palctl's own and say so, so the
+  supervisor stands down instead of accusing anyone, and the message you are
+  left looking at is the one that names the problem.
+- **A backup that worked could abort your server update.** Retention ran inside
+  the backup's own `try`, so a prune that failed — one old backup directory held
+  by an antivirus or the search indexer, which on Windows is routine and
+  permanent — was reported as "Backup failed" for a backup sitting complete on
+  disk. `update_requires_backup` (on by default) then read that as "no safety
+  net" and aborted the update. One stuck folder was enough to stop a server ever
+  updating again. Retention is now housekeeping that runs after the valuable
+  work: it reports its own trouble, on its own terms, and never fails the backup
+  it follows.
+- **Retention gave up at the first directory it couldn't delete**, so every
+  later run stopped in the same place and nothing was ever pruned again — while
+  palctl warned about the low disk that caused. It now deletes everything
+  deletable and reports once, naming what stuck.
+- **The "your server runs from a different folder than palctl updates" warning
+  could be silenced before it ever ran.** It fires once per daemon run, and the
+  one shot was spent even when the check came back inconclusive — which it does
+  whenever psutil can't read the server process's image path, exactly what a
+  server running as SYSTEM under a login-user daemon produces. So the installs
+  most likely to have a split root were the ones told least, and a wrong server
+  root is *the* reason an update reports success and changes nothing. Only a
+  conclusive reading counts now.
+- **A watchdog restart that failed restarted the server again a minute later,
+  forever.** The 20-minute cooldown was stamped only after a successful restart
+  cycle, so if anything on that path raised — an event subscriber failing on the
+  full disk that triggered the restart, a malformed `/metrics` reply while
+  waiting for the server to come back — the next tick found memory still over
+  the line and no cooldown, and went again. Every poll interval, kicking players
+  each time. The cooldown now belongs to the attempt.
+- **The dashboard's "update available" badge was wrong for hours after an
+  update.** `update_status` is the standing answer to "is this server on the
+  build Steam is serving clients?", and only the six-hourly check refreshed it —
+  so the one moment it was guaranteed to be stale was straight after the update
+  that fixed it. The update now records what it verified.
+- **The pre-update copy of your settings was stored inside the folder SteamCMD
+  rewrites.** PalWorldSettings.ini lives under the server install, so the one
+  copy that makes a bad update undoable sat in the blast radius of the thing it
+  protects — and if the update took the Config directory with it, restoring the
+  ini raised, which aborted the repair before it re-asserted the REST API
+  settings and left palctl blind to a server that was running perfectly well.
+  The snapshot goes to palctl's own config directory (`ini-backups/`) now.
+- **`.bak` copies of PalWorldSettings.ini piled up forever** in the server's own
+  Config folder. Every path that rewrites the ini takes one first, and a single
+  server update takes up to three; with scheduled auto-updates on, that is
+  roughly a thousand files a year that nothing ever removed. The newest ten are
+  kept.
+
+### Changed
+- Listing backups no longer measures every file of every backup when only the
+  names are needed. Retention runs right after each backup and used to pay for a
+  full recursive walk of the whole backup tree — a real cost with a couple of
+  dozen retained multi-GB worlds on a slow disk or a network share.
+
 ## [1.2.7.0] — 2026-08-10
 
 ### Added

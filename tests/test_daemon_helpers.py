@@ -10,6 +10,7 @@ import asyncio
 import logging
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -651,3 +652,83 @@ def test_boot_intent_always_releases_the_startup_hold(monkeypatch, tmp_path):
     d._service_state_cached = _boom
     asyncio.run(d._restore_boot_intent())
     assert d._boot_intent_pending is False
+
+
+# ---------------- the wrong-server-root warning ----------------
+#
+# A server started from a folder other than `server_root` is why an update can
+# report success and change nothing: SteamCMD rewrites the copy nobody runs.
+# This warning is the only thing in palctl that says so, and it fires once per
+# daemon run — so which readings are allowed to spend that one shot is the whole
+# question.
+
+
+def _daemon_for_root_warning(cfg_root="/srv/PalServer"):
+    d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+    d._root_warned = False
+    d.log = logging.getLogger("test-root-warning")
+    d.cfg = types.SimpleNamespace(server_root=cfg_root)
+    d.emitted = []
+
+    class _Bus:
+        @staticmethod
+        async def emit(e):
+            d.emitted.append(e)
+
+    d.bus = _Bus()
+    return d
+
+
+def test_an_unreadable_server_process_does_not_spend_the_root_warning(monkeypatch):
+    """`server_root_from_process` answers None for "no process to read" AND for
+    "found it, couldn't read its image path" — and the second is routine, since
+    a server running as SYSTEM under a login-user daemon denies psutil the exe
+    path. Latching the one-shot on that silenced the warning for the daemon's
+    whole life, so the installs most likely to have a split root were the ones
+    told least. The reading has to be conclusive to count."""
+    from palctl import discovery
+
+    roots = [None, Path("/srv/OtherPalServer")]
+    monkeypatch.setattr(discovery, "server_root_from_process", lambda: roots.pop(0))
+
+    d = _daemon_for_root_warning()
+    asyncio.run(d._maybe_warn_wrong_server_root())
+    assert d._root_warned is False, "an inconclusive read must not burn the one-shot"
+    assert d.emitted == []
+
+    asyncio.run(d._maybe_warn_wrong_server_root())
+    assert d._root_warned is True
+    assert any("OtherPalServer" in e.message for e in d.emitted)
+
+
+def test_a_matching_root_is_a_conclusive_answer_and_ends_the_check(monkeypatch):
+    """"Checked, they agree" is a real answer — it must not keep re-checking."""
+    from palctl import discovery
+
+    calls = []
+
+    def _root():
+        calls.append(1)
+        return Path("/srv/PalServer")
+
+    monkeypatch.setattr(discovery, "server_root_from_process", _root)
+
+    d = _daemon_for_root_warning("/srv/PalServer")
+    asyncio.run(d._maybe_warn_wrong_server_root())
+    asyncio.run(d._maybe_warn_wrong_server_root())
+    assert len(calls) == 1
+    assert d.emitted == []
+
+
+def test_a_thrown_process_lookup_does_not_spend_the_root_warning(monkeypatch):
+    from palctl import discovery
+
+    def _boom():
+        raise RuntimeError("psutil fell over")
+
+    monkeypatch.setattr(discovery, "server_root_from_process", _boom)
+
+    d = _daemon_for_root_warning()
+    asyncio.run(d._maybe_warn_wrong_server_root())
+    assert d._root_warned is False
+    assert d.emitted == []

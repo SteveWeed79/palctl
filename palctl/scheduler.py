@@ -12,7 +12,7 @@ from pathlib import Path
 # through this reference.
 from . import backups, countdown, procs, rclone, steamcmd  # noqa: F401
 from .api import PalApi
-from .config import Config
+from .config import Config, config_dir
 from .control import ServerController
 from .countdown import Countdown
 from .events import Event, EventBus
@@ -35,6 +35,20 @@ _ESCAPES = (
 # start, a watchdog restart that handed its timer to the game — never had one,
 # so "too late" would be the wrong word: there was nothing to be in time for.
 _COUNTDOWN_OPS = frozenset({"restart", "restore"})
+
+
+def ini_backup_dir() -> Path:
+    """Where the pre-update snapshot of PalWorldSettings.ini is kept.
+
+    Deliberately outside the server install. The ini lives at
+    ``<server_root>/Pal/Saved/Config/<OS>/``, which is inside the directory
+    SteamCMD rewrites — so keeping the only copy of the admin's tuned settings
+    beside the original puts the safety net inside the blast radius of the thing
+    it exists to survive. palctl's own config dir is somewhere the updater has
+    no reason to touch, and it is already where every other piece of recoverable
+    state lives.
+    """
+    return config_dir() / "ini-backups"
 
 
 def _dir_size_bytes(path: Path | str) -> int:
@@ -217,9 +231,8 @@ class Scheduler:
                 Path(self._cfg.backup_root),
                 label,
             )
-            pruned = await asyncio.to_thread(
-                backups.prune, Path(self._cfg.backup_root),
-                self._cfg.schedule.backup_retain,
+            pruned = await self._prune(
+                Path(self._cfg.backup_root), self._cfg.schedule.backup_retain
             )
             mirrored = await self._mirror(b)
             await self._bus.emit(
@@ -255,33 +268,124 @@ class Scheduler:
             await self._bus.emit(Event("error", f"Backup failed: {e}"))
             return None
 
+    async def _prune(self, root: Path, retain: int) -> list[str]:
+        """Apply retention to the local backup folder. Never fails the backup.
+
+        Retention runs immediately after a successful create(), and it used to
+        share that call's try/except — so a prune that raised was reported as
+        "Backup failed" and returned None, for a backup that was sitting on disk
+        complete and correct. Two things followed, and the second is the
+        expensive one: the good backup was never announced, and `update_requires_backup`
+        (on by default) read the None as "no safety net" and **aborted the
+        update** citing a backup failure that had not happened. A file lock on
+        one old backup directory — routine on Windows — was enough to stop a
+        server ever updating again.
+
+        So retention is now what it always was in fact: housekeeping that
+        happens after the valuable work is already done. It reports its own
+        trouble on its own terms, like the off-site mirror beside it, and the
+        backup stands on its own.
+        """
+        try:
+            return await asyncio.to_thread(backups.prune, root, retain)
+        except backups.BackupRetentionError as e:
+            await self._bus.emit(
+                Event("error", f"Backup retention: {e} (the new backup is fine).")
+            )
+            return e.deleted
+        except Exception as e:
+            await self._bus.emit(
+                Event(
+                    "error",
+                    f"Backup retention in {root} failed: {e} (the new backup is "
+                    "fine, but old ones are no longer being cleaned up — the "
+                    "folder will grow).",
+                )
+            )
+            return []
+
     async def _mirror(self, b: backups.Backup) -> bool:
         """Second copy of the backup, if configured — onto another disk/share, or
         up to an rclone cloud remote (Google Drive, Dropbox, S3, …) when the
         mirror target is a `remote:path` string instead of a local path. A mirror
-        failure must not fail the backup — the primary copy already exists."""
+        failure must not fail the backup — the primary copy already exists.
+
+        Retention on the far side is separated from the copy for the same reason
+        it is separated from create(): a prune that fails is not a mirror that
+        failed. Reporting "Backup mirror to gdrive:… failed" for a copy that is
+        sitting complete in the cloud sends the admin to check the wrong thing —
+        and it is retention, running against a folder full of older backups,
+        that has the most to trip over."""
         root = self._cfg.backup_mirror
         if not (self._cfg.backup_mirror_enabled and root):
             return False
         # The mirror can keep a different number of copies than the local disk
         # (cloud costs money, or cold storage is cheap). 0 = match local.
         retain = self._cfg.schedule.mirror_retain or self._cfg.schedule.backup_retain
+        remote = rclone.is_remote(root)
         try:
-            if rclone.is_remote(root):
+            if remote:
                 await asyncio.to_thread(rclone.mirror, b.path, root)
-                await asyncio.to_thread(rclone.prune, root, retain)
             else:
                 await asyncio.to_thread(backups.mirror, b.path, Path(root))
-                await asyncio.to_thread(backups.prune, Path(root), retain)
-            return True
         except Exception as e:
             await self._bus.emit(
                 Event("error", f"Backup mirror to {root} failed: {e} "
                                "(the primary backup is fine).")
             )
             return False
+        try:
+            if remote:
+                await asyncio.to_thread(rclone.prune, root, retain)
+            else:
+                await asyncio.to_thread(backups.prune, Path(root), retain)
+        except Exception as e:
+            await self._bus.emit(
+                Event(
+                    "error",
+                    f"Backup retention on the mirror {root} failed: {e} (the copy "
+                    "itself is there — but old ones are no longer being cleaned "
+                    "up, so the mirror will grow).",
+                )
+            )
+        return True
 
     # ---------- daily restart ----------
+
+    async def _left_stopped(self, kind: str, because: str) -> None:
+        """Record — and say — that *palctl* is leaving the server down.
+
+        Three abort paths stop the server and then refuse to go on, on purpose:
+        an update or a restore that finds a PalServer process still holding the
+        files, and a restore that failed with no world in place. All three are
+        right to leave it down. What they used to leave behind was a lie.
+
+        The daemon reads "the server should be running" (the intent this
+        records) plus "the service says STOPPED and palctl isn't busy" as
+        somebody having stopped the server behind its back — and after a few
+        confirming polls it announces exactly that: *"The server was stopped
+        outside palctl (services.msc, `sc stop`, or Task Manager)."* palctl had
+        stopped it itself, seconds earlier, and said so in an event that had
+        already scrolled past. The admin is then sent looking for a culprit that
+        doesn't exist, and the real reason — a locked install, a half-restored
+        world — is the thing they aren't reading.
+
+        Recording the stop as deliberate is both honest and what the situation
+        needs: the supervisor stands down instead of accusing anyone, and the
+        scheduled restart and the next boot leave a server alone that a human
+        has to look at first. Start (or a retry) sets the intent back.
+        """
+        self._set_intent(False)
+        await self._bus.emit(
+            Event(
+                kind,
+                f"⏹️ palctl stopped the server for the {kind} and is **leaving it "
+                f"stopped** — {because}. Nothing will restart it on its own (not "
+                "the schedule, not auto-recovery, not the next reboot). Fix the "
+                "problem above, then use Start, or run the operation again.",
+                {"action": "left_stopped", "operation": kind},
+            )
+        )
 
     def _intentionally_stopped(self) -> bool:
         """True when the admin has deliberately stopped the server, so a
@@ -782,6 +886,9 @@ class Scheduler:
                 )
                 return False
             if not await self._confirm_world_is_free(cfg):
+                await self._left_stopped(
+                    "restore", "another process still has the world open"
+                )
                 return False
 
             try:
@@ -814,6 +921,9 @@ class Scheduler:
                             f"`{cfg.savegames_dir.name}`, then start the server.",
                             {"savegames": str(cfg.savegames_dir)},
                         )
+                    )
+                    await self._left_stopped(
+                        "restore", "the restore failed with no world in place"
                     )
                     return False
 
@@ -925,6 +1035,14 @@ class Scheduler:
         from .serversetup import ensure_rest_api, restore_user_settings
 
         if ini_backup and await asyncio.to_thread(is_blank, ini):
+            # `is_blank` is also True for an ini the update *removed*, and an
+            # update that removes the file can take its Config directory with
+            # it. copy2 into a missing parent raises, which would abort the heal
+            # before it ever re-asserts the REST API settings — so make the
+            # directory, exactly as seed_from_default does for the same reason.
+            await asyncio.to_thread(
+                lambda: ini.parent.mkdir(parents=True, exist_ok=True)
+            )
             await asyncio.to_thread(shutil.copy2, ini_backup, ini)
             await self._bus.emit(
                 Event(
@@ -1028,8 +1146,22 @@ class Scheduler:
 
         Best-effort by design: when Steam can't be reached, or the manifest can't
         be read, we say what we couldn't verify rather than invent a verdict.
+
+        Whatever it concludes is also *recorded* (`update_status`), not only
+        announced. That field is the standing "is this server on the build Steam
+        is serving clients?" every surface reads, and it was refreshed by the
+        six-hourly check alone — so the moment it was guaranteed to be wrong was
+        the moment right after an update, when it went on showing "behind" for
+        up to six hours on a server that had just been brought current. An event
+        the admin has to have been watching for is not a substitute for a badge
+        that is true.
         """
         if after is None:
+            self._record_update_status(
+                state="unknown",
+                installed=before,
+                detail="Steam's appmanifest could not be read after the update",
+            )
             # Can't verify. Not an error in itself (the periodic check already
             # reports an unreadable manifest as a config problem), but never
             # claim a verified update we didn't verify.
@@ -1047,7 +1179,20 @@ class Scheduler:
             return False
         latest = await steamcmd.latest_buildid(cfg.steamcmd_path, cfg.app_id)
         if not latest:
-            return False  # offline / steamcmd trouble: nothing to compare against
+            # Offline / steamcmd trouble: nothing to compare against. The build
+            # on disk is still worth recording — it's newer than whatever the
+            # last check saw — but the verdict has to stay honest.
+            self._record_update_status(
+                state="unknown",
+                installed=after,
+                detail="Steam didn't report a latest build after the update",
+            )
+            return False
+        self._record_update_status(
+            state="current" if after == latest else "behind",
+            installed=after,
+            latest=latest,
+        )
         if after == latest:
             return True
         await self._bus.emit(
@@ -1119,6 +1264,9 @@ class Scheduler:
             )
             return
         if not await self._confirm_install_is_free(cfg):
+            await self._left_stopped(
+                "update", "another process still holds the install open"
+            )
             return
         try:
             ini = cfg.live_ini
@@ -1127,7 +1275,13 @@ class Scheduler:
             before = await asyncio.to_thread(
                 steamcmd.installed_buildid, cfg.server_root, cfg.app_id
             )
-            ini_backup = await asyncio.to_thread(steamcmd.backup_file, ini)
+            # Into palctl's own config dir, NOT beside the ini: the ini lives
+            # inside the install SteamCMD is about to rewrite, so a sibling copy
+            # is the one thing that makes a bad update undoable stored in the
+            # blast radius of the thing it protects.
+            ini_backup = await asyncio.to_thread(
+                steamcmd.backup_file, ini, dest_dir=ini_backup_dir()
+            )
 
             latest: list[str] = []
 

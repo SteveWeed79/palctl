@@ -1,10 +1,12 @@
 """The ini round-trip is the highest-stakes code in the project: a parsing bug
 here rewrites someone's PalWorldSettings.ini wrong and eats their server."""
 
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from palctl import inifile
 from palctl.inifile import (
     PalSettings,
     ValueKind,
@@ -218,3 +220,83 @@ def test_a_truncated_block_still_yields_what_survived():
     text = "[/Script/Pal.PalGameWorldSettings]\nOptionSettings=(Difficulty=None,MaxPlay"
     s = PalSettings.parse(text)
     assert s.get("Difficulty") == "None"
+
+
+# ---------------- .bak retention beside the live ini ----------------
+
+
+class _TickingClock:
+    """A distinct %Y%m%d-%H%M%S stamp per call, so a burst of saves produces a
+    burst of .bak files the way a run of updates does over days — not one file
+    repeatedly overwritten because the test was faster than a second."""
+
+    def __init__(self):
+        self.n = 0
+
+    def now(self):
+        self.n += 1
+        return datetime(2026, 1, 1) + timedelta(seconds=self.n)
+
+
+def test_saving_keeps_a_bounded_number_of_bak_copies(tmp_path, monkeypatch):
+    """Every path that rewrites PalWorldSettings.ini takes a .bak first, and a
+    single server update takes up to three (the pre-update snapshot,
+    restore_user_settings, ensure_rest_api). Nothing ever removed them, so with
+    scheduled auto-updates on that is roughly a thousand files a year piling up
+    in the server's own Config folder."""
+    monkeypatch.setattr(inifile, "datetime", _TickingClock())
+    ini = tmp_path / "PalWorldSettings.ini"
+    ini.write_text(
+        '[/Script/Pal.PalGameWorldSettings]\nOptionSettings=(ServerName="a")\n',
+        encoding="utf-8",
+    )
+    saves = inifile.BACKUP_RETAIN + 8
+    for i in range(saves):
+        s = PalSettings.load(ini)
+        s.set("ServerName", f"name{i}")
+        s.save(ini)
+
+    baks = sorted(tmp_path.glob("PalWorldSettings.ini.*.bak"))
+    assert len(baks) == inifile.BACKUP_RETAIN
+    # The live file is still the last thing written, untouched by the trim.
+    assert f"name{saves - 1}" in ini.read_text(encoding="utf-8")
+    # ...and what survived is the most recent history, not a random slice: the
+    # newest .bak is the copy taken just before the final save.
+    assert f"name{saves - 2}" in baks[-1].read_text(encoding="utf-8")
+
+
+def test_the_newest_bak_copies_are_the_ones_kept(tmp_path):
+    ini = tmp_path / "PalWorldSettings.ini"
+    ini.write_text("live", encoding="utf-8")
+    made = [
+        tmp_path / f"PalWorldSettings.ini.2026010{i}-000000.bak" for i in range(1, 9)
+    ]
+    for p in made:
+        p.write_text("old", encoding="utf-8")
+
+    inifile.prune_backups(ini, retain=3)
+    left = sorted(p.name for p in tmp_path.glob("PalWorldSettings.ini.*.bak"))
+    assert left == [p.name for p in made[-3:]]
+    assert ini.read_text(encoding="utf-8") == "live"
+
+
+def test_pruning_bak_copies_never_raises_on_an_undeletable_one(tmp_path, monkeypatch):
+    """The copy is the point and is never skipped; the trim is housekeeping and
+    must not fail the save it was taken to protect."""
+    ini = tmp_path / "PalWorldSettings.ini"
+    ini.write_text("live", encoding="utf-8")
+    for i in range(1, 6):
+        (tmp_path / f"PalWorldSettings.ini.2026010{i}-000000.bak").write_text("x")
+
+    def _no(self, *a, **kw):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "unlink", _no)
+    assert inifile.prune_backups(ini, retain=1) == []
+
+
+def test_a_backup_is_taken_even_when_the_folder_is_already_full_of_them(tmp_path):
+    ini = tmp_path / "PalWorldSettings.ini"
+    ini.write_text("live", encoding="utf-8")
+    bak = inifile.timestamped_backup(ini, retain=1)
+    assert bak.exists() and bak.read_text(encoding="utf-8") == "live"

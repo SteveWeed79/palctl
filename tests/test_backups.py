@@ -467,3 +467,66 @@ def test_prune_still_ignores_directories_that_are_not_ours(tmp_path):
     backups.prune(root, retain=1)
 
     assert mine.exists(), "a populated backup root must never lose the user's data"
+
+
+# ---------------- retention that cannot be stopped by one stuck directory ----
+
+
+def test_prune_keeps_sweeping_past_a_directory_it_cannot_delete(tmp_path, monkeypatch):
+    """Retention is the only thing keeping the backup folder bounded, and a
+    single old backup that won't delete (an antivirus handle, a read-only
+    attribute — both routine on Windows) is permanent. Aborting on the first one
+    meant every later run stopped in the same place, nothing was ever pruned
+    again, and the volume filled: a full disk corrupts saves, which is the
+    failure backups exist to survive."""
+    root = tmp_path / "backups"
+    root.mkdir()
+    names = [f"2026-01-0{i}_00-00-00-manual" for i in range(1, 6)]
+    for n in names:
+        (root / n).mkdir()
+
+    stuck = root / names[0]  # oldest; sorted newest-first, so it is doomed
+    real_rmtree = backups.shutil.rmtree
+
+    def rmtree(path, *a, **kw):
+        if Path(path) == stuck:
+            raise OSError(13, "Permission denied")
+        return real_rmtree(path, *a, **kw)
+
+    monkeypatch.setattr(backups.shutil, "rmtree", rmtree)
+
+    with pytest.raises(backups.BackupRetentionError) as excinfo:
+        backups.prune(root, retain=2)
+
+    # Everything deletable is gone; only the stuck one survives past retention.
+    assert set(excinfo.value.deleted) == {names[1], names[2]}
+    assert names[0] in str(excinfo.value)
+    survivors = {d.name for d in root.iterdir()}
+    assert survivors == {names[4], names[3], names[0]}
+
+
+def test_prune_reports_nothing_when_every_deletion_works(tmp_path):
+    root = tmp_path / "backups"
+    root.mkdir()
+    for i in range(1, 5):
+        (root / f"2026-01-0{i}_00-00-00-manual").mkdir()
+    assert backups.prune(root, retain=2) == [
+        "2026-01-02_00-00-00-manual",
+        "2026-01-01_00-00-00-manual",
+    ]
+
+
+def test_listing_can_skip_the_expensive_size_walk(tmp_path):
+    """prune() only needs names and order. Sizing stats every file of every
+    backup, which on a couple of dozen retained multi-GB worlds is a full walk
+    of the whole tree — paid right after every single backup."""
+    root = tmp_path / "backups"
+    (root / "2026-01-01_00-00-00-manual" / "sub").mkdir(parents=True)
+    (root / "2026-01-01_00-00-00-manual" / "sub" / "w.sav").write_bytes(b"x" * 2048)
+
+    assert backups.listing(root)[0].size_mb > 0
+    assert backups.listing(root, with_size=False)[0].size_mb == 0.0
+    # Same directories, same order — only the measurement is skipped.
+    assert [b.name for b in backups.listing(root)] == [
+        b.name for b in backups.listing(root, with_size=False)
+    ]

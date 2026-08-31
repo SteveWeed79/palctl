@@ -24,6 +24,20 @@ CONFIG_SNAPSHOT_NAME = "palctl-config.zip"
 _SNAPSHOT_FILES = ("config.json", "daemon_state.json", "sessions.db")
 
 
+class BackupRetentionError(RuntimeError):
+    """Retention ran but could not delete every backup it wanted to.
+
+    Carries the names it *did* delete, because this is a partial success and the
+    caller has to be able to say so: a backup that was taken correctly must
+    never be reported as a failed backup just because pruning an older one
+    afterwards hit a file lock. See prune().
+    """
+
+    def __init__(self, message: str, *, deleted: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.deleted = deleted or []
+
+
 @dataclass(frozen=True)
 class Backup:
     name: str
@@ -164,11 +178,25 @@ def _write_config_snapshot(dest: Path) -> None:
             (dest / CONFIG_SNAPSHOT_NAME).unlink(missing_ok=True)
 
 
-def listing(backup_root: Path) -> list[Backup]:
+def listing(backup_root: Path, *, with_size: bool = True) -> list[Backup]:
+    """Finished backups under `backup_root`, newest first.
+
+    `with_size=False` reports every size as 0.0 and skips the measurement.
+    Sizing is not free: it stats every file of every backup, so a retained
+    two dozen multi-GB worlds on a slow disk or a network share is a full
+    recursive walk of the whole backup tree. Callers that only need the names
+    and the order — prune(), above all, which runs right after every backup —
+    have no business paying for it.
+    """
     if not backup_root.exists():
         return []
     out = [
-        Backup(d.name, d, _dir_size_mb(d), datetime.fromtimestamp(d.stat().st_mtime))
+        Backup(
+            d.name,
+            d,
+            _dir_size_mb(d) if with_size else 0.0,
+            datetime.fromtimestamp(d.stat().st_mtime),
+        )
         for d in backup_root.iterdir()
         if d.is_dir() and not d.name.endswith(".partial")  # skip in-progress copies
     ]
@@ -347,13 +375,43 @@ def prune(backup_root: Path, retain: int) -> list[str]:
     Only directories named like palctl's own backups are counted or deleted, so
     a mirror pointed at a populated location (another disk's root, a shared
     network folder) can never lose the user's unrelated data to retention.
+
+    One directory that will not delete does NOT stop the sweep. Retention is the
+    only thing keeping a backup folder from growing without limit, and the
+    reasons a single old backup resists removal are ordinary and persistent on
+    Windows — an antivirus or the search indexer holding a .sav open, a
+    read-only attribute, an Explorer window parked in it. Aborting on the first
+    one meant every later run stopped at the same directory, so nothing was ever
+    pruned again and the volume filled up: a full disk corrupts saves, which is
+    the failure backups exist to survive. So delete everything deletable, then
+    raise once naming what stuck — the caller reports it without failing the
+    backup that just succeeded.
     """
     retain = max(1, retain)
-    ours = [b for b in listing(backup_root) if BACKUP_NAME_RE.match(b.name)]
+    # Sizes are never read here, and measuring them walks every file of every
+    # backup — see listing().
+    ours = [
+        b for b in listing(backup_root, with_size=False) if BACKUP_NAME_RE.match(b.name)
+    ]
     scheduled = [b for b in ours if not b.name.endswith("-pre-restore")]
     pre_restore = [b for b in ours if b.name.endswith("-pre-restore")]
 
     doomed = scheduled[retain:] + pre_restore[PRE_RESTORE_RETAIN:]
+    deleted: list[str] = []
+    stuck: list[str] = []
     for b in doomed:
-        shutil.rmtree(b.path)
-    return [b.name for b in doomed]
+        try:
+            shutil.rmtree(b.path)
+            deleted.append(b.name)
+        except OSError as e:
+            stuck.append(f"{b.name} ({e.strerror or e})")
+    if stuck:
+        raise BackupRetentionError(
+            f"{len(deleted)} old backup(s) were removed from {backup_root}, but "
+            f"{len(stuck)} could not be deleted: {', '.join(stuck)}. Retention "
+            "will keep trying, but until they go the backup folder grows past "
+            "its limit — check for a file lock (antivirus, an open Explorer "
+            "window) or a read-only attribute.",
+            deleted=deleted,
+        )
+    return deleted
