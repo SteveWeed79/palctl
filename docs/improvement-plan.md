@@ -298,6 +298,24 @@ list so a returning player isn't pruned twice; report bytes reclaimed. Offer it 
 
 **Effort:** L. New module. **Value:** this is the feature people would switch for.
 
+**Status: started.** `palctl/saveaudit.py` plus `palctl save-audit` ship the
+diagnosis half — sizes, and which players palctl hasn't seen in months —
+read-only, with no parser and no mutation. `sessions` gained a `player_id`
+column, because save files are named after Palworld's playerId and palctl was
+keyed on the Steam userId, so it previously could not tell whose a save file
+was. That was the real blocker: cleanup cannot delete what it cannot identify,
+and the column only starts helping from the moment it ships, which is why it
+went first.
+
+Still to build, in order:
+1. Out-of-process `Level.sav` parsing (vendored `palworld-save-tools`), so the
+   report can say what those idle players actually weigh — today's figure is
+   only the per-player files, which is a floor, not the prize.
+2. The prune itself: gated behind a fresh *verified* backup (1.3's manifest and
+   `verify()` exist for exactly this), inside the operation lock, with a
+   persistent exclusion list so a returning player isn't pruned twice.
+3. A dry run that reports what it *would* remove, and is the default.
+
 ### 3.2 Auto-pause when the server is empty
 
 palworld-server-docker suspends the server process with `SIGSTOP` once empty (gated on

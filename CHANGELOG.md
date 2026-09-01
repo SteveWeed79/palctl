@@ -11,6 +11,28 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Added
+- **`palctl save-audit` — what's in your world folder, and how much of it is
+  nobody's.** Palworld's `Level.sav` grows without bound: every player who ever
+  joined leaves a character record, every guild a group record, every abandoned
+  base camp its own, and none of it is ever collected. Past a few gigabytes
+  saves stall and restarts outlast the players' patience. palctl now reports
+  world and `Level.sav` size, and — using the session history no other tool in
+  this space has — names the players who haven't been seen in months.
+
+  It is diagnosis only: it reads sizes and filenames and does not parse,
+  decompress or modify a single save. Two refusals are deliberate. A save file
+  palctl can't match to a session is reported as **unknown, never as inactive**
+  (a world restored from a backup is full of players palctl never met, and
+  "I don't know" is not "nobody wants this"). And the reclaimable figure is
+  stated as a **floor**, because it counts only the small per-player files —
+  the weight is those players' records inside `Level.sav`, which needs a
+  parser palctl does not yet ship.
+- **Sessions now record each player's Palworld `playerId`.** Save files are
+  named after that GUID, not the Steam user ID palctl was keyed on, so until
+  now there was no way to look at `Players/<guid>.sav` and say whose it is —
+  the prerequisite for any cleanup that deletes something. Added as a nullable
+  column on the existing table; old rows keep a NULL, which is honest, and any
+  future cleanup must treat unknown as do-not-touch.
 - **The event feed now records who asked.** Four surfaces can stop this server
   — the desktop GUI, the web dashboard, the CLI and the Discord bot — and the
   feed recorded that a stop happened but never who wanted it, so the first

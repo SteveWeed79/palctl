@@ -167,6 +167,21 @@ def _migrate(db: sqlite3.Connection) -> None:
         )
         """
     )
+    # Palworld names each player's save file after their *playerId* — a GUID
+    # unrelated to the Steam userId this table was keyed on. Without it there is
+    # no way to look at Players/<guid>.sav and say whose it is, which is exactly
+    # what save-bloat cleanup has to know before it deletes anything. Added
+    # rather than replacing user_id: user_id is what /whois and /playtime
+    # resolve, and it is what a Steam account keeps across worlds.
+    #
+    # ALTER, not a new CREATE, because this table already exists on every
+    # install and holds history nobody can regenerate. Old rows keep a NULL
+    # player_id — which is honest: palctl genuinely does not know their GUID,
+    # and any cleanup must treat "unknown" as "do not touch".
+    cols = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
+    if "player_id" not in cols:
+        db.execute("ALTER TABLE sessions ADD COLUMN player_id TEXT")
+
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -266,8 +281,15 @@ class SessionStore:
     def open_session(self, p: Player) -> None:
         with self._lock:
             self._db.execute(
-                "INSERT INTO sessions (user_id, name, joined_at, level_start) VALUES (?,?,?,?)",
-                (p.user_id, p.name, datetime.now(UTC).isoformat(), p.level),
+                "INSERT INTO sessions (user_id, name, joined_at, level_start, "
+                "player_id) VALUES (?,?,?,?,?)",
+                (
+                    p.user_id,
+                    p.name,
+                    datetime.now(UTC).isoformat(),
+                    p.level,
+                    p.player_id,
+                ),
             )
             self._db.commit()
 
@@ -280,8 +302,9 @@ class SessionStore:
         now = datetime.now(UTC).isoformat()
         with self._lock:
             self._db.executemany(
-                "INSERT INTO sessions (user_id, name, joined_at, level_start) VALUES (?,?,?,?)",
-                [(p.user_id, p.name, now, p.level) for p in players],
+                "INSERT INTO sessions (user_id, name, joined_at, level_start, "
+                "player_id) VALUES (?,?,?,?,?)",
+                [(p.user_id, p.name, now, p.level, p.player_id) for p in players],
             )
             self._db.commit()
 
@@ -347,6 +370,24 @@ class SessionStore:
                 (user_id,),
             ).fetchone()
         return (row[0], row[1]) if row else None
+
+    def last_seen_by_player_id(self) -> dict[str, tuple[str, str]]:
+        """{playerId: (name, last-activity ISO)} for every player whose GUID
+        palctl has recorded.
+
+        Keyed on playerId because that is what Palworld names the save file
+        after. Uses the newest of joined_at/left_at so a session still open
+        (someone online right now) counts as activity rather than reading as
+        "never left" — a cleanup that treats an online player as inactive is
+        the worst possible bug in this area.
+        """
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT player_id, name, MAX(COALESCE(left_at, joined_at)) "
+                "FROM sessions WHERE player_id IS NOT NULL AND player_id != '' "
+                "GROUP BY player_id"
+            ).fetchall()
+        return {pid: (name, seen) for pid, name, seen in rows if seen}
 
     def recent_player_names(self, limit: int = 50) -> list[str]:
         """Distinct display names from recent sessions, most-recent first. The

@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import localauth, procs
+from . import localauth, procs, saveaudit
 from .client import DAEMON_PORT, DaemonClient, DaemonError
 
 # ---------------- formatting (pure, tested) ----------------
@@ -117,6 +117,36 @@ def _by(event: dict) -> str:
     return f"  — by {actor or via}"
 
 
+def _save_audit(days: int) -> str:
+    """Read the world folder and the session history directly.
+
+    Deliberately NOT through the daemon: this is a read-only look at files on
+    this machine, it needs no privileges the user doesn't already have, and it
+    has to work on exactly the box where a stalling server is being diagnosed —
+    including when the daemon is the thing that has fallen over.
+    """
+    from .config import Config
+    from .events import SessionStore
+
+    cfg = Config.load()
+    worlds = saveaudit.world_dirs(cfg.savegames_dir)
+    if not worlds:
+        return (
+            f"No world found under {cfg.savegames_dir}. Check the server root "
+            "in Config — a world folder holds Level.sav."
+        )
+
+    store = SessionStore()
+    try:
+        seen = store.last_seen_by_player_id()
+    finally:
+        store.close()
+
+    return "\n\n".join(
+        saveaudit.format_audit(saveaudit.audit(w, seen), days=days) for w in worlds
+    )
+
+
 def find_players(players: list[dict], name: str) -> list[dict]:
     """All online players matching an in-game name (case-insensitive) — the
     daemon's kick/ban actions want the user_id, which nobody types by hand.
@@ -179,6 +209,16 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("players", help="who's online")
     ev = sub.add_parser("events", help="recent daemon events")
     ev.add_argument("-n", type=int, default=20, help="how many (default 20)")
+
+    sa = sub.add_parser(
+        "save-audit",
+        help="what's in your world folder, and how much of it is nobody's",
+    )
+    sa.add_argument(
+        "--days", type=int, default=saveaudit.INACTIVE_DAYS,
+        help=f"how long since a player's last session counts as inactive "
+             f"(default {saveaudit.INACTIVE_DAYS})",
+    )
 
     def _countdown_flags(parser: argparse.ArgumentParser, what: str) -> None:
         """`--in`/`--now` on anything that warns players first. Both are
@@ -244,6 +284,8 @@ def main(argv: list[str] | None = None) -> int:
             print(fmt_players(client.state().get("players", [])))
         elif args.cmd == "events":
             print(fmt_events(client.state().get("events", []), args.n))
+        elif args.cmd == "save-audit":
+            print(_save_audit(args.days))
         elif args.cmd == "start":
             client.action("start")
             print("Server starting.")
