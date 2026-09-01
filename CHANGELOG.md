@@ -11,6 +11,25 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Added
+- **`palctl save-audit --deep` reads `Level.sav` itself**, and reports how many
+  character records — a player's own character plus every pal they caught —
+  are held for players who stopped playing months ago. That is the number the
+  plain audit could only call a floor.
+
+  It runs in a **separate short-lived process**, always. Parsing a
+  multi-gigabyte save needs multiple gigabytes of RAM, and a daemon that does
+  that in-process is one the OOM killer may choose — taking down the supervisor
+  of a running game server to answer a question nobody was blocked on. Every
+  failure of that child (crash, OOM kill, timeout, an upstream format change,
+  output that isn't JSON) comes back as "couldn't read it" with a reason, and
+  the file-size report stands on its own.
+
+  This vendors [palworld-save-tools](https://github.com/cheahjs/palworld-save-tools)
+  0.24.0 (MIT, no dependencies, 228 KB) under `palctl/vendor/`. Vendored rather
+  than a pip extra because the Windows installer ships a frozen build with no
+  Python and no pip — the users most likely to hit save bloat are the ones
+  least able to `pip install` a fix. Nothing there is edited; palctl code
+  reaches it only through `savescan.py`.
 - **`palctl save-audit` — what's in your world folder, and how much of it is
   nobody's.** Palworld's `Level.sav` grows without bound: every player who ever
   joined leaves a character record, every guild a group record, every abandoned

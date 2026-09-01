@@ -117,7 +117,7 @@ def _by(event: dict) -> str:
     return f"  — by {actor or via}"
 
 
-def _save_audit(days: int) -> str:
+def _save_audit(days: int, *, deep: bool = False) -> str:
     """Read the world folder and the session history directly.
 
     Deliberately NOT through the daemon: this is a read-only look at files on
@@ -142,9 +142,46 @@ def _save_audit(days: int) -> str:
     finally:
         store.close()
 
-    return "\n\n".join(
-        saveaudit.format_audit(saveaudit.audit(w, seen), days=days) for w in worlds
-    )
+    reports = []
+    for w in worlds:
+        report = saveaudit.format_audit(saveaudit.audit(w, seen), days=days)
+        if deep:
+            report += "\n" + _deep_report(w, seen, days)
+        reports.append(report)
+    return "\n\n".join(reports)
+
+
+def _deep_report(world, seen: dict, days: int) -> str:
+    """The Level.sav half: what those idle players actually weigh.
+
+    Printed as a continuation of the audit rather than replacing it, because a
+    failed scan must still leave the operator with the file-size report they
+    would have had anyway.
+    """
+    from . import savescan
+
+    print("Reading Level.sav — this can take minutes on a large world…", flush=True)
+    result = savescan.scan(world / saveaudit.LEVEL_SAV)
+    if not result.ok:
+        return f"\n  Level.sav not read: {result.error}"
+
+    lines = [
+        f"\n  Level.sav holds {result.characters:,} character record(s) "
+        f"({result.unowned:,} wild or unattributed) and {result.guilds:,} guild(s)."
+    ]
+    idle = {p.player_id.replace("-", "").upper(): p for p in
+            saveaudit.audit(world, seen).inactive(days=days)}
+    owed = [(result.by_player.get(g, 0), p) for g, p in idle.items()]
+    owed = [(n, p) for n, p in owed if n]
+    if owed:
+        lines.append("  Of those, belonging to players not seen in months:")
+        for n, p in sorted(owed, reverse=True, key=lambda t: t[0]):
+            lines.append(f"    {p.name or p.player_id:<24} {n:>6,} record(s)")
+        lines.append(
+            f"  That is {sum(n for n, _ in owed):,} of {result.characters:,} "
+            "records held for players who have stopped playing."
+        )
+    return "\n".join(lines)
 
 
 def find_players(players: list[dict], name: str) -> list[dict]:
@@ -219,6 +256,11 @@ def main(argv: list[str] | None = None) -> int:
         help=f"how long since a player's last session counts as inactive "
              f"(default {saveaudit.INACTIVE_DAYS})",
     )
+    sa.add_argument(
+        "--deep", action="store_true",
+        help="also read Level.sav to count each player's characters and pals "
+             "(slow, and needs memory proportional to the save)",
+    )
 
     def _countdown_flags(parser: argparse.ArgumentParser, what: str) -> None:
         """`--in`/`--now` on anything that warns players first. Both are
@@ -285,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "events":
             print(fmt_events(client.state().get("events", []), args.n))
         elif args.cmd == "save-audit":
-            print(_save_audit(args.days))
+            print(_save_audit(args.days, deep=args.deep))
         elif args.cmd == "start":
             client.action("start")
             print("Server starting.")

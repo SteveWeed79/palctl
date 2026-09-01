@@ -307,14 +307,28 @@ was. That was the real blocker: cleanup cannot delete what it cannot identify,
 and the column only starts helping from the moment it ships, which is why it
 went first.
 
+**Step 1 is done.** `palworld-save-tools` 0.24.0 is vendored under
+`palctl/vendor/` (MIT, no dependencies, 228 KB of the 57 MB sdist — the rest is
+test fixtures), and `savescan.py` runs it in a separate short-lived process.
+`palctl save-audit --deep` now reports how many character records each departed
+player still holds. Vendored rather than a pip extra because the frozen Windows
+installer has no pip, and the frozen build needs a marker argument rather than
+`-m` — the same trap as the health-task bug.
+
 Still to build, in order:
-1. Out-of-process `Level.sav` parsing (vendored `palworld-save-tools`), so the
-   report can say what those idle players actually weigh — today's figure is
-   only the per-player files, which is a floor, not the prize.
-2. The prune itself: gated behind a fresh *verified* backup (1.3's manifest and
+1. The prune itself: gated behind a fresh *verified* backup (1.3's manifest and
    `verify()` exist for exactly this), inside the operation lock, with a
    persistent exclusion list so a returning player isn't pruned twice.
-3. A dry run that reports what it *would* remove, and is the default.
+2. A dry run that reports what it *would* remove, and is the default.
+3. Guild and base-camp records — `savescan` counts guilds but does not yet
+   attribute them, and abandoned base camps are the third source of bloat.
+
+**A gap worth naming:** there is no test of a *successful* end-to-end parse.
+That needs a genuine multi-hundred-megabyte `Level.sav`; upstream's own
+fixtures are 56 MB and are not worth vendoring, and a valid one cannot be
+synthesised cheaply. The record-counting that parse feeds is tested
+exhaustively as a pure function, and every failure path of the subprocess
+boundary is covered — but the first real save this meets will be a user's.
 
 ### 3.2 Auto-pause when the server is empty
 
