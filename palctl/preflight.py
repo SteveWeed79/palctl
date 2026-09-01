@@ -193,20 +193,123 @@ def check_single_server_instance() -> Check:
     )
 
 
+def boot_ownership_verdict(start_mode: str | None, daemon_startup: str) -> Check:
+    """Who — if anyone — starts the game server after a reboot. Pure, so the
+    whole truth table is testable off Windows.
+
+    palctl registers the game service **Manual** when it runs as a boot service,
+    because the daemon then starts the server itself and an intentional Stop
+    survives a restart (setup_flow.server_service_start_mode). Manual is
+    therefore correct in exactly one configuration, and silently fatal in the
+    others: nothing is left to start the server, on any reboot, forever. That is
+    the state anyone who ran `palctl-daemon uninstall-service` before the
+    handback existed is sitting in right now, and it produces no error anywhere
+    — the daemon whose absence causes it is not running to complain.
+    """
+    if start_mode is None:
+        return Check("Server boot start", None, "couldn't read the service's start type")
+    if start_mode == "Disabled":
+        # Somebody turned it off deliberately. Not palctl's to overrule — but
+        # worth saying out loud, since "my server won't start" and "I disabled
+        # the service months ago" are rarely connected by the same person.
+        return Check(
+            "Server boot start", None,
+            "the server service is Disabled, so nothing will start it",
+            fix="If that wasn't deliberate, set it to Automatic in services.msc.",
+        )
+    if start_mode != "Manual":
+        return Check("Server boot start", True, "Windows starts the server at boot")
+    if daemon_startup == "service":
+        return Check(
+            "Server boot start", True,
+            "palctl's daemon starts the server at boot (service is Manual, by design)",
+        )
+    where = {
+        "login": "palctl only starts when you sign in",
+        "none": "palctl doesn't start in the background at all",
+    }.get(daemon_startup, "palctl isn't registered to start at boot")
+    return Check(
+        "Server boot start", False,
+        f"the server service is set to Manual and {where}",
+        fix="Nothing will start your server after a reboot. palctl set the "
+            "service to Manual back when it ran as a boot service and took that "
+            "job on itself. Either re-run setup with background startup set to "
+            "\"Windows service\", or hand the job back to Windows:\n"
+            "    sc config <your server service> start= auto",
+    )
+
+
+def check_server_boot_ownership(service_name: str, daemon_startup: str) -> Check:
+    """Is anything actually going to start the game server after a reboot?"""
+    if not sys.platform.startswith("win") or not service_name:
+        return Check("Server boot start", None, "not applicable on this platform")
+    try:
+        from . import winservice
+
+        if not winservice.service_exists(service_name):
+            return Check(
+                "Server boot start", None,
+                f"no '{service_name}' service registered yet",
+            )
+        mode = winservice.start_mode_of(service_name)
+    except Exception as e:
+        return Check("Server boot start", None, f"couldn't check: {e}")
+    return boot_ownership_verdict(mode, daemon_startup)
+
+
+def check_backup_volume(server_root: str | Path, backup_root: str | Path) -> Check:
+    """Whether backups land on a different disk from the server.
+
+    Backups on the server's own volume cover a bad update, a botched restore and
+    a corrupt save — but not the disk, which is the failure the word "backup"
+    makes people assume they are covered for. Never a hard failure: one disk is
+    a perfectly reasonable place to start, and the off-site mirror is the real
+    answer. It just should not be a silent default.
+    """
+    from . import backups as _backups
+
+    same = _backups.same_volume(Path(server_root), Path(backup_root))
+    if same is None:
+        return Check("Backup location", None, "couldn't tell which disk the backups are on")
+    if not same:
+        return Check("Backup location", True, "backups are on a different disk from the server")
+    return Check(
+        "Backup location",
+        None,
+        "backups are on the same disk as the server — that disk failing takes both",
+        fix=(
+            "Point the backup folder at another drive, or turn on off-site "
+            "backups in Config so a second copy leaves this machine."
+        ),
+    )
+
+
 def run_all(
     server_root: str | Path,
     api_port: int,
     *,
     need_install: bool = True,
     need_admin: bool = True,
+    service_name: str = "",
+    daemon_startup: str = "",
+    backup_root: str | Path = "",
 ) -> list[Check]:
-    """The checks relevant to what the user is about to do."""
+    """The checks relevant to what the user is about to do.
+
+    `service_name`/`daemon_startup` come from the config; without them the
+    boot-ownership check is skipped rather than guessed at, so older callers
+    keep working unchanged. `backup_root` is the same deal for the
+    backup-volume check."""
     checks: list[Check] = []
     if need_install:
         checks.append(check_disk_space(server_root))
         checks.append(check_vcredist())
     checks.append(check_port_free(api_port))
     checks.append(check_single_server_instance())
+    if service_name:
+        checks.append(check_server_boot_ownership(service_name, daemon_startup))
+    if backup_root:
+        checks.append(check_backup_volume(server_root, backup_root))
     if need_admin:
         checks.append(check_admin())
     return checks

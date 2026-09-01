@@ -60,6 +60,14 @@ jobs:
     # startup (must remove the service and keep exactly one daemon), and full
     # removal. Also re-downloads WinSW and checks it against the pinned SHA-256,
     # so the pin is re-verified from independent infrastructure on every run.
+    #
+    # Three things here can only be proved by a real SCM and a real Task
+    # Scheduler, and each one shipped broken precisely because nothing executed
+    # it: the wrapper's restart policy (an unbounded 5-second loop looks exactly
+    # like a healthy service in every unit test), the health task's ability to
+    # ACTUALLY RUN (schtasks registered it fine; the command inside could not
+    # resolve), and handing the game server's boot start back to Windows when
+    # palctl stops providing it.
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -88,6 +96,69 @@ jobs:
           $daemonPid = @((Get-NetTCPConnection -LocalPort 8830 -State Listen).OwningProcess)[0]
           "DAEMON_PID=$daemonPid" >> $env:GITHUB_ENV
           exit 0
+      - name: The service wrapper must be able to give up, not loop forever
+        shell: pwsh
+        run: |
+          # A daemon that can never start (port held, unwritable config dir) was
+          # restarted every 5 seconds for good. Unit tests pin the generated
+          # XML; this pins that the XML a REAL registration wrote says it too.
+          $xml = Get-Content "$env:APPDATA\palctl\bin\palctl-daemon-service.xml" -Raw
+          Write-Host $xml
+          if ($xml -notmatch '<onfailure action="none"/>') {
+            throw "the registered service has no terminal onfailure - it will restart forever"
+          }
+          if (([regex]::Matches($xml, '<onfailure')).Count -lt 2) {
+            throw "a single onfailure entry repeats forever - no escalation"
+          }
+          if ($xml -notmatch '<resetfailure>') {
+            throw "no resetfailure window - unrelated crashes accumulate toward give-up"
+          }
+      - name: The health task must actually RUN, not merely register
+        shell: pwsh
+        run: |
+          # This is the whole bug: schtasks /Create has no working-directory
+          # option, so the task ran from System32. For a source checkout that is
+          # `python -m palctl.daemon`, which resolves -m against the current
+          # directory -> "No module named palctl", every five minutes, forever,
+          # while register_health_task reported success because the task had
+          # registered perfectly well. CI runs from a checkout, so it is exactly
+          # the broken shape.
+          schtasks /Query /TN palctl-health
+          if ($LASTEXITCODE -ne 0) { throw "health task not registered by install-service" }
+          # /FO LIST /V rather than /XML: it prints the command verbatim as
+          # "Task To Run", with no XML entity escaping to see through, and it is
+          # the same query the Last Result check below already needs.
+          $info = (schtasks /Query /TN palctl-health /FO LIST /V) -join "`n"
+          Write-Host $info
+          if ($info -notmatch 'cd /d') {
+            throw "the task carries no working directory - it cannot resolve -m palctl.daemon"
+          }
+          if ($info -notmatch [regex]::Escape($PWD.Path)) {
+            throw "the task's working directory is not this checkout"
+          }
+          # Now the real proof: let the SCHEDULER run it, from its own directory,
+          # and demand a zero exit. An unresolvable module exits non-zero here.
+          schtasks /Run /TN palctl-health
+          if ($LASTEXITCODE -ne 0) { throw "schtasks refused to run the health task" }
+          # Poll until the run has really finished. Waiting only on Status is a
+          # flake: for the first seconds after /Run the task can still read
+          # "Ready" while Last Result is the placeholder 267011 ("has not yet
+          # run") — which is not 0, so a naive check would fail a healthy task.
+          # 267009 is "currently running". Treat both as not-finished-yet.
+          $deadline = (Get-Date).AddSeconds(120)
+          do {
+            Start-Sleep -Seconds 3
+            $v = (schtasks /Query /TN palctl-health /FO LIST /V) -join "`n"
+            $status = if ($v -match 'Status:\s*(.+)') { $Matches[1].Trim() } else { '' }
+            $last = if ($v -match 'Last Result:\s*(-?\d+)') { $Matches[1] } else { '' }
+            $pending = ($status -eq 'Running') -or ($last -in @('', '267009', '267011'))
+          } while ($pending -and (Get-Date) -lt $deadline)
+          Write-Host $v
+          if ($pending) { throw "the health task never finished within 120s" }
+          Write-Host "health task last result: $last"
+          if ($last -ne '0') {
+            throw "the health task ran and failed (last result $last) - the command cannot resolve from the scheduler's directory"
+          }
       - name: Reinstall over the RUNNING daemon (must replace it)
         shell: pwsh
         run: |
@@ -98,6 +169,18 @@ jobs:
             throw "reinstall did NOT replace the running daemon (still PID $newPid)"
           }
           exit 0
+      - name: Stand in for the game server, registered Manual like setup does
+        shell: pwsh
+        run: |
+          # Setup registers the game service Manual whenever palctl runs as a
+          # boot service, because palctl's daemon then starts it. A stand-in is
+          # enough: nothing here starts the service, only reads and changes its
+          # start type, which is all the handback touches.
+          sc.exe create palctl-ci-server binPath= "C:\Windows\System32\cmd.exe /c ping -n 3600 127.0.0.1" start= demand
+          if ($LASTEXITCODE -ne 0) { throw "could not create the stand-in game service" }
+          python -c "from palctl.config import Config; c = Config.load(); c.service_name = 'palctl-ci-server'; c.save(); print('service_name ->', c.service_name)"
+          $qc = (sc.exe qc palctl-ci-server) -join "`n"
+          if ($qc -notmatch 'DEMAND_START') { throw "stand-in service is not Manual to begin with" }
       - name: Switch to login startup (removes the service, replaces the daemon)
         shell: pwsh
         run: |
@@ -110,6 +193,36 @@ jobs:
           if (-not (Get-NetTCPConnection -LocalPort 8830 -State Listen -ErrorAction SilentlyContinue)) {
             throw "no daemon answering after the switch"
           }
+          exit 0
+      - name: Leaving service mode hands the server's boot start back to Windows
+        shell: pwsh
+        run: |
+          # A login-startup daemon does not exist until somebody signs in, so it
+          # cannot be what starts the server at boot. Left Manual, the server
+          # came up only if a human logged in within fifteen minutes of boot --
+          # on a headless box, never -- and nothing said so.
+          $qc = (sc.exe qc palctl-ci-server) -join "`n"
+          Write-Host $qc
+          if ($qc -notmatch 'AUTO_START') {
+            throw "the game service is still Manual after palctl stopped being a boot service - nothing will start it at boot"
+          }
+      - name: A Disabled server service is never re-enabled behind the user
+        shell: pwsh
+        run: |
+          # Disabled is somebody deliberately turning the server off. Quietly
+          # switching it back on would be palctl making a decision that is not
+          # its to make -- the same line the handback draws in the other
+          # direction.
+          sc.exe config palctl-ci-server start= disabled
+          if ($LASTEXITCODE -ne 0) { throw "could not disable the stand-in service" }
+          python -m palctl.daemon install-startup
+          if ($LASTEXITCODE -ne 0) { throw "install-startup failed on the re-run" }
+          $qc = (sc.exe qc palctl-ci-server) -join "`n"
+          Write-Host $qc
+          if ($qc -notmatch 'DISABLED') {
+            throw "palctl re-enabled a service the user had deliberately disabled"
+          }
+          sc.exe delete palctl-ci-server
           exit 0
       - name: Full removal (nothing left registered or running)
         shell: pwsh
@@ -191,11 +304,24 @@ jobs:
         run: |
           schtasks /Query /TN palctl-health
           if ($LASTEXITCODE -ne 0) { throw "health task not registered by install-service" }
+          # Removing the daemon is the OTHER way palctl stops being what starts
+          # the game server at boot. install-lifecycle covers the install-startup
+          # route; this covers uninstall-service, and it is the worse of the two
+          # -- it leaves the server Manual with nothing alive to start it at all.
+          sc.exe create palctl-ci-server binPath= "C:\Windows\System32\cmd.exe /c ping -n 3600 127.0.0.1" start= demand
+          if ($LASTEXITCODE -ne 0) { throw "could not create the stand-in game service" }
+          python -c "from palctl.config import Config; c = Config.load(); c.service_name = 'palctl-ci-server'; c.save()"
           python -m palctl.daemon uninstall-service
           schtasks /Query /TN palctl-health
           if ($LASTEXITCODE -eq 0) { throw "health task survived uninstall-service" }
           sc.exe query palctl-daemon
           if ($LASTEXITCODE -eq 0) { throw "service survived uninstall-service" }
+          $qc = (sc.exe qc palctl-ci-server) -join "`n"
+          Write-Host $qc
+          if ($qc -notmatch 'AUTO_START') {
+            throw "removing palctl left the game service Manual - nothing will ever start it again"
+          }
+          sc.exe delete palctl-ci-server
           exit 0
 
   lint:

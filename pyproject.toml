@@ -44,10 +44,17 @@ palctl = ["dashboard.html"]
 # The GUI icon set (tinted at runtime by palctl/gui/icons.py). app-icon-tile.svg
 # is the composed brand tile used for the window/taskbar icon.
 "palctl.gui" = ["icons/*.svg"]
+# MIT requires the notice to ship with the copy. See palctl/vendor/README.md.
+"palctl.vendor.palworld_save_tools" = ["LICENSE"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Vendored third-party code is not ours to restyle. It is copied verbatim so a
+# re-vendor is a clean replacement; linting it would either fail CI on somebody
+# else's formatting or push us into editing files palctl/vendor/README.md says
+# must not be edited.
+exclude = ["palctl/vendor"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]

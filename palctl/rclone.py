@@ -13,6 +13,7 @@ retention line up with the local side.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -108,6 +109,44 @@ def mirror(backup_path: Path, remote: str) -> str:
     # No timeout: a multi-GB world is a legitimately long upload. rclone applies
     # its own network idle timeouts, and this runs off the daemon's event loop.
     _run(["copy", str(backup_path), dest])
+    return dest
+
+
+def pull(remote: str, name: str, backup_root: Path) -> Path:
+    """Bring one backup back down from the remote into the local backup root.
+
+    The half that was missing. Off-site copies existed for the case where the
+    box is gone — and palctl could upload them, list them and prune them, but
+    never fetch one, so the answer to "my disk died" was still a manual rclone
+    invocation the operator had to work out under pressure. With this, restore
+    takes a remote name, stages it locally, and the ordinary restore path runs
+    unchanged.
+
+    Downloads to a `.partial` sibling and renames, exactly as
+    `backups._copytree_staged` does: an interrupted download must never leave
+    something at the destination that `backups.listing` will present as a
+    finished backup.
+    """
+    if not BACKUP_NAME_RE.match(name):
+        raise RuntimeError(f"{name!r} is not a palctl backup name.")
+    if "/" in name or "\\" in name or ".." in name:
+        raise RuntimeError(f"Invalid backup name: {name!r}")
+
+    backup_root.mkdir(parents=True, exist_ok=True)
+    dest = backup_root / name
+    if dest.exists():
+        return dest  # already local — nothing to fetch
+    tmp = backup_root / f"{name}.partial"
+    if tmp.exists():
+        shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        # No timeout, for the same reason mirror() has none: a multi-GB world
+        # is a legitimately long transfer.
+        _run(["copy", _join(remote, name), str(tmp)])
+        os.replace(tmp, dest)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
     return dest
 
 

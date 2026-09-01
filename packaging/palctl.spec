@@ -28,6 +28,12 @@ hiddenimports = [
     *collect_submodules("discord"),
     # pywin32 timezone helper the keyring Windows backend can reach for.
     "win32timezone",
+    # The vendored Palworld save parser. savescan.py reaches it by putting
+    # palctl/vendor on sys.path at call time, which PyInstaller's static import
+    # scan cannot see — so without this the frozen build ships without it and
+    # `save-audit --deep` fails on exactly the installer users it was vendored
+    # for. See palctl/vendor/README.md.
+    *collect_submodules("palctl.vendor.palworld_save_tools"),
 ]
 
 daemon_a = Analysis(

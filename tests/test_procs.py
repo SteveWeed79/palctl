@@ -9,6 +9,7 @@ import time
 import types
 
 import psutil
+import pytest
 
 from palctl import procs
 
@@ -224,7 +225,7 @@ def test_proc_stats_reports_cpu_on_the_very_first_read(monkeypatch):
     # status` right after start) must still get a real CPU number. proc_stats
     # samples over a real window, so even a brand-new process object reads > 0.
     proc = _FakeMetricsProc(cpu_raw=800.0)  # raw per-core sum
-    monkeypatch.setattr(procs, "find_process", lambda: proc)
+    monkeypatch.setattr(procs, "_find_server", lambda root=None: (proc, False, 1))
     monkeypatch.setattr(procs.psutil, "cpu_count", lambda: 8)
 
     stats = procs.proc_stats()
@@ -238,7 +239,7 @@ def test_proc_stats_samples_cpu_outside_oneshot(monkeypatch):
     # value against itself and reads 0.0. The CPU sample must happen before the
     # oneshot block, or the bug comes straight back.
     proc = _FakeMetricsProc(cpu_raw=100.0)
-    monkeypatch.setattr(procs, "find_process", lambda: proc)
+    monkeypatch.setattr(procs, "_find_server", lambda root=None: (proc, False, 1))
     monkeypatch.setattr(procs.psutil, "cpu_count", lambda: 1)
 
     assert procs.proc_stats() is not None
@@ -246,7 +247,7 @@ def test_proc_stats_samples_cpu_outside_oneshot(monkeypatch):
 
 
 def test_proc_stats_returns_none_when_server_stopped(monkeypatch):
-    monkeypatch.setattr(procs, "find_process", lambda: None)
+    monkeypatch.setattr(procs, "_find_server", lambda root=None: (None, False, 0))
     assert procs.proc_stats() is None
 
 
@@ -475,3 +476,207 @@ def test_processes_under_ignores_a_process_it_cannot_attribute(monkeypatch):
     # everyone with that setup. The post-update build check covers it instead.
     _fake_iter(monkeypatch, [_FakeExeProc(None)])
     assert procs.processes_under("/srv/PalServer") == []
+
+
+# ---------- which server gets measured, and how the reading is published ----
+#
+# Two defects lived here together, and between them they are why the CPU tile
+# was wrong twice over: palctl could measure the wrong process, and then divide
+# the result into invisibility before anyone saw it.
+
+
+class _FakePickProc:
+    """A candidate for _pick_server: a pid, an image path, and an RSS."""
+
+    def __init__(self, pid, exe="/srv/PalServer/Pal/Binaries/Linux/x", rss=0):
+        self.pid = pid
+        self._exe = exe
+        self._rss = rss
+
+    def exe(self):
+        if self._exe is None:
+            raise psutil.AccessDenied(self.pid)
+        return self._exe
+
+    def memory_info(self):
+        return types.SimpleNamespace(rss=self._rss)
+
+
+def test_two_instances_no_longer_collapse_into_one():
+    """They used to be collected into a dict keyed by process *name*, which they
+    share — so each later one overwrote the earlier and only one survived to be
+    chosen from. psutil enumerates in ascending pid order, making the survivor
+    whichever server started LAST, which is precisely the leftover."""
+    busy = _FakePickProc(100, "/srv/PalServer/Pal/Binaries/Linux/x", rss=8_000_000_000)
+    leftover = _FakePickProc(200, "/srv/Old/Pal/Binaries/Linux/x", rss=50_000_000)
+    # No root configured: fall back to size, and the real server is the big one.
+    assert procs._pick_server([busy, leftover], None) is busy
+    assert procs._pick_server([leftover, busy], None) is busy
+
+
+def test_the_configured_install_decides_between_two_servers():
+    """Size is a heuristic; the install palctl actually manages is a fact. A
+    leftover second service is usually a second *install*, so this is exact."""
+    managed = _FakePickProc(100, "/srv/PalServer/Pal/Binaries/Linux/x", rss=10)
+    leftover = _FakePickProc(200, "/srv/Old/Pal/Binaries/Linux/x", rss=9_000_000_000)
+    # ...and it outranks size: the huge one is not ours.
+    assert procs._pick_server([managed, leftover], "/srv/PalServer") is managed
+
+
+def test_an_unattributable_process_still_gets_measured():
+    """psutil can't read exe() across an account boundary. Refusing to measure
+    anything then would blank the tile on exactly the setups that need it, so an
+    install we can't attribute falls back to the size ranking."""
+    a = _FakePickProc(100, None, rss=8_000_000_000)
+    b = _FakePickProc(200, None, rss=10)
+    assert procs._pick_server([a, b], "/srv/PalServer") is a
+
+
+def test_picking_a_server_is_stable_across_calls():
+    """Two identical candidates must not flip between calls — the displayed
+    numbers would jump between two processes with nothing changing."""
+    a = _FakePickProc(100, "/srv/PalServer/x", rss=1000)
+    b = _FakePickProc(200, "/srv/PalServer/x", rss=1000)
+    assert {procs._pick_server([a, b], None).pid for _ in range(5)} == {100}
+
+
+def test_proc_stats_publishes_cores_not_only_a_share_of_the_machine(monkeypatch):
+    """The bug behind "the GUI still doesn't report CPU correctly". The sample
+    was right; dividing it by the core count and rendering with no decimals threw
+    it away. One fully busy core is 1.00 cores on any box — 25% of a 4-core host,
+    1.6% of a 64-core one."""
+    proc = _FakeMetricsProc(cpu_raw=100.0)  # one core, fully busy
+    monkeypatch.setattr(procs, "_find_server", lambda root=None: (proc, False, 1))
+    monkeypatch.setattr(procs.psutil, "cpu_count", lambda: 64)
+
+    stats = procs.proc_stats()
+    assert stats.cpu_cores == 1.0
+    assert stats.cpu_count == 64
+    assert round(stats.cpu_percent, 2) == 1.56  # what used to render as "2%"
+    assert "1.00 cores" in procs.format_cpu(stats.cpu_cores, stats.cpu_percent)
+
+
+def test_a_busy_server_never_renders_as_zero_however_many_cores_the_box_has():
+    """The literal symptom, pinned across the box sizes people host on."""
+    for cores in (4, 8, 16, 32, 64, 128):
+        rendered = procs.format_cpu(1.0, 100.0 / cores)  # one core, fully busy
+        assert rendered.startswith("1.00 cores"), (cores, rendered)
+        assert not rendered.startswith("0"), (cores, rendered)
+    # ...and an idle-but-running server stays distinguishable from a dead one.
+    assert procs.format_cpu(0.05, 0.08) == "0.05 cores (0.1%)"
+
+
+def test_the_launcher_is_never_published_as_the_servers_own_load(monkeypatch):
+    """The launcher idles at a few MB and ~0% forever. Showing that as the
+    server's load is worse than admitting the server couldn't be reached."""
+    proc = _FakeMetricsProc(cpu_raw=0.0)
+    monkeypatch.setattr(procs, "_find_server", lambda root=None: (proc, True, 1))
+    monkeypatch.setattr(procs.psutil, "cpu_count", lambda: 8)
+
+    stats = procs.proc_stats()
+    assert stats.measured_launcher is True
+    assert "unavailable" in procs.format_cpu(
+        stats.cpu_cores, stats.cpu_percent, measured_launcher=True
+    )
+
+
+def test_proc_stats_reports_how_many_servers_are_running(monkeypatch):
+    """So a surface can say "2 server instances" rather than quietly describing
+    one of them."""
+    proc = _FakeMetricsProc(cpu_raw=50.0)
+    monkeypatch.setattr(procs, "_find_server", lambda root=None: (proc, False, 2))
+    monkeypatch.setattr(procs.psutil, "cpu_count", lambda: 4)
+    assert procs.proc_stats().instances == 2
+
+
+# ---------- against a real process ----------
+#
+# Every CPU test above this line — and every one that shipped with the two
+# previous "CPU reads 0%" fixes — runs against _FakeMetricsProc, whose
+# cpu_percent() returns `self._cpu if interval else 0.0`. That fake *models* the
+# psutil behaviour the code is trying to get right, so it passes whether or not
+# the real thing works, and it cannot see a wrong process being measured at all.
+# This one spawns a process that really burns CPU and reads it back through the
+# real find_process()/proc_stats(), which is the only way the chain is actually
+# under test.
+
+
+def _spawn_named_burner(tmp_path, name, seconds=8.0):
+    """A real process, named so find_process() will match it, burning one core."""
+    import shutil as _shutil
+
+    exe = tmp_path / name
+    _shutil.copy(sys.executable, exe)
+    script = tmp_path / "burn.py"
+    script.write_text(
+        "import time\n"
+        f"end = time.time() + {seconds}\n"
+        "while time.time() < end: pass\n",
+        encoding="utf-8",
+    )
+    return subprocess.Popen([str(exe), str(script)])
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"), reason="the burner is named for the Linux binary"
+)
+def test_a_real_busy_server_reads_as_about_one_core(tmp_path):
+    """One process pegging one core must read as ~1.00 cores, whatever this
+    machine's core count is — the property that makes the number portable, and
+    the one a percentage of the machine does not have.
+
+    Deliberately asserted on cores and with a wide band: CI runners are shared
+    and oversubscribed, so a tight tolerance here would be a flaky test. A busy
+    core reading anywhere near 1 is enough to catch the failures that matter
+    (0.0 from a broken sample, or a number scaled by the core count)."""
+    proc = _spawn_named_burner(tmp_path, "PalServer-Linux-Shipping")
+    try:
+        time.sleep(1.0)  # let it get going and become visible to psutil
+        found = procs.find_process()
+        assert found is not None and found.pid == proc.pid
+        stats = procs.proc_stats()
+        assert stats is not None and stats.pid == proc.pid
+        # Not 0.0 (the symptom of every previous incarnation of this bug)...
+        assert stats.cpu_cores > 0.3, stats
+        # ...and not scaled by the core count in either direction.
+        assert stats.cpu_cores < 2.0, stats
+        assert stats.cpu_count == psutil.cpu_count()
+        # The rendered string is the actual deliverable.
+        assert procs.format_cpu(stats.cpu_cores, stats.cpu_percent).endswith("%)")
+        assert not procs.format_cpu(stats.cpu_cores, stats.cpu_percent).startswith("0.0 ")
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"), reason="the burner is named for the Linux binary"
+)
+def test_a_real_leftover_instance_does_not_steal_the_reading(tmp_path):
+    """Two real servers, the managed one busy and a leftover idle. Before the
+    fix this returned the idle one five times out of five, so the tile read 0%
+    while the server pegged a core — and the leak watchdog watched the idle
+    instance, which is why it could never fire."""
+    managed_root = tmp_path / "managed"
+    leftover_root = tmp_path / "leftover"
+    managed_root.mkdir()
+    leftover_root.mkdir()
+
+    busy = _spawn_named_burner(managed_root, "PalServer-Linux-Shipping")
+    idle_exe = leftover_root / "PalServer-Linux-Shipping"
+    import shutil as _shutil
+
+    _shutil.copy(sys.executable, idle_exe)
+    idle = subprocess.Popen([str(idle_exe), "-c", "import time; time.sleep(8)"])
+    try:
+        time.sleep(1.0)
+        assert len(procs.shipping_processes()) >= 2
+        stats = procs.proc_stats(str(managed_root))
+        assert stats is not None
+        assert stats.pid == busy.pid, "measured the leftover instead of the server"
+        assert stats.instances >= 2, "the collision must be reported, not hidden"
+        assert stats.cpu_cores > 0.3, stats
+    finally:
+        for p in (busy, idle):
+            p.kill()
+            p.wait(timeout=10)

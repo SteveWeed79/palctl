@@ -140,3 +140,64 @@ def test_authenticode_status_is_empty_off_windows():
     if sys.platform.startswith("win"):
         return  # on Windows it shells out to PowerShell; nothing to assert here
     assert preflight._authenticode_status(Path("whatever.exe")) == ""
+
+
+# ---------- who starts the game server after a reboot ----------
+#
+# palctl registers the game service Manual when it runs as a boot service,
+# because the daemon then starts the server itself. Manual is correct in exactly
+# that one configuration and silently fatal in the others — nothing is left to
+# start the server, on any reboot, forever. Anyone who ran
+# `palctl-daemon uninstall-service` before the handback existed is in that state
+# now, and nothing tells them: the daemon whose absence causes it is not running
+# to complain.
+
+
+def test_manual_plus_a_boot_service_is_the_intended_arrangement():
+    c = preflight.boot_ownership_verdict("Manual", "service")
+    assert c.ok is True
+    assert "palctl's daemon starts the server" in c.detail
+
+
+def test_manual_without_a_boot_service_is_a_server_that_never_starts():
+    for startup, phrase in (
+        ("login", "only starts when you sign in"),
+        ("none", "doesn't start in the background"),
+        ("", "isn't registered to start at boot"),
+    ):
+        c = preflight.boot_ownership_verdict("Manual", startup)
+        assert c.ok is False, startup
+        assert phrase in c.detail, startup
+        assert "start= auto" in c.fix
+
+
+def test_automatic_always_passes():
+    for startup in ("service", "login", "none", ""):
+        assert preflight.boot_ownership_verdict("Automatic", startup).ok is True
+
+
+def test_disabled_is_reported_but_never_called_a_failure():
+    """Disabled is somebody deliberately turning the server off. Worth saying
+    out loud — 'my server won't start' and 'I disabled that service months ago'
+    are rarely connected by the same person — but it is not palctl's to
+    overrule."""
+    c = preflight.boot_ownership_verdict("Disabled", "service")
+    assert c.ok is None
+    assert "Disabled" in c.detail
+
+
+def test_an_unreadable_start_type_is_unknown_not_broken():
+    assert preflight.boot_ownership_verdict(None, "login").ok is None
+
+
+def test_the_check_is_skipped_when_the_caller_has_no_service_name(tmp_path):
+    names = {c.name for c in preflight.run_all(tmp_path, 8212, need_admin=False)}
+    assert "Server boot start" not in names
+    names = {
+        c.name
+        for c in preflight.run_all(
+            tmp_path, 8212, need_admin=False, service_name="PalServer",
+            daemon_startup="login",
+        )
+    }
+    assert "Server boot start" in names

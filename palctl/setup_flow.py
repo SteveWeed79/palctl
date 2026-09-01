@@ -280,6 +280,14 @@ def _preflight(plan: SetupPlan, log: Log) -> bool:
             register_server_service=plan.register_server_service,
             daemon_startup=plan.daemon_startup,
         ),
+        # Catches the state a pre-handback uninstall leaves behind: the game
+        # service still Manual, with no boot-time palctl left to start it. Setup
+        # is where such a host comes back, so it is where they have to be told.
+        service_name=plan.service_name,
+        daemon_startup=plan.daemon_startup,
+        # Backups on the server's own disk are a reasonable place to start and
+        # a bad place to stop. Setup is where to say so, once.
+        backup_root=plan.backup_root,
     )
     blocking = False
     for c in checks:
@@ -499,6 +507,60 @@ def server_service_start_mode(daemon_startup: str) -> str:
     return "Manual" if daemon_startup == "service" else "Automatic"
 
 
+def _server_flavour(server_root: str) -> str:
+    """Whether this server install is the Windows or the Linux build.
+
+    Keyed on which launcher is actually present, not on `sys.platform`, and
+    that is deliberate on two counts. It is the more truthful question — a
+    server directory carries `PalServer.exe` or `PalServer.sh`, and that is
+    what decides whether a WinSW service or a systemd unit can start it. And
+    it keeps the Windows registration path reachable from a test suite that
+    runs on Linux: those tests create a `PalServer.exe` and mock `winservice`,
+    which a `sys.platform` check would silently route past, leaving the whole
+    Windows path unexercised while every assertion still passed.
+
+    Falls back to the platform only when neither launcher is there, so the
+    "install the server first" message still comes from the right branch.
+    """
+    root = Path(server_root)
+    if (root / "PalServer.exe").exists():
+        return "windows"
+    if (root / "PalServer.sh").exists():
+        return "linux"
+    return "windows" if sys.platform.startswith("win") else "linux"
+
+
+def _register_server_unit_linux(plan: SetupPlan, log: Log) -> bool:
+    """The Linux half of registering the game server.
+
+    Until now this whole function was Windows-only and keyed off
+    `PalServer.exe`, so on Linux setup registered nothing and every later
+    `systemctl start <service_name>` failed against a unit that did not exist —
+    the supervision, the watchdog and the scheduler all silently had nothing to
+    drive. See systemd.install_server_service for why the unit is registered
+    but not enabled.
+    """
+    from . import systemd
+
+    launcher = Path(plan.server_root) / "PalServer.sh"
+    if not launcher.exists():
+        log(
+            f"  ⚠️ {launcher} not found — skipping the server service. Install "
+            "the server first, then run setup again."
+        )
+        return False
+    try:
+        systemd.install_server_service(
+            plan.service_name, plan.server_root, user=_invoking_username() or None
+        )
+    except Exception as e:  # noqa: BLE001 — setup reports, it does not raise
+        log(f"  ⚠️ Couldn't register the server unit: {e}")
+        log("     Writing a unit needs root; re-run setup with sudo.")
+        return False
+    log(f"  ✅ Registered systemd unit {plan.service_name}.service for the server.")
+    return True
+
+
 def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
     """Register the PalServer Windows service. Returns False (skipped) when
     PalServer.exe isn't there yet, so the caller doesn't try to start a service
@@ -507,6 +569,9 @@ def _register_server_service(cfg: Config, plan: SetupPlan, log: Log) -> bool:
     With a service password (Path A), it registers under the invoking user — so
     palctl, running as that same user, can actually read the server process it
     watches; otherwise it stays LocalSystem."""
+    if _server_flavour(plan.server_root) == "linux":
+        return _register_server_unit_linux(plan, log)
+
     from . import winservice
 
     exe = Path(plan.server_root) / "PalServer.exe"

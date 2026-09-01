@@ -50,7 +50,9 @@ def make_watchdog(monkeypatch, *, memory_mb, api, skip_if_players_online=True, s
     monkeypatch.setattr(
         watchdog_mod.procs,
         "proc_stats",
-        lambda: types.SimpleNamespace(memory_mb=memory_mb),
+        # takes cfg.server_root now, so the leak is watched on the install
+        # palctl manages rather than on whichever server psutil listed last.
+        lambda root=None: types.SimpleNamespace(memory_mb=memory_mb),
     )
 
     restarts = []
@@ -144,7 +146,7 @@ def make_fps_watchdog(monkeypatch, *, fps_api, min_fps=8, samples=2, memory_mb=1
     wd = Watchdog(cfg, fps_api, bus)
     monkeypatch.setattr(
         watchdog_mod.procs, "proc_stats",
-        lambda: types.SimpleNamespace(memory_mb=memory_mb),  # memory path stays quiet
+        lambda root=None: types.SimpleNamespace(memory_mb=memory_mb),  # memory path quiet
     )
     restarts = []
 
@@ -199,3 +201,84 @@ def test_fps_watchdog_off_by_default(monkeypatch):
     wd, bus, restarts = make_watchdog(monkeypatch, memory_mb=1_000, api=api)
     asyncio.run(wd._tick())
     assert restarts == []
+
+
+# ---------------- the cooldown belongs to the attempt, not the success ------
+
+
+class _ExplodingControl:
+    """A controller whose restart raises — the shape of a full disk breaking an
+    event subscriber, or a malformed /metrics payload while waiting for the
+    server to come back."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    def try_operation(self, name):
+        import contextlib
+
+        @contextlib.asynccontextmanager
+        async def _op():
+            yield
+
+        return _op()
+
+    async def save_best_effort(self, settle=0.0):
+        return True
+
+    async def restart_cycle(self, **kw):
+        self.attempts += 1
+        raise RuntimeError("the event store is on a full disk")
+
+
+def _watchdog_over_the_line(monkeypatch, control):
+    cfg = Config()
+    cfg.watchdog.consecutive_samples = 1
+    cfg.watchdog.skip_if_players_online = False
+    cfg.watchdog.warn_seconds = 0
+    wd = Watchdog(cfg, FakeApi(players=[]), FakeBus(), control)
+    monkeypatch.setattr(
+        watchdog_mod.procs, "proc_stats",
+        lambda root=None: types.SimpleNamespace(memory_mb=13_000),
+    )
+    monkeypatch.setattr(watchdog_mod.asyncio, "sleep", _no_sleep)
+    return wd
+
+
+async def _no_sleep(_seconds):
+    return None
+
+
+def test_a_restart_that_raises_still_starts_the_cooldown(monkeypatch):
+    """`_last_restart` used to be stamped only after restart_cycle returned. A
+    restart that raised left it None and `_over` still over the threshold, so
+    the very next tick restarted again — every poll interval, forever, kicking
+    players each time. An auto-restarter that misfires like that is worse than
+    none, which is this module's own first principle."""
+    control = _ExplodingControl()
+    wd = _watchdog_over_the_line(monkeypatch, control)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(wd._tick())  # the attempt itself still surfaces the failure
+    # run() catches that and comes straight back a poll interval later, with
+    # memory still over the line. Those ticks must find a cooldown in place.
+    for _ in range(3):
+        asyncio.run(wd._tick())
+
+    assert control.attempts == 1, "the cooldown must hold after a failed attempt"
+    assert wd._last_restart is not None
+    assert wd.is_restarting is False  # and the flag is always released
+
+
+def test_a_restart_that_succeeds_still_cools_down(monkeypatch):
+    class _Ok(_ExplodingControl):
+        async def restart_cycle(self, **kw):
+            self.attempts += 1
+            return True
+
+    control = _Ok()
+    wd = _watchdog_over_the_line(monkeypatch, control)
+    for _ in range(3):
+        asyncio.run(wd._tick())
+    assert control.attempts == 1
+    assert wd._last_restart is not None

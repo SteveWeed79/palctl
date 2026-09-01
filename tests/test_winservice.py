@@ -492,3 +492,122 @@ def test_config_is_current_notices_a_start_mode_change(tmp_path, monkeypatch):
     assert not winservice.config_is_current(
         tmp_path, "PalServer", "PalServer.exe", start_mode="Manual"
     )
+
+
+# ---------- the restart policy must be able to give up ----------
+
+
+def test_a_daemon_that_can_never_start_stops_instead_of_restarting_forever():
+    """WinSW applies the Nth <onfailure> to the Nth failure and repeats the LAST
+    one forever. A lone `restart delay="5 sec"` therefore restarts a daemon that
+    can never start — port already held, unwritable config dir, half-finished
+    upgrade — every five seconds for good. services.msc shows it flickering
+    rather than stopped, so the reason never surfaces, and nothing supervises
+    the game server the whole time."""
+    xml = winservice.winsw_config_xml("palctl-daemon", "palctl-daemon.exe")
+    failures = xml.count("<onfailure")
+    assert failures > 1, "a single onfailure entry repeats forever"
+    assert '<onfailure action="none"/>' in xml, "the ladder never gives up"
+    # The terminal entry must be last, or WinSW repeats a restart instead.
+    assert xml.rindex("<onfailure") == xml.rindex('<onfailure action="none"/>')
+    # Retries escalate rather than hammering at a fixed 5s.
+    delays = [
+        int(chunk.split('delay="')[1].split(" ")[0])
+        for chunk in xml.split("<onfailure")[1:]
+        if 'delay="' in chunk
+    ]
+    assert delays == sorted(delays) and len(set(delays)) > 1, delays
+
+
+def test_clean_uptime_resets_the_failure_count():
+    """WinSW's default reset window is a day, which would let four unrelated
+    crashes spread across it add up to 'give up'."""
+    xml = winservice.winsw_config_xml("palctl-daemon", "palctl-daemon.exe")
+    assert "<resetfailure>" in xml
+
+
+# ---------- handing the game server's boot start back ----------
+
+
+def test_parse_start_mode_reads_sc_qc():
+    auto = "        START_TYPE         : 2   AUTO_START\n"
+    manual = "        START_TYPE         : 3   DEMAND_START\n"
+    disabled = "        START_TYPE         : 4   DISABLED\n"
+    assert winservice.parse_start_mode(auto) == "Automatic"
+    assert winservice.parse_start_mode(manual) == "Manual"
+    assert winservice.parse_start_mode(disabled) == "Disabled"
+    # A delayed-auto service still boots itself, so Automatic is the right read.
+    assert winservice.parse_start_mode(
+        "        START_TYPE         : 2   AUTO_START  (DELAYED)\n"
+    ) == "Automatic"
+    assert winservice.parse_start_mode("no such line") is None
+    assert winservice.parse_start_mode("START_TYPE : 16 OWN_PROCESS") is None
+
+
+def test_set_start_mode_uses_sc_config_not_a_reregistration(monkeypatch):
+    """Re-registering means stop -> delete -> install, which would bounce a live
+    game server and drop its players — for a change that only affects the NEXT
+    boot."""
+    seen = []
+    monkeypatch.setattr(winservice.sys, "platform", "win32")
+    monkeypatch.setattr(
+        winservice, "_run",
+        lambda cmd: seen.append(cmd) or _Completed(0),
+    )
+    assert winservice.set_start_mode("PalServer", "Automatic") is True
+    # The space after `start=` is required by sc.exe's parser.
+    assert seen == [["sc.exe", "config", "PalServer", "start=", "auto"]]
+
+    with pytest.raises(ValueError):
+        winservice.set_start_mode("PalServer", "Whenever")
+
+
+class _Completed:
+    def __init__(self, rc, stdout=""):
+        self.returncode = rc
+        self.stdout = stdout
+        self.stderr = ""
+
+
+def test_sync_config_start_mode_edits_only_that_line(tmp_path):
+    """config_is_current compares this file byte-for-byte to decide whether a
+    wizard re-run can leave a healthy server alone. If sc.exe is told Automatic
+    and the file still says Manual, the next re-run believes the registration is
+    stale and stops, deletes and re-creates the service — bouncing a live server
+    over a difference palctl itself created."""
+    xml = winservice.winsw_config_xml(
+        "PalServer", r"C:\srv\PalServer.exe", args="-useperfthreads",
+        app_dir=r"C:\srv", stop_timeout="90 sec", start_mode="Manual",
+    )
+    _, svc_xml = winservice.wrapper_paths(tmp_path, "PalServer")
+    svc_xml.write_text(xml, encoding="utf-8")
+
+    assert winservice.sync_config_start_mode(tmp_path, "PalServer", "Automatic") is True
+    after = svc_xml.read_text(encoding="utf-8")
+    assert "<startmode>Automatic</startmode>" in after
+    assert "<startmode>Manual</startmode>" not in after
+    # Everything else survives untouched — this must not regenerate the file.
+    assert after == winservice.winsw_config_xml(
+        "PalServer", r"C:\srv\PalServer.exe", args="-useperfthreads",
+        app_dir=r"C:\srv", stop_timeout="90 sec", start_mode="Automatic",
+    )
+    # ...which is exactly the comparison config_is_current makes, so a wizard
+    # re-run now sees the registration as current and leaves the server alone.
+    assert after == winservice.winsw_config_xml(
+        "PalServer", r"C:\srv\PalServer.exe", args="-useperfthreads",
+        app_dir=r"C:\srv", user=None, password=None, appdata=None,
+        stop_timeout="90 sec", start_mode="Automatic",
+    )
+
+
+def test_sync_config_start_mode_is_a_noop_when_it_already_agrees(tmp_path):
+    _, svc_xml = winservice.wrapper_paths(tmp_path, "PalServer")
+    svc_xml.write_text(
+        winservice.winsw_config_xml("PalServer", "p.exe", start_mode="Automatic"),
+        encoding="utf-8",
+    )
+    assert winservice.sync_config_start_mode(tmp_path, "PalServer", "Automatic") is False
+
+
+def test_sync_config_start_mode_survives_a_missing_config(tmp_path):
+    assert winservice.sync_config_start_mode(tmp_path, "Nope", "Automatic") is False

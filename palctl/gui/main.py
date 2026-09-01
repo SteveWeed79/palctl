@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import countdown, netinfo
+from .. import countdown, netinfo, procs
 from ..config import (
     CONFIG_PATH,
     Config,
@@ -90,6 +90,11 @@ class DaemonDown(DaemonError):
 
 def call(path: str, body: dict | None = None, *, timeout: float = 10) -> dict:
     headers = _auth_headers()
+    # Say which surface asked, so the event feed can answer "who stopped the
+    # server" when four of them can. Not an identity claim — the token is one
+    # shared secret — just a label the daemon records.
+    if body is not None and path.startswith("/action"):
+        body = {"via": "gui", **body}
     try:
         with httpx.Client(timeout=timeout) as c:
             r = (
@@ -295,11 +300,23 @@ class Dashboard(QWidget):
         mv.addWidget(self.mem_spark)
         grid.addWidget(mem_box, 4, 0, 1, 3)
 
+        # The CPU series was already sampled every poll, stored in SQLite and
+        # published on /state — and drawn by nothing. That left the tile as a
+        # lone 0.3-second sample of a process whose work comes in bursts (world
+        # tick, autosave, level streaming), so the number jumped between readings
+        # with nothing in the world changing and no way to tell a spike from the
+        # truth. A trend costs one widget and makes the tile legible.
+        cpu_box = QGroupBox("CPU (cores) — recent trend")
+        cv = QVBoxLayout(cpu_box)
+        self.cpu_spark = Sparkline("#47c8ff")
+        cv.addWidget(self.cpu_spark)
+        grid.addWidget(cpu_box, 5, 0, 1, 3)
+
         ev_box = QGroupBox("Events")
         ev = QVBoxLayout(ev_box)
         self.events = QListWidget()
         ev.addWidget(self.events)
-        grid.addWidget(ev_box, 5, 0, 1, 3)
+        grid.addWidget(ev_box, 6, 0, 1, 3)
 
     def update_state(self, s: dict) -> None:
         m = s.get("metrics") or {}
@@ -314,7 +331,19 @@ class Dashboard(QWidget):
             f"{m.get('server_frame_time', 0):.1f} ms" if m else "—"
         )
         self.tiles["Memory"].setText(f"{p.get('memory_mb', 0):,.0f} MB" if p else "—")
-        self.tiles["CPU"].setText(f"{p.get('cpu_percent', 0):.0f}%" if p else "—")
+        # Cores, not just a share of the machine — see procs.format_cpu. A
+        # percentage of an N-core box divides the whole interesting range by N,
+        # so a server pegging a core used to read "3%" on a 32-core host and an
+        # idle one read "0%" on anything with 16 or more.
+        self.tiles["CPU"].setText(
+            procs.format_cpu(
+                p.get("cpu_cores", 0.0),
+                p.get("cpu_percent", 0.0),
+                measured_launcher=bool(p.get("measured_launcher")),
+            )
+            if p
+            else "—"
+        )
         up = m.get("uptime", 0)
         self.tiles["Uptime"].setText(f"{up // 3600}h {(up % 3600) // 60}m" if m else "—")
         self.tiles["In-game day"].setText(str(m.get("days", "—")))
@@ -325,6 +354,12 @@ class Dashboard(QWidget):
             last = hist[-1]
             self.fps_spark.push(float(last.get("fps", 0)))
             self.mem_spark.push(float(last.get("memory_mb", 0)))
+            # history stores the machine share (and so does the metrics table, on
+            # disk, going back). Cores is the exact inverse of how that share was
+            # derived — share = raw / N, cores = raw / 100 — so convert here
+            # rather than migrating a database column for a unit change.
+            cores = float(last.get("cpu", 0.0)) * int(p.get("cpu_count", 0) or 0) / 100
+            self.cpu_spark.push(cores)
 
         self.events.clear()
         for e in reversed(s.get("events", [])):

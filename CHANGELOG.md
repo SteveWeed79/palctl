@@ -10,6 +10,386 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+### Added
+- **Auto-pause: an empty server puts itself away, and comes back when somebody
+  tries to connect.** Off by default (`autopause_enabled`), and turning it off
+  is always the safe direction — the server simply stays up.
+
+  palctl **stops** the server rather than `SIGSTOP`-ing it, which is a
+  deliberate departure from how the rest of the field does this. A suspended
+  process still owns the UDP port, so the wake packet lands in its receive
+  buffer where nothing can see it without root and packet capture; a stopped
+  server releases the port and palctl just listens on it. And a suspended
+  process still holds its leaked memory — palctl exists because Palworld leaks,
+  and freezing a 12 GB process leaves 12 GB frozen. The cost is honest and
+  belongs to the first player back: a stopped server takes tens of seconds to
+  load.
+
+  Every branch fails safe toward *running*. It will not act while an operation
+  holds the lock, while the API is silent (that is the watchdog's business, and
+  pausing would hide a sick server behind a deliberate-looking stop), when the
+  player count is unknown as opposed to zero, or on a server somebody stopped
+  on purpose — which it also never wakes. A freshly woken server gets a grace
+  period so the player whose connection woke it isn't put away while still
+  loading in.
+- **`palctl save-prune --player NAME`** prunes one named player — the escape
+  hatch the 90%-of-the-world refusal points at. It only ever *narrows* the
+  automatic selection: the player must still be known, inactive and not
+  excluded, so naming somebody is not a way around any rule.
+- **The deep save audit now counts guilds and base camps**, and reports guilds
+  whose every member has stopped playing. A guild with even one active player
+  is that player's guild and is never counted — and a guild palctl could not
+  read the membership of is never counted either, since an empty member set is
+  a subset of everything and would make every unparseable guild a target.
+- **The prune can be driven from the daemon**, under the same operation lock as
+  a backup, with `apply` off by default over HTTP exactly as on the CLI.
+- **A `/metrics` endpoint in Prometheus format.** palctl keeps seven days of
+  metrics and could show about two hours of them, in its own sparkline, with no
+  way to export any of it — so "was the server slow last Tuesday?" was
+  unanswerable from inside palctl and trivial in Grafana. Deliberately the
+  small version of the idea: a handful of well-labelled gauges collected at
+  scrape time, built from the *same* document `/state` serves, because two
+  collectors drift and a metrics endpoint that disagrees with the dashboard is
+  worse than none. Token-gated like everything else. The most alert-worthy
+  sample is `palctl_workers_degraded` — the daemon is up and not doing its job,
+  which `/healthz` alone reports as healthy.
+- **palctl can register the game server on Linux.** Setup's server registration
+  was Windows-only and keyed off `PalServer.exe`, so on Linux it registered
+  nothing and every later `systemctl start` went at a unit that did not exist —
+  the supervision, the watchdog and the scheduler all silently had nothing to
+  drive, on the platform the README advertises as supported. The unit is
+  `Type=simple`, not `notify` (PalServer never calls `sd_notify`; under
+  `Type=notify` systemd waits for a READY that never comes, then kills a
+  healthy server), carries a working directory (the launcher resolves its
+  engine relative to it), waits longer before restarting, and gets 120s to
+  shut down so the world finishes writing. It is registered but **not
+  enabled**: palctl's daemon owns the boot decision, and an enabled unit would
+  start the server behind its back.
+- **`palctl setup` — first-run setup without the desktop wizard.**
+  `setup_flow.run_setup` was written Qt-free on purpose and then only ever
+  called from the GUI, so a headless Linux install could not run setup at all.
+  Dry run by default, like `save-prune`.
+- **`palctl save-prune` removes departed players' records from `Level.sav`** —
+  the fix for the save-size death spiral that palctl's memory watchdog could
+  only treat the symptom of. It is the only thing in palctl that rewrites a
+  world, and it is built as a series of refusals with a mutation at the end:
+
+  * **Dry run unless you pass `--apply`.** You have to ask twice.
+  * **The server must be stopped**, established by looking for its process
+    rather than by asking the service manager. Rewriting a save the server has
+    open corrupts it, and its next autosave would overwrite the result anyway.
+  * **A backup is taken and *verified* first** (`backups.verify`) — an undo
+    nobody checked is not an undo.
+  * **Only players palctl can identify, has not seen for months, and has not
+    already pruned.** A save file it cannot match to a session is never a
+    target. A plan that would remove more than 90% of the world's records is
+    refused outright, because that is far likelier to be an attribution bug
+    than a world that is 90% abandoned.
+  * **The rewritten save is re-read and checked before it replaces anything** —
+    the targets gone, and every other player's record count unchanged. Only
+    then is the file swapped, with the original kept beside it.
+  * **An exclusion list beside the world** records who was pruned, so a player
+    who comes back is never pruned a second time.
+- **`palctl save-audit --deep` reads `Level.sav` itself**, and reports how many
+  character records — a player's own character plus every pal they caught —
+  are held for players who stopped playing months ago. That is the number the
+  plain audit could only call a floor.
+
+  It runs in a **separate short-lived process**, always. Parsing a
+  multi-gigabyte save needs multiple gigabytes of RAM, and a daemon that does
+  that in-process is one the OOM killer may choose — taking down the supervisor
+  of a running game server to answer a question nobody was blocked on. Every
+  failure of that child (crash, OOM kill, timeout, an upstream format change,
+  output that isn't JSON) comes back as "couldn't read it" with a reason, and
+  the file-size report stands on its own.
+
+  This vendors [palworld-save-tools](https://github.com/cheahjs/palworld-save-tools)
+  0.24.0 (MIT, no dependencies, 228 KB) under `palctl/vendor/`. Vendored rather
+  than a pip extra because the Windows installer ships a frozen build with no
+  Python and no pip — the users most likely to hit save bloat are the ones
+  least able to `pip install` a fix. Nothing there is edited; palctl code
+  reaches it only through `savescan.py`.
+- **`palctl save-audit` — what's in your world folder, and how much of it is
+  nobody's.** Palworld's `Level.sav` grows without bound: every player who ever
+  joined leaves a character record, every guild a group record, every abandoned
+  base camp its own, and none of it is ever collected. Past a few gigabytes
+  saves stall and restarts outlast the players' patience. palctl now reports
+  world and `Level.sav` size, and — using the session history no other tool in
+  this space has — names the players who haven't been seen in months.
+
+  It is diagnosis only: it reads sizes and filenames and does not parse,
+  decompress or modify a single save. Two refusals are deliberate. A save file
+  palctl can't match to a session is reported as **unknown, never as inactive**
+  (a world restored from a backup is full of players palctl never met, and
+  "I don't know" is not "nobody wants this"). And the reclaimable figure is
+  stated as a **floor**, because it counts only the small per-player files —
+  the weight is those players' records inside `Level.sav`, which needs a
+  parser palctl does not yet ship.
+- **Sessions now record each player's Palworld `playerId`.** Save files are
+  named after that GUID, not the Steam user ID palctl was keyed on, so until
+  now there was no way to look at `Players/<guid>.sav` and say whose it is —
+  the prerequisite for any cleanup that deletes something. Added as a nullable
+  column on the existing table; old rows keep a NULL, which is honest, and any
+  future cleanup must treat unknown as do-not-touch.
+- **The event feed now records who asked.** Four surfaces can stop this server
+  — the desktop GUI, the web dashboard, the CLI and the Discord bot — and the
+  feed recorded that a stop happened but never who wanted it, so the first
+  question after a surprise had no answer inside palctl. Events now carry an
+  actor and the surface it came from ("zoe (discord)"), shown by `palctl
+  events` and carried on `/state`. Attribution is inherited by whatever an
+  action spawns, so a restart whose countdown ends ten minutes later is still
+  recorded as that person's restart, and it is absent for anything palctl
+  decided itself — which is the answer to "did a person do this?".
+- **Updates now warn the people they are about to disconnect.** An update takes
+  the server down for longer than a restart does, and it was the one operation
+  that did it with no notice — the countdown machinery existed and updates were
+  simply left out of it. They now get the same countdown, the same in-game
+  announcements, and the same two escape hatches (cancel, or skip the wait) as
+  a scheduled restart, and collapse to a few seconds when nobody is online.
+- **A Steam branch can be held.** `steam_branch` (and `steam_beta_password` for
+  a branch that needs one) pass `-beta` through to SteamCMD, so a server can sit
+  on a known-good build instead of taking whatever `public` is serving today.
+  Palworld patches constantly and has shipped save-breaking builds; until now
+  there was no way to say "not that one". Pinning to an exact depot manifest
+  needs DepotDownloader and is not part of this.
+- **Calendar-based backup retention.** `backup_keep_daily` / `_weekly` /
+  `_monthly` keep the newest backup in each of the last N days, ISO weeks and
+  months, layered on top of the flat count — a backup survives if any rule
+  wants it, so turning this on can only ever keep more. Without it, a burst of
+  manual backups (exactly what people take before doing something risky) evicts
+  the entire older history, and the day you need a backup is usually the day
+  you learn the corruption started last week.
+- **Setup warns when backups land on the server's own disk.** That covers a bad
+  update, a botched restore and a corrupt save — but not the disk, which is the
+  failure the word "backup" makes people assume they are covered for. A
+  warning, never a blocker.
+- **Backups now record what they are, and can be checked without restoring
+  them.** Every backup gets a `palctl-manifest.json`: the file list with sizes,
+  whether the pre-backup save actually flushed, and whether the copy was
+  consistent. `backups.verify()` reads it back — every file present at the size
+  it was written at, plus a header check on each `.sav` that catches a
+  truncated save without decompressing anything. Until now the only way to find
+  out whether a backup was any good was to restore it and see, which is the one
+  experiment nobody runs.
+- **Off-site backups can be brought back down.** `rclone.pull()` fetches one
+  backup from the remote into the local backup root, staged through a
+  `.partial` and renamed, so an interrupted download never looks like a
+  finished backup. Off-site copies exist for the case where the box is gone —
+  palctl could upload, list and prune them, but not retrieve one, so the answer
+  to a dead disk was still a manual rclone invocation worked out under pressure.
+- **Setup now checks that something will actually start your server after a
+  reboot.** palctl sets the game service to Manual only when its own daemon runs
+  as a boot service and takes that job on; in every other arrangement Manual
+  means nothing starts the server, on any reboot, forever — and it produces no
+  error, because the daemon whose absence causes it isn't running to complain.
+  The readiness checks (both the CLI setup flow and the GUI wizard) now compare
+  the service's real start type against how palctl itself is set to start, and
+  say plainly which of the two is supposed to be doing it. This is what catches
+  anyone already left in that state by an uninstall from before the handback
+  existed. A Disabled service is reported but never called a failure — that is
+  somebody deliberately turning the server off.
+
+### Fixed
+- **A backup was taken even when the save before it failed, and filed as
+  clean.** The pre-backup flush returns whether the server's REST API answered,
+  and that answer was discarded — so when the API was wedged, which is exactly
+  when a good backup matters most, palctl copied an unflushed world and
+  reported success. The copy still happens (an older world beats no world) but
+  it is now announced, and recorded in the backup's manifest so a restore can
+  say the world may be older than the backup's timestamp.
+- **Scheduled backups forgot where they were across a daemon restart.** The
+  loop slept a full interval before its first backup, measured from daemon
+  start, so a box that restarts more often than the interval never reached a
+  backup at all — and nothing warned, because no backup had *failed*. The wait
+  is now measured from the newest backup on disk, which cannot drift from the
+  thing it describes. An overdue backup runs after a short grace rather than
+  the instant the daemon comes up, since the server is usually still starting.
+- **Nothing ever said "your backups aren't running".** Everything reported a
+  backup that failed; the quieter case — scheduling switched off, or an
+  interval of zero, while the operator believes backups are running because
+  they set them up once — was silent. palctl now says so once per daemon run
+  when the newest backup is older than it should be.
+- **`sessions.db` was copied hot into every backup.** A live SQLite file copied
+  byte-for-byte can land mid-transaction and restore as invalid, not merely
+  stale, and nothing says so until someone opens it. The config snapshot now
+  takes it through SQLite's own backup API, so what lands in the zip always
+  opens.
+- **A crashed worker loop was never restarted.** One escaped exception retired
+  that loop for the life of the daemon — the memory watchdog, or the scheduler,
+  simply gone — while the daemon stayed up, the control API kept answering and
+  `/healthz` kept reporting "ok". Loops are now restarted with a 5s → 30s → 2m
+  → 10m backoff and a bounded budget, and once that budget is spent the daemon
+  reports itself `degraded` in `/healthz` and `/state` instead of claiming
+  health it doesn't have.
+- **The nightly auto-update took the server down whether or not there was an
+  update.** The loop went straight to running SteamCMD, so on the majority of
+  nights when Steam had shipped nothing it still stopped, updated and restarted
+  the server, in front of whoever was playing. It now checks first, and fails
+  *closed*: an inconclusive check is not evidence of a new build.
+- **Discord notifications that failed to send said nothing at all.** The
+  delivery path swallowed `DiscordException` with a bare `pass`, so the usual
+  causes — the bot losing Send Messages on that channel, the channel being
+  deleted — were permanent and invisible until someone noticed palctl had gone
+  quiet. Failures are now logged.
+- **The hung-daemon health task could never run in a source install.**
+  `schtasks /Create` has no working-directory option — that lives in the task
+  XML — so a scheduled task runs from the scheduler's own directory. For a
+  frozen build that is harmless (an absolute path to `palctl-daemon.exe`, no
+  arguments), but a pip or source install runs `python -m palctl.daemon`, which
+  resolves `-m` against the current directory: the health check failed with "No
+  module named palctl" every five minutes, forever. Nothing noticed, because
+  `register_health_task` returned success — schtasks had registered the task
+  perfectly well; it was the task that could not run. So those installs had no
+  wedged-daemon recovery at all while being told they did. The command now
+  carries its checkout directory when it needs one; the frozen path is
+  unchanged.
+- **palctl took over starting your server at boot, then could give that job up
+  without handing it back.** Setup registers the PalServer service **Manual**
+  when palctl itself runs as a boot service, on purpose: palctl's daemon then
+  starts the server after a reboot, which is what lets a server you deliberately
+  stopped stay stopped. That trade only holds while a boot-time daemon exists to
+  keep its half — and nothing ever gave the job back. `palctl-daemon
+  install-startup` (switching to login startup) left a daemon that does not
+  exist until somebody signs in, so the server came up only if a human logged in
+  within fifteen minutes of boot, and on a headless box never. `palctl-daemon
+  uninstall-service`, and unticking background startup in setup, left PalServer
+  Manual with nothing alive to start it at all — a server that silently never
+  came back after any reboot, with no message anywhere and nothing in palctl
+  that checked for it. Those paths now set the service back to Automatic and say
+  so, so Windows resumes the job palctl is no longer doing. Only **Manual** is
+  touched: Automatic already boots, and **Disabled is left alone** — that is
+  somebody deliberately turning the server off, and quietly re-enabling it on
+  the way out would be palctl making a decision that isn't its to make. When the
+  change needs an administrator and palctl doesn't have one, it prints the exact
+  `sc config` command rather than leaving the server silently unbootable. The
+  stored WinSW config is updated to match, so a later setup re-run doesn't see a
+  stale registration and bounce a live server over it. Windows-only; on Linux
+  palctl never registers the game service.
+- **A daemon that could never start was restarted forever, invisibly.** Both
+  service wrappers were told to restart on failure and never told when to stop.
+  Some startup failures are permanent — another daemon already holding the
+  control port, an unwritable config directory, a half-finished upgrade — and
+  the daemon would then be relaunched every five seconds for good. On Linux one
+  restart per 5 s stays *under* systemd's own default rate limiter (5 starts per
+  10 s), so the unit never reached `failed` and never appeared in
+  `systemctl --failed`; on Windows, WinSW repeats its last `<onfailure>` entry
+  indefinitely, so services.msc showed a service flickering rather than a
+  stopped one. Either way the operator saw a service that looked like it was
+  starting, a game server nobody was supervising, and no indication why. The
+  systemd unit now carries `StartLimitIntervalSec=300` / `StartLimitBurst=5` (in
+  `[Unit]`, where they have been since systemd 229 — under `[Service]` they are
+  silently ignored), and the WinSW config escalates 5 s → 20 s → 60 s and then
+  stops, with `<resetfailure>1 hour</resetfailure>` so clean uptime clears the
+  count. A transient failure still recovers untouched; a permanent one stops and
+  says so, and on Windows the five-minute health task keeps trying from there.
+- **The CPU reading was being divided into invisibility before you saw it.**
+  Twice before, this was reported as "CPU always shows 0%" and twice it was fixed
+  in the *sampling* — and the sampling has been right since. The number was then
+  normalised to a share of the whole machine and rendered with no decimals, and
+  those two compound: the entire meaningful range for one busy core is 100/N on
+  an N-core box. A Palworld server pegging a core showed **25%** on a 4-core box,
+  **6%** on 16, **3%** on 32 and **2%** on 64; an idle-but-running server showed
+  a flat **0%** on anything with 16 cores or more, next to a Memory tile and an
+  FPS tile that were both live. So the reading looked broken on exactly the
+  hardware people host on.
+  palctl now reports **CPU-cores-equivalent** alongside the machine share —
+  `1.00 cores (3.1%)` — because that is the figure that survives the box it was
+  measured on, and because Palworld saturates one game-tick thread long before it
+  runs out of cores, so "1.00 cores" is the number that says the server is at its
+  ceiling. Same reading on the desktop GUI, the web dashboard, `palctl status`
+  and Discord `/health`, from one shared formatter.
+- **palctl could measure the wrong server entirely.** Candidate processes were
+  collected into a dictionary keyed by process *name* — which they share — so
+  with two Palworld servers running, each later one overwrote the earlier, and
+  since psutil enumerates in ascending PID order the survivor was whichever
+  server started **last**. That is precisely the leftover: a stale service
+  registration firing at boot, or a second copy started on top of a server that
+  has been up for days. Measured with a busy instance and an idle one, palctl
+  picked the idle one five times out of five and reported its 0% CPU and few MB
+  of memory as the server's — **and the memory-leak watchdog watched that
+  instance too, so it could never fire.** The choice is now made properly: the
+  install `server_root` points at wins outright (a second service is usually a
+  second install, so this is exact rather than a guess), then resident memory,
+  then the lower PID so repeated readings agree. `/state` also publishes how many
+  server processes are running, so a surface can say so instead of quietly
+  describing one of them.
+- **The thin launcher's idle 0% was published as if it were the server's.** When
+  palctl can only reach `PalServer.exe`/`PalServer.sh` and not the real binary
+  behind it, it used to hand that process's numbers to every surface. It now says
+  the reading is unavailable, which is the truth.
+
+### Added
+- **A CPU trend line in the desktop dashboard.** The CPU series was already
+  sampled every poll, stored in SQLite and published on `/state` — and drawn by
+  nothing, leaving the tile as a lone 0.3-second sample of a process whose work
+  arrives in bursts. It now sits beside the FPS and Memory sparklines.
+
+### Fixed
+- **palctl blamed you for stops it made itself.** Three paths deliberately stop
+  the server and then refuse to go on: an update or a restore that finds a
+  PalServer process still holding the files, and a restore that fails with no
+  world left in place. All three are right to leave the server down — but none
+  of them recorded that palctl was the one who stopped it. The daemon reads
+  "should be running" plus "the service says STOPPED and palctl isn't busy" as
+  somebody stopping the server behind its back, so a few polls later it
+  announced exactly that — *"The server was stopped outside palctl (services.msc,
+  `sc stop`, or Task Manager)"* — about a stop it had performed seconds earlier,
+  and quietly flipped the intent to "stay down" while the real reason scrolled
+  past. Those aborts now record the stop as palctl's own and say so, so the
+  supervisor stands down instead of accusing anyone, and the message you are
+  left looking at is the one that names the problem.
+- **A backup that worked could abort your server update.** Retention ran inside
+  the backup's own `try`, so a prune that failed — one old backup directory held
+  by an antivirus or the search indexer, which on Windows is routine and
+  permanent — was reported as "Backup failed" for a backup sitting complete on
+  disk. `update_requires_backup` (on by default) then read that as "no safety
+  net" and aborted the update. One stuck folder was enough to stop a server ever
+  updating again. Retention is now housekeeping that runs after the valuable
+  work: it reports its own trouble, on its own terms, and never fails the backup
+  it follows.
+- **Retention gave up at the first directory it couldn't delete**, so every
+  later run stopped in the same place and nothing was ever pruned again — while
+  palctl warned about the low disk that caused. It now deletes everything
+  deletable and reports once, naming what stuck.
+- **The "your server runs from a different folder than palctl updates" warning
+  could be silenced before it ever ran.** It fires once per daemon run, and the
+  one shot was spent even when the check came back inconclusive — which it does
+  whenever psutil can't read the server process's image path, exactly what a
+  server running as SYSTEM under a login-user daemon produces. So the installs
+  most likely to have a split root were the ones told least, and a wrong server
+  root is *the* reason an update reports success and changes nothing. Only a
+  conclusive reading counts now.
+- **A watchdog restart that failed restarted the server again a minute later,
+  forever.** The 20-minute cooldown was stamped only after a successful restart
+  cycle, so if anything on that path raised — an event subscriber failing on the
+  full disk that triggered the restart, a malformed `/metrics` reply while
+  waiting for the server to come back — the next tick found memory still over
+  the line and no cooldown, and went again. Every poll interval, kicking players
+  each time. The cooldown now belongs to the attempt.
+- **The dashboard's "update available" badge was wrong for hours after an
+  update.** `update_status` is the standing answer to "is this server on the
+  build Steam is serving clients?", and only the six-hourly check refreshed it —
+  so the one moment it was guaranteed to be stale was straight after the update
+  that fixed it. The update now records what it verified.
+- **The pre-update copy of your settings was stored inside the folder SteamCMD
+  rewrites.** PalWorldSettings.ini lives under the server install, so the one
+  copy that makes a bad update undoable sat in the blast radius of the thing it
+  protects — and if the update took the Config directory with it, restoring the
+  ini raised, which aborted the repair before it re-asserted the REST API
+  settings and left palctl blind to a server that was running perfectly well.
+  The snapshot goes to palctl's own config directory (`ini-backups/`) now.
+- **`.bak` copies of PalWorldSettings.ini piled up forever** in the server's own
+  Config folder. Every path that rewrites the ini takes one first, and a single
+  server update takes up to three; with scheduled auto-updates on, that is
+  roughly a thousand files a year that nothing ever removed. The newest ten are
+  kept.
+
+### Changed
+- Listing backups no longer measures every file of every backup when only the
+  names are needed. Retention runs right after each backup and used to pay for a
+  full recursive walk of the whole backup tree — a real cost with a couple of
+  dozen retained multi-GB worlds on a slow disk or a network share.
+
 ## [1.2.7.0] — 2026-08-10
 
 ### Added

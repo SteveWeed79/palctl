@@ -16,6 +16,7 @@ setup flow, the GUI wizard and the CLI all call it by that name.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import subprocess
 import sys
@@ -24,7 +25,7 @@ from pathlib import Path
 
 from . import procs, startup, winservice
 from .client import DAEMON_PORT
-from .config import config_dir
+from .config import Config, config_dir
 from .logging_setup import setup_logging
 
 SERVICE_NAME = "palctl-daemon"  # the Windows service name palctl registers
@@ -301,11 +302,71 @@ def uninstall_service() -> None:
 
         firewall.remove_rule()
         wintask.remove_health_task()
+        # The daemon that was starting the game server at boot is gone; give
+        # that job back to Windows before we finish. See _hand_back_server_boot.
+        _hand_back_server_boot("no longer runs as a service")
     else:
         from . import systemd
 
         systemd.remove_service(SERVICE_NAME)
     print(f"[daemon] service '{SERVICE_NAME}' removed.")
+
+
+def _hand_back_server_boot(why: str) -> None:
+    """Give the game server's boot start back to Windows, because palctl is
+    about to stop being the thing that provides it.
+
+    Setup registers PalServer **Manual** when palctl runs as a boot service, so
+    that a server somebody deliberately stopped stays stopped across a reboot —
+    palctl's daemon starts it instead (setup_flow.server_service_start_mode,
+    daemon._restore_boot_intent). That trade only holds while a boot-time daemon
+    exists to keep its half.
+
+    Nothing used to hand it back. Switching to login startup left a daemon that
+    only exists after somebody signs in, so the server came up only if a human
+    logged in within daemon.BOOT_INTENT_WINDOW (15 minutes) of boot — and on a
+    headless box, never. Removing the service left PalServer Manual with nothing
+    alive to start it at all: a server that silently never came back after any
+    reboot, with no message anywhere and nothing in palctl that checked.
+
+    Only Manual is touched. Automatic already boots. **Disabled is left alone**
+    — that is somebody deliberately turning the server off, and quietly
+    re-enabling their server on the way out would be palctl making a decision
+    that isn't its to make, which is the same mistake in the other direction.
+    """
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        name = Config.load().service_name
+        if not name or not winservice.service_exists(name):
+            return
+        if winservice.start_mode_of(name) != "Manual":
+            return
+        changed = winservice.set_start_mode(name, "Automatic")
+    except Exception:
+        # Best-effort by construction. This runs at the tail of an uninstall or
+        # a startup-mode switch, and a courtesy step must never be the thing
+        # that makes one of those fail — an unreadable config, an sc.exe that
+        # isn't on PATH, a wedged SCM all mean "couldn't hand it back", not
+        # "abandon the teardown half-done".
+        return
+
+    if not changed:
+        print(
+            f"[daemon] NOTE: the '{name}' service is set to Manual start, and "
+            f"palctl {why} — so nothing will start your server after a reboot.\n"
+            "         palctl couldn't change it (this needs an administrator). "
+            "Set it to Automatic yourself:\n"
+            f"             sc config {name} start= auto"
+        )
+        return
+    with contextlib.suppress(Exception):
+        winservice.sync_config_start_mode(config_dir() / "bin", name, "Automatic")
+    print(
+        f"[daemon] '{name}' start mode set back to Automatic — palctl {why}, so "
+        "Windows starts\n         your server at boot again (palctl had taken "
+        "that job while it was running as a service)."
+    )
 
 
 def _register_health_task(*, as_system: bool) -> None:
@@ -317,8 +378,14 @@ def _register_health_task(*, as_system: bool) -> None:
         return
     from . import wintask
 
-    exe, args, _ = service_target()
-    if wintask.register_health_task(exe, args, as_system=as_system):
+    exe, args, app_dir = service_target()
+    # A source install's command is `python -m palctl.daemon`, which only
+    # resolves from the checkout — and a scheduled task runs from System32
+    # unless told otherwise. The frozen build needs no directory (absolute exe,
+    # no -m), so only pass one when there are arguments to resolve.
+    if wintask.register_health_task(
+        exe, args, as_system=as_system, app_dir=app_dir if args else None
+    ):
         print(
             "[daemon] health watchdog scheduled: every 5 minutes palctl checks "
             "itself and auto-restarts a hung daemon."
@@ -344,6 +411,9 @@ def install_startup() -> None:
     # process) and thus only while logged in — exactly when a login-mode
     # daemon is supposed to exist at all.
     _register_health_task(as_system=False)
+    # A login-startup daemon does not exist until somebody signs in, so it
+    # cannot be what starts the server at boot. See _hand_back_server_boot.
+    _hand_back_server_boot("now starts at login rather than at boot")
     print(
         "[daemon] palctl will start automatically when you log in — no password "
         "or Windows service needed."

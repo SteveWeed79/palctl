@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import localauth
+from . import localauth, procs, saveaudit
 from .client import DAEMON_PORT, DaemonClient, DaemonError
 
 # ---------------- formatting (pure, tested) ----------------
@@ -58,7 +58,21 @@ def fmt_status(state: dict) -> str:
     p = state.get("process")
     if p:
         lines.append(f"memory     {p['memory_mb']:,.0f} MB")
-        lines.append(f"cpu        {p['cpu_percent']:.0f}%")
+        lines.append(
+            "cpu        "
+            + procs.format_cpu(
+                p.get("cpu_cores", 0.0),
+                p.get("cpu_percent", 0.0),
+                measured_launcher=bool(p.get("measured_launcher")),
+            )
+        )
+        if p.get("instances", 1) > 1:
+            # These numbers describe ONE of them. Saying which is impossible;
+            # saying that there is more than one is the part that matters.
+            lines.append(
+                f"           ⚠ {p['instances']} Palworld server processes are "
+                "running — the readings above are from the largest one"
+            )
     return "\n".join(lines)
 
 
@@ -83,8 +97,229 @@ def fmt_events(events: list[dict], n: int = 20) -> str:
     if not events:
         return "No recent events."
     return "\n".join(
-        f"{e['at'][:19]}  {e['kind']:<16} {e['message']}" for e in events[-n:]
+        f"{e['at'][:19]}  {e['kind']:<16} {e['message']}{_by(e)}"
+        for e in events[-n:]
     )
+
+
+def _by(event: dict) -> str:
+    """" — by zoe (discord)" when a person asked for this, else nothing.
+
+    Absence is meaningful: no attribution means palctl decided it by itself,
+    which is exactly what someone reading "the server restarted" needs to know
+    first."""
+    actor = (event.get("actor") or "").strip()
+    via = (event.get("via") or "").strip()
+    if not actor and not via:
+        return ""
+    if actor and via:
+        return f"  — by {actor} ({via})"
+    return f"  — by {actor or via}"
+
+
+def _save_audit(days: int, *, deep: bool = False) -> str:
+    """Read the world folder and the session history directly.
+
+    Deliberately NOT through the daemon: this is a read-only look at files on
+    this machine, it needs no privileges the user doesn't already have, and it
+    has to work on exactly the box where a stalling server is being diagnosed —
+    including when the daemon is the thing that has fallen over.
+    """
+    from .config import Config
+    from .events import SessionStore
+
+    cfg = Config.load()
+    worlds = saveaudit.world_dirs(cfg.savegames_dir)
+    if not worlds:
+        return (
+            f"No world found under {cfg.savegames_dir}. Check the server root "
+            "in Config — a world folder holds Level.sav."
+        )
+
+    store = SessionStore()
+    try:
+        seen = store.last_seen_by_player_id()
+    finally:
+        store.close()
+
+    reports = []
+    for w in worlds:
+        report = saveaudit.format_audit(saveaudit.audit(w, seen), days=days)
+        if deep:
+            report += "\n" + _deep_report(w, seen, days)
+        reports.append(report)
+    return "\n\n".join(reports)
+
+
+def _deep_report(world, seen: dict, days: int) -> str:
+    """The Level.sav half: what those idle players actually weigh.
+
+    Printed as a continuation of the audit rather than replacing it, because a
+    failed scan must still leave the operator with the file-size report they
+    would have had anyway.
+    """
+    from . import savescan
+
+    print("Reading Level.sav — this can take minutes on a large world…", flush=True)
+    result = savescan.scan(world / saveaudit.LEVEL_SAV)
+    if not result.ok:
+        return f"\n  Level.sav not read: {result.error}"
+
+    lines = [
+        f"\n  Level.sav holds {result.characters:,} character record(s) "
+        f"({result.unowned:,} wild or unattributed), {result.guilds:,} guild(s) "
+        f"and {result.base_camps:,} base camp(s)."
+    ]
+    idle = {p.player_id.replace("-", "").upper(): p for p in
+            saveaudit.audit(world, seen).inactive(days=days)}
+    owed = [(result.by_player.get(g, 0), p) for g, p in idle.items()]
+    owed = [(n, p) for n, p in owed if n]
+    if owed:
+        lines.append("  Of those, belonging to players not seen in months:")
+        for n, p in sorted(owed, reverse=True, key=lambda t: t[0]):
+            lines.append(f"    {p.name or p.player_id:<24} {n:>6,} record(s)")
+        lines.append(
+            f"  That is {sum(n for n, _ in owed):,} of {result.characters:,} "
+            "records held for players who have stopped playing."
+        )
+        orphans = result.orphan_guilds(set(idle))
+        if orphans:
+            lines.append(
+                f"  {orphans} guild(s) have no remaining active member. A guild "
+                "with even one\n  player still around is that player's guild and "
+                "is never counted here."
+            )
+    return "\n".join(lines)
+
+
+def _setup(args) -> int:
+    """First-run setup, without Qt.
+
+    `setup_flow.run_setup` was written Qt-free on purpose and then only ever
+    called from the wizard, so the headless Linux install the README advertises
+    had no way to run setup at all. This is the missing front end: same plan
+    object, same sequence, printing instead of updating a progress list.
+
+    Dry run by default, like `save-prune`: setup writes config, edits the game's
+    ini and can register a system service, and an operator on a box they cannot
+    see should be able to read the plan before any of that happens.
+    """
+    from . import discovery, setup_flow
+    from .config import Config
+
+    cfg = Config.load()
+
+    server_root = args.server_root or str(
+        next(iter(discovery.detect_server_roots()), "") or cfg.server_root
+    )
+    steamcmd = args.steamcmd or str(
+        next(iter(discovery.detect_steamcmd()), "") or cfg.steamcmd_path
+    )
+    if not server_root:
+        print(
+            "No Palworld server found, and --server-root wasn't given. Point "
+            "setup at the directory holding PalServer.sh, or pass "
+            "--install-server to fetch it from Steam."
+        )
+        return 1
+
+    plan = setup_flow.SetupPlan(
+        server_root=server_root,
+        steamcmd_path=steamcmd,
+        api_port=args.api_port,
+        password=args.admin_password or cfg.api_password,
+        install_server=args.install_server,
+        install_vcredist=False,  # Windows-only runtime
+        register_server_service=args.register_service,
+        daemon_startup="none",  # the daemon's own unit is `daemon install-service`
+        service_name=cfg.service_name or "palserver",
+        backup_root=args.backup_root or cfg.backup_root,
+    )
+
+    print("Setup plan:")
+    print(f"  Server root     {plan.server_root}")
+    print(f"  steamcmd        {plan.steamcmd_path or '(none — cannot install/update)'}")
+    print(f"  REST API port   {plan.api_port}")
+    password_note = (
+        "set" if plan.password else "NOT SET — the REST API will be unusable"
+    )
+    print(f"  Admin password  {password_note}")
+    print(f"  Backups         {plan.backup_root or '(default)'}")
+    print(f"  Install server  {'yes' if plan.install_server else 'no'}")
+    service_note = (
+        f"register {plan.service_name}" if plan.register_server_service else "no"
+    )
+    print(f"  Server service  {service_note}")
+
+    if not args.apply:
+        print("\nThis was a dry run. Re-run with --apply to do it.")
+        return 0
+
+    result = setup_flow.run_setup(cfg, plan, log=lambda line: print(line, flush=True))
+    if not result.ok:
+        print("\nSetup did not complete. Nothing above that failed was retried.")
+        return 1
+    print(
+        "\nSetup complete. Register the daemon with "
+        "`sudo python -m palctl.daemon install-service`, then `palctl status`."
+    )
+    return 0
+
+
+def _save_prune(days: int, *, apply: bool, player: str = "") -> int:
+    """Plan — and with --apply, carry out — a Level.sav prune.
+
+    Whether the server is stopped is established by looking for its process,
+    not by asking the daemon or trusting a flag. This is the one command that
+    rewrites a world, and "the service says STOPPED" is a weaker claim than
+    "there is no PalServer process running".
+    """
+    from pathlib import Path
+
+    from . import procs, saveprune
+    from .config import Config
+    from .events import SessionStore
+
+    cfg = Config.load()
+    worlds = saveaudit.world_dirs(cfg.savegames_dir)
+    if not worlds:
+        print(f"No world found under {cfg.savegames_dir}.")
+        return 1
+    if len(worlds) > 1:
+        print(
+            f"{len(worlds)} worlds found under {cfg.savegames_dir}. palctl will "
+            "not guess which one to rewrite — move the others aside first."
+        )
+        return 1
+
+    running = procs.find_process(cfg.server_root) is not None
+    store = SessionStore()
+    try:
+        seen = store.last_seen_by_player_id()
+    finally:
+        store.close()
+
+    if apply:
+        print("Reading Level.sav and taking a verified backup — this takes a while…",
+              flush=True)
+    outcome = saveprune.run_prune(
+        worlds[0],
+        cfg.savegames_dir,
+        Path(cfg.backup_root),
+        seen,
+        server_stopped=not running,
+        apply=apply,
+        days=days,
+        only=player,
+    )
+    print(saveprune.format_plan(outcome.plan, applied=outcome.applied))
+    if outcome.error:
+        print(f"\n{outcome.error}")
+    if outcome.message:
+        print(f"\n{outcome.message}")
+    if not apply and outcome.plan.safe:
+        print("\nRe-run with --apply to do it, with the server stopped.")
+    return 0 if outcome.ok else 1
 
 
 def find_players(players: list[dict], name: str) -> list[dict]:
@@ -150,6 +385,61 @@ def main(argv: list[str] | None = None) -> int:
     ev = sub.add_parser("events", help="recent daemon events")
     ev.add_argument("-n", type=int, default=20, help="how many (default 20)")
 
+    sa = sub.add_parser(
+        "save-audit",
+        help="what's in your world folder, and how much of it is nobody's",
+    )
+    sa.add_argument(
+        "--days", type=int, default=saveaudit.INACTIVE_DAYS,
+        help=f"how long since a player's last session counts as inactive "
+             f"(default {saveaudit.INACTIVE_DAYS})",
+    )
+    st = sub.add_parser(
+        "setup",
+        help="first-run setup without the desktop wizard (headless Linux)",
+    )
+    st.add_argument("--server-root", default="", help="the Palworld server directory")
+    st.add_argument("--steamcmd", default="", help="path to steamcmd")
+    st.add_argument("--admin-password", default="",
+                    help="REST API admin password to set in PalWorldSettings.ini")
+    st.add_argument("--api-port", type=int, default=8212, help="REST API port")
+    st.add_argument("--backup-root", default="", help="where backups are written")
+    st.add_argument("--install-server", action="store_true",
+                    help="install/update the server from Steam first")
+    st.add_argument("--register-service", action="store_true",
+                    help="register a systemd unit for the game server (needs root)")
+    st.add_argument("--apply", action="store_true",
+                    help="actually do it. Without this, setup only reports the "
+                         "plan it would run.")
+
+    sp = sub.add_parser(
+        "save-prune",
+        help="remove departed players' records from Level.sav (dry run unless "
+             "--apply)",
+    )
+    sp.add_argument(
+        "--days", type=int, default=saveaudit.INACTIVE_DAYS,
+        help=f"how long since a player's last session counts as inactive "
+             f"(default {saveaudit.INACTIVE_DAYS})",
+    )
+    sp.add_argument(
+        "--player", default="",
+        help="prune only this player (name or GUID). Still subject to every "
+             "rule — they must be known, inactive and not excluded.",
+    )
+    sp.add_argument(
+        "--apply", action="store_true",
+        help="actually rewrite Level.sav. Without this it only reports what it "
+             "would remove. Requires a stopped server; takes and verifies a "
+             "backup first.",
+    )
+
+    sa.add_argument(
+        "--deep", action="store_true",
+        help="also read Level.sav to count each player's characters and pals "
+             "(slow, and needs memory proportional to the save)",
+    )
+
     def _countdown_flags(parser: argparse.ArgumentParser, what: str) -> None:
         """`--in`/`--now` on anything that warns players first. Both are
         overrides for this one call; the default lives in Config so the usual
@@ -214,6 +504,12 @@ def main(argv: list[str] | None = None) -> int:
             print(fmt_players(client.state().get("players", [])))
         elif args.cmd == "events":
             print(fmt_events(client.state().get("events", []), args.n))
+        elif args.cmd == "save-audit":
+            print(_save_audit(args.days, deep=args.deep))
+        elif args.cmd == "save-prune":
+            return _save_prune(args.days, apply=args.apply, player=args.player)
+        elif args.cmd == "setup":
+            return _setup(args)
         elif args.cmd == "start":
             client.action("start")
             print("Server starting.")

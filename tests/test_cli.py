@@ -7,6 +7,7 @@ import pytest
 
 pytest.importorskip("httpx")
 pytest.importorskip("keyring")
+pytest.importorskip("psutil")  # cli reads procs.format_cpu, the one CPU formatter
 
 from palctl.cli import (  # noqa: E402  (after importorskip)
     _countdown_seconds,

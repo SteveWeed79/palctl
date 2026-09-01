@@ -407,8 +407,9 @@ def test_install_service_registers_the_health_task(monkeypatch):
     monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda: True)
     monkeypatch.setattr(cli_mod, "_stop_daemon_process", lambda: None)
 
-    def _register(exe, args="", *, every_minutes=5, as_system=False):
+    def _register(exe, args="", *, every_minutes=5, as_system=False, app_dir=None):
         registered["as_system"] = as_system
+        registered["app_dir"] = app_dir
         return True
 
     monkeypatch.setattr(wintask, "register_health_task", _register)
@@ -572,3 +573,147 @@ def test_stop_daemon_process_escalates_to_kill(monkeypatch):
     assert killed == [111]
 
 
+
+
+# ---------- handing the game server's boot start back ----------
+#
+# Setup registers PalServer Manual when palctl runs as a boot service, because
+# palctl then owns starting it (setup_flow.server_service_start_mode +
+# daemon._restore_boot_intent). Nothing used to hand that job back. Switching to
+# login startup left a daemon that only exists after somebody signs in, so the
+# server came up only if a human logged in within BOOT_INTENT_WINDOW of boot —
+# on a headless box, never. Removing the service left nothing alive to start it
+# at all: a server that silently never came back after any reboot.
+
+
+class _FakeWinservice:
+    def __init__(self, mode, *, exists=True, can_set=True):
+        self.mode, self.exists, self.can_set = mode, exists, can_set
+        self.set_calls: list = []
+        self.synced: list = []
+
+    def service_exists(self, name):
+        return self.exists
+
+    def start_mode_of(self, name):
+        return self.mode
+
+    def set_start_mode(self, name, mode):
+        self.set_calls.append((name, mode))
+        if not self.can_set:
+            return False
+        self.mode = mode
+        return True
+
+    def sync_config_start_mode(self, cache_dir, name, mode):
+        self.synced.append((name, mode))
+        return True
+
+
+def _handback(monkeypatch, fake, *, service_name="PalServer", platform="win32"):
+    monkeypatch.setattr(cli_mod.sys, "platform", platform)
+    monkeypatch.setattr(cli_mod, "winservice", fake)
+    monkeypatch.setattr(
+        cli_mod, "Config",
+        types.SimpleNamespace(load=lambda: types.SimpleNamespace(service_name=service_name)),
+    )
+    cli_mod._hand_back_server_boot("no longer runs as a service")
+
+
+def test_a_manual_server_is_handed_back_to_windows(monkeypatch, capsys):
+    fake = _FakeWinservice("Manual")
+    _handback(monkeypatch, fake)
+    assert fake.set_calls == [("PalServer", "Automatic")]
+    # The stored WinSW config is pointed at the same mode, or the next wizard
+    # re-run compares byte-for-byte, sees "stale", and bounces a live server.
+    assert fake.synced == [("PalServer", "Automatic")]
+    assert "Automatic" in capsys.readouterr().out
+
+
+def test_an_automatic_server_is_left_alone(monkeypatch):
+    fake = _FakeWinservice("Automatic")
+    _handback(monkeypatch, fake)
+    assert fake.set_calls == []  # it already boots itself
+
+
+def test_a_disabled_server_is_never_re_enabled(monkeypatch):
+    """Disabled is somebody deliberately turning the server off. Quietly
+    switching it back on during an uninstall would be palctl making a decision
+    that isn't its to make — the same mistake in the other direction."""
+    fake = _FakeWinservice("Disabled")
+    _handback(monkeypatch, fake)
+    assert fake.set_calls == []
+
+
+def test_a_service_that_is_not_registered_is_not_invented(monkeypatch):
+    fake = _FakeWinservice("Manual", exists=False)
+    _handback(monkeypatch, fake)
+    assert fake.set_calls == []
+
+
+def test_failing_to_change_it_names_the_exact_command(monkeypatch, capsys):
+    """sc config needs elevation. When palctl can't do it, the operator has to
+    be left knowing their server will not start at boot, and how to fix it."""
+    fake = _FakeWinservice("Manual", can_set=False)
+    _handback(monkeypatch, fake)
+    out = capsys.readouterr().out
+    assert "sc config PalServer start= auto" in out
+    assert "reboot" in out
+    assert fake.synced == []  # never claim the config agrees when it doesn't
+
+
+def test_handback_is_a_noop_off_windows(monkeypatch):
+    fake = _FakeWinservice("Manual")
+    _handback(monkeypatch, fake, platform="linux")
+    assert fake.set_calls == []
+
+
+def test_an_unreadable_config_never_blocks_an_uninstall(monkeypatch):
+    def _boom():
+        raise OSError("config.json is unreadable")
+
+    fake = _FakeWinservice("Manual")
+    monkeypatch.setattr(cli_mod.sys, "platform", "win32")
+    monkeypatch.setattr(cli_mod, "winservice", fake)
+    monkeypatch.setattr(cli_mod, "Config", types.SimpleNamespace(load=_boom))
+    cli_mod._hand_back_server_boot("no longer runs as a service")  # must not raise
+    assert fake.set_calls == []
+
+
+def test_both_exit_paths_hand_the_boot_start_back():
+    """The wiring, not just the helper: leaving service mode and removing the
+    service are the two ways palctl stops being what starts the server."""
+    import inspect
+
+    assert "_hand_back_server_boot" in inspect.getsource(cli_mod.install_startup)
+    assert "_hand_back_server_boot" in inspect.getsource(cli_mod.uninstall_service)
+
+
+def test_a_source_install_gives_the_health_task_somewhere_to_run(monkeypatch):
+    """service_target() yields `python -m palctl.daemon` outside a frozen build,
+    and a scheduled task runs from System32 — so without a working directory the
+    health check failed with "No module named palctl" every five minutes while
+    reporting success. The frozen build (absolute exe, no arguments) must stay
+    on the plain command it has always had."""
+    from palctl import wintask
+
+    seen: dict = {}
+
+    def _register(exe, args="", *, every_minutes=5, as_system=False, app_dir=None):
+        seen["exe"], seen["args"], seen["app_dir"] = exe, args, app_dir
+        return True
+
+    monkeypatch.setattr(wintask, "register_health_task", _register)
+    monkeypatch.setattr(cli_mod.sys, "platform", "win32")
+
+    monkeypatch.setattr(
+        cli_mod, "service_target", lambda: ("py.exe", "-m palctl.daemon", r"C:\src")
+    )
+    cli_mod._register_health_task(as_system=False)
+    assert seen["app_dir"] == r"C:\src", "a source install needs its checkout"
+
+    monkeypatch.setattr(
+        cli_mod, "service_target", lambda: (r"C:\app\palctl-daemon.exe", "", r"C:\app")
+    )
+    cli_mod._register_health_task(as_system=True)
+    assert seen["app_dir"] is None, "the frozen build resolves from anywhere"

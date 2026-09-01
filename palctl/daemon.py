@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ from pathlib import Path
 from aiohttp import web
 
 from . import backups, countdown, inifile, leak, localauth, netinfo, procs, supervisor
+from . import metrics as metrics_mod
 from .alerts import WebhookAlerter
 from .api import PalApi, PalApiError, PalApiUnauthorized
 from .bot import run_bot
@@ -34,7 +36,7 @@ from .client import DAEMON_PORT
 from .config import Config, config_dir, get_admin_password
 from .control import ServerController
 from .decisions import DecisionLog, summarize
-from .events import Event, EventBus, PlayerTracker, SessionStore
+from .events import Event, EventBus, PlayerTracker, SessionStore, set_actor
 from .logging_setup import setup_logging
 from .scheduler import Scheduler
 from .supervisor import Action, Observation, is_boot_start
@@ -77,6 +79,14 @@ def sd_notify(state: str) -> None:
 # and losing it across a restart is what turns a recoverable outage into a
 # permanent one. See _load_ever_alive.
 _STATE_PATH = config_dir() / "daemon_state.json"
+
+# A worker loop that raises out of its own guards is restarted rather than
+# retired: a daemon still answering /healthz with its memory watchdog quietly
+# gone is the worst of both worlds. The budget is what stops a genuinely
+# unstartable loop (bad config, missing dependency) from spinning forever —
+# after it, the daemon is degraded and says so. See DaemonApp._supervised.
+_WORKER_RESTART_BUDGET = 3
+_WORKER_RESTART_BACKOFF = (5.0, 30.0, 120.0, 600.0)
 
 
 def _read_state() -> dict:
@@ -358,6 +368,10 @@ class Daemon:
         # One-shot: warn if the running server was started from a different
         # install than the one updates rewrite (see _maybe_warn_wrong_server_root).
         self._root_warned = False
+        # Worker loops that crashed past their restart budget: name -> last
+        # error. Non-empty means palctl is running with something missing, and
+        # /healthz must stop claiming everything is fine.
+        self.degraded: dict[str, str] = {}
         # Wall-clock of the last completed poll, for the /healthz liveness probe.
         self._last_poll_at = 0.0
         # Set by a SIGTERM/SIGINT handler to unblock run() into graceful shutdown.
@@ -524,7 +538,7 @@ class Daemon:
         self._bot_task = self._spawn(
             self._supervised(
                 "discord bot",
-                run_bot(
+                lambda: run_bot(
                     self.cfg, self.api, self.bus, self.store, self.scheduler,
                     on_created=self._set_bot,
                 ),
@@ -745,7 +759,9 @@ class Daemon:
 
         await self.tracker.update(players)
 
-        stats = await asyncio.to_thread(procs.proc_stats)  # psutil enumeration off the loop
+        stats = await asyncio.to_thread(  # psutil enumeration off the loop
+            procs.proc_stats, self.cfg.server_root
+        )
         self._last_metrics = metrics
 
         if first_poll:
@@ -802,17 +818,32 @@ class Daemon:
         different folder than the one palctl updates, say so. That split makes
         every update land on a copy nobody runs — the update reports success and
         the live server stays on its old build, which players meet as a version
-        mismatch. psutil enumeration runs off the event loop."""
+        mismatch. psutil enumeration runs off the event loop.
+
+        The one-shot is only spent on a *conclusive* reading, for the same
+        reason as the account check above — and it is the same trap, because it
+        is the same psutil call underneath. `server_root_from_process` answers
+        None both for "no server process to read" and for "found it, couldn't
+        read its image path", and the second is routine: an AccessDenied on
+        `proc.exe()` is exactly what a server running as SYSTEM under a
+        login-user daemon produces. Latching before the check ran meant one
+        early poll — the first successful one, while the game process is still
+        settling — silenced this warning for the life of the daemon. Silencing
+        it is expensive: a wrong server root is the reason updates land on an
+        install nobody starts, and this is the only thing in palctl that says
+        so."""
         if self._root_warned:
             return
-        self._root_warned = True
         from . import discovery
 
         try:
             running = await asyncio.to_thread(discovery.server_root_from_process)
-            warning = discovery.root_mismatch_warning(self.cfg.server_root, running)
         except Exception:
-            warning = None
+            running = None
+        if running is None:
+            return  # inconclusive — ask again on the next poll
+        self._root_warned = True
+        warning = discovery.root_mismatch_warning(self.cfg.server_root, running)
         if warning:
             self.log.warning("%s", warning)
             await self.bus.emit(Event("error", "⚠️ " + warning))
@@ -1203,19 +1234,52 @@ class Daemon:
                 now=time.time(),
                 poll_seconds=self.cfg.poll_seconds,
             )
+            # A worker that crashed past its restart budget is not a healthy
+            # daemon, even with the poll loop turning: "ok" here is what the
+            # health task and any external monitor trust, and it must not be
+            # true while the watchdog or the scheduler is gone. Reported as
+            # `degraded`, distinct from `stale` — the remedy differs. Still
+            # 200: restarting the daemon is the operator's call once the cause
+            # is fixed, and the health task's blind restart would only loop.
             return web.json_response(
                 {
                     "status": "ok" if ok else "stale",
                     "alive": self._alive,
                     "last_poll_age_seconds": round(age, 1) if age is not None else None,
+                    "degraded": dict(self.degraded),
                 },
                 status=200 if ok else 503,
             )
 
+        async def metrics_endpoint(_: web.Request) -> web.Response:
+            """Prometheus exposition, built from the same document /state
+            serves — two collectors drift, and a metrics endpoint that
+            disagrees with the dashboard is worse than none.
+
+            Token-gated like everything else. Prometheus sends it as a header:
+              authorization / X-Palctl-Token in scrape_configs.
+            """
+            from . import __version__
+
+            payload = await self._state_payload()
+            body = metrics_mod.render(
+                payload, version=__version__, degraded=self.degraded
+            )
+            return web.Response(
+                text=body,
+                content_type="text/plain",
+                charset="utf-8",
+            )
+
         async def state(_: web.Request) -> web.Response:
-            stats = await asyncio.to_thread(procs.proc_stats)  # psutil enum off the loop
+            return web.json_response(await self._state_payload())
+
+        async def _state_payload_impl() -> dict:
+            stats = await asyncio.to_thread(  # psutil enum off the loop
+                procs.proc_stats, self.cfg.server_root
+            )
             service = await self._service_state_cached()
-            return web.json_response(
+            return (
                 {
                     "service": service,
                     "alive": self._alive,
@@ -1232,7 +1296,17 @@ class Daemon:
                     "players": [asdict(p) for p in self.tracker.online],
                     "history": self._history[-360:],
                     "events": [
-                        {"kind": e.kind, "message": e.message, "at": e.at.isoformat()}
+                        {
+                            "kind": e.kind,
+                            "message": e.message,
+                            "at": e.at.isoformat(),
+                            # Empty for anything palctl decided by itself,
+                            # which is itself the answer to "did a person do
+                            # this?" — so surfaces can render "by zoe (discord)"
+                            # only where there is a person to name.
+                            "actor": e.actor,
+                            "via": e.via,
+                        }
                         for e in self.bus.recent(60)
                     ],
                     # What palctl decided, and why. `why` is the one-liner a
@@ -1246,6 +1320,11 @@ class Daemon:
                     "update": self.scheduler.update_status,
                 }
             )
+
+        # Both /state and /metrics read this one builder. Two collectors drift,
+        # and a metrics endpoint that disagrees with the dashboard is worse
+        # than no metrics endpoint.
+        self._state_payload = _state_payload_impl
 
         async def decisions(request: web.Request) -> web.Response:
             """The full recent decision history — "why isn't palctl doing
@@ -1275,6 +1354,30 @@ class Daemon:
                     raise _BadRequest(f"missing required field: {field}")
                 return value
 
+            def who() -> tuple[str, str]:
+                """Who is asking, per the client's own claim.
+
+                The token is one shared per-user secret, so this is not an
+                identity check and must never be treated as one — every holder
+                of the token is already fully authorised. It is a *label*, so
+                the event feed can answer "which of my four surfaces stopped
+                the server", which it previously could not answer at all.
+                Trimmed and length-capped because it is rendered in Discord
+                embeds, the dashboard and the desktop GUI.
+                """
+
+                def clean(field: str) -> str:
+                    value = body.get(field)
+                    if not isinstance(value, str):
+                        return ""
+                    # Control characters would break the log line and the
+                    # embed; newlines especially.
+                    return "".join(
+                        c for c in value.strip() if c.isprintable()
+                    )[:64]
+
+                return clean("actor"), clean("via")
+
             def optional_seconds() -> int | None:
                 """`{"seconds": N}` overrides the configured countdown for this
                 one call — 0 means "no warning, go now". Absent = use the
@@ -1291,6 +1394,10 @@ class Daemon:
                     )
                 return value
 
+            # Scoped to this request by aiohttp's per-request task context,
+            # and inherited by anything _spawn_exclusive starts from here — so
+            # a long restore that finishes minutes later is still attributed.
+            set_actor(*who())
             try:
                 if what == "start":
                     # One implementation for start/stop (also the bot's /start,
@@ -1334,6 +1441,27 @@ class Daemon:
                     await self.api.save()
                 elif what == "backup":
                     if not self._spawn_exclusive("backup", self.scheduler.backup_now("gui")):
+                        return _busy_response(self.control.current_op)
+                elif what == "save-prune":
+                    # The world-rewriting operation, driven from a surface
+                    # rather than the CLI. Two things make this safe to expose:
+                    # it runs under the same operation lock as a backup, so
+                    # nothing else can touch the world while it does, and it
+                    # refuses unless the server is genuinely stopped — checked
+                    # from the process list, not from the service state, in
+                    # saveprune.run_prune itself.
+                    #
+                    # `apply` must be asked for explicitly here exactly as it
+                    # must on the CLI. A dry run is the default over HTTP too,
+                    # so a mis-clicked button reports rather than rewrites.
+                    if not self._spawn_exclusive(
+                        "save-prune",
+                        self._run_save_prune(
+                            apply=bool(body.get("apply", False)),
+                            days=int(body.get("days", 90)),
+                            only=str(body.get("player", "")),
+                        ),
+                    ):
                         return _busy_response(self.control.current_op)
                 elif what == "update-server":
                     # `{"validate": true}` asks SteamCMD to re-verify every file
@@ -1425,6 +1553,7 @@ class Daemon:
         app.router.add_get("/", index)
         app.router.add_get("/favicon.ico", favicon)
         app.router.add_get("/healthz", healthz)
+        app.router.add_get("/metrics", metrics_endpoint)
         app.router.add_get("/state", state)
         app.router.add_get("/backups", list_backups)
         app.router.add_get("/logs", tail_logs)
@@ -1476,7 +1605,13 @@ class Daemon:
         # nothing below depends on them, so they run off the loop and, more
         # importantly, must not delay the workers or READY=1 behind a slow
         # external tool. Spawned rather than awaited for the same reason.
-        self._spawn(self._supervised("startup checks", self._startup_side_effects(host)))
+        self._spawn(
+            self._supervised(
+                "startup checks",
+                lambda: self._startup_side_effects(host),
+                restarts=0,  # one-shot diagnostics; retrying just re-runs netsh
+            )
+        )
 
         self._install_signal_handlers()
 
@@ -1487,19 +1622,27 @@ class Daemon:
         # whether a STOPPED service is about to be started (the flag it clears
         # gates external-stop adoption) — but spawned, because waiting for the
         # SCM must not delay READY=1.
-        self._spawn(self._supervised("boot intent", self._restore_boot_intent()))
+        self._spawn(
+            self._supervised(
+                "boot intent",
+                self._restore_boot_intent,
+                restarts=0,  # one-shot; a second pass would fight the operator
+            )
+        )
 
         self._start_bot()
-        for name, coro in (
-            ("poll loop", self._poll_loop()),
-            ("watchdog", self.watchdog.run()),
-            ("scheduler", self.scheduler.run()),
-            ("leak forecaster", self._predict_loop()),
-            ("update check", self._update_check_loop()),
-            ("disk watch", self._disk_loop()),
-            ("liveness", self._liveness_loop()),
+        # Factories, not coroutines: _supervised restarts a crashed loop, and a
+        # coroutine object cannot be awaited a second time.
+        for name, factory in (
+            ("poll loop", self._poll_loop),
+            ("watchdog", self.watchdog.run),
+            ("scheduler", self.scheduler.run),
+            ("leak forecaster", self._predict_loop),
+            ("update check", self._update_check_loop),
+            ("disk watch", self._disk_loop),
+            ("liveness", self._liveness_loop),
         ):
-            self._spawn(self._supervised(name, coro))
+            self._spawn(self._supervised(name, factory))
 
         sd_notify("READY=1")
         await self._stop.wait()  # runs until SIGTERM/SIGINT
@@ -1560,23 +1703,116 @@ class Daemon:
             await asyncio.to_thread(self.store.close)
         self.log.info("shutdown complete")
 
-    async def _supervised(self, name: str, coro) -> None:
-        """One escaped exception in any loop must not kill the whole daemon.
+    async def _run_save_prune(self, *, apply: bool, days: int, only: str) -> None:
+        """Plan (and optionally run) a Level.sav prune, reporting to the event
+        feed. Everything heavy happens off the event loop: the parse is a child
+        process and the backup is a file copy, and neither may stall the poll
+        loop that is supervising the server."""
+        from . import saveaudit, saveprune
+
+        worlds = await asyncio.to_thread(saveaudit.world_dirs, self.cfg.savegames_dir)
+        if not worlds:
+            await self.bus.emit(Event("error", "No world found to prune."))
+            return
+        if len(worlds) > 1:
+            await self.bus.emit(
+                Event(
+                    "error",
+                    f"{len(worlds)} worlds found — palctl won't guess which one "
+                    "to rewrite. Move the others aside first.",
+                )
+            )
+            return
+
+        seen = await asyncio.to_thread(self.store.last_seen_by_player_id)
+        running = await asyncio.to_thread(procs.find_process, self.cfg.server_root)
+        outcome = await asyncio.to_thread(
+            functools.partial(
+                saveprune.run_prune,
+                worlds[0],
+                self.cfg.savegames_dir,
+                Path(self.cfg.backup_root),
+                seen,
+                server_stopped=running is None,
+                apply=apply,
+                days=days,
+                only=only,
+            )
+        )
+        if outcome.error:
+            await self.bus.emit(Event("error", f"Save prune: {outcome.error}"))
+            return
+        await self.bus.emit(
+            Event(
+                "info" if not outcome.applied else "restore",
+                saveprune.format_plan(outcome.plan, applied=outcome.applied),
+                {"applied": outcome.applied, "backup": outcome.backup},
+            )
+        )
+
+    async def _supervised(
+        self, name: str, factory, *, restarts: int = _WORKER_RESTART_BUDGET
+    ) -> None:
+        """One escaped exception in any loop must not kill the whole daemon —
+        and must not silently retire that loop either.
 
         Every loop guards its tick body, but errors can still raise outside
         those guards — a wrong-typed hand-edited config value at loop setup,
         or a startup-time failure. gather() propagates the first one and
         cancels everything: watchdog, scheduler, control API, bot, all gone.
-        Log it, tell the event feed, and keep the rest of the daemon alive."""
-        try:
-            await coro
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self.log.error("%s crashed; the rest of palctl keeps running", name, exc_info=True)
-            with contextlib.suppress(Exception):
-                await self.bus.emit(
-                    Event("error", f"{name} crashed and is disabled until restart: {e}")
+
+        This used to catch that, log it, and stop. The daemon stayed up, the
+        control API kept answering and /healthz kept saying "ok" — with the
+        memory watchdog, or the scheduler, simply gone. A supervisor that
+        outlives the thing it supervises and still reports healthy is the
+        exact silent failure this codebase exists to avoid.
+
+        So: restart the loop, backing off 5s → 30s → 2m → 10m, and give up
+        only after _WORKER_RESTART_BUDGET failures — a genuinely unstartable
+        loop (bad config, missing dependency) must not spin forever. Once the
+        budget is spent the daemon is *degraded*, and says so where it counts:
+        the event feed, the log, and `degraded` in /state and /healthz.
+
+        `factory` is a zero-argument callable returning the coroutine, not a
+        coroutine — a coroutine object cannot be awaited twice, so restarting
+        means building a fresh one.
+        """
+        for attempt in range(restarts + 1):
+            try:
+                await factory()
+                return  # a loop that returns on its own is done, not crashed
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last = attempt >= restarts
+                self.log.error(
+                    "%s crashed (attempt %d/%d)%s",
+                    name,
+                    attempt + 1,
+                    restarts + 1,
+                    "" if last else "; restarting it",
+                    exc_info=True,
+                )
+                if last:
+                    self.degraded[name] = str(e)
+                    with contextlib.suppress(Exception):
+                        await self.bus.emit(
+                            Event(
+                                "error",
+                                f"🛑 {name} crashed {restarts + 1} time(s) "
+                                f"and has stopped for good: {e}. palctl is "
+                                "running degraded — restart the daemon once the "
+                                "cause is fixed.",
+                                {"worker": name},
+                            )
+                        )
+                    return
+                with contextlib.suppress(Exception):
+                    await self.bus.emit(
+                        Event("error", f"{name} crashed and is restarting: {e}")
+                    )
+                await asyncio.sleep(
+                    _WORKER_RESTART_BACKOFF[min(attempt, len(_WORKER_RESTART_BACKOFF) - 1)]
                 )
 
     async def _liveness_loop(self) -> None:

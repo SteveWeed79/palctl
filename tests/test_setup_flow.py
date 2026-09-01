@@ -81,7 +81,7 @@ def env(tmp_path, monkeypatch):
         return 0
 
     monkeypatch.setattr("palctl.steamcmd.run_update", _run_update)
-    monkeypatch.setattr("palctl.steamcmd.backup_file", lambda p: None)
+    monkeypatch.setattr("palctl.steamcmd.backup_file", lambda p, **kw: None)
     monkeypatch.setattr("palctl.steamcmd.parse_progress", lambda line: None)
     monkeypatch.setattr("palctl.inifile.is_blank", lambda p: rec.is_blank)
 
@@ -535,7 +535,7 @@ def test_blanked_ini_is_restored_even_when_steamcmd_raises(env, monkeypatch):
 
     backup = env.tmp_path / "ini.bak"
     backup.write_text("GOOD SETTINGS", encoding="utf-8")
-    monkeypatch.setattr("palctl.steamcmd.backup_file", lambda p: backup)
+    monkeypatch.setattr("palctl.steamcmd.backup_file", lambda p, **kw: backup)
     env.is_blank = True                       # ini looks blanked after the run
     env.run_update = RuntimeError("steam boom")  # ...and the update then dies
 

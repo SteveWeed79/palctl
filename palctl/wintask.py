@@ -29,16 +29,50 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # ---------------- pure command builders ----------------
 
 
-def create_task_command(
-    exe: str, args: str = "", *, every_minutes: int = 5, as_system: bool = False
-) -> list[str]:
-    """The schtasks invocation that registers the recurring health check.
-    /F overwrites an existing registration, so re-install converges instead of
-    erroring — same reinstall-replaces rule as the services themselves."""
+def task_run_string(exe: str, args: str = "", app_dir: str | None = None) -> str:
+    """The command Task Scheduler will run, as its /TR value.
+
+    `app_dir` exists because ``schtasks /Create`` has no working-directory
+    option at all — that lives in the task XML, not on the command line — and a
+    task with no working directory runs from the scheduler's own (System32).
+    That is fine for the frozen build, whose /TR is an absolute path to
+    palctl-daemon.exe with no arguments. It is fatal for a source install, where
+    service_target() yields ``python.exe -m palctl.daemon``: ``-m`` resolves
+    against the current directory and sys.path, so the task failed with "No
+    module named palctl" every five minutes, forever. Nothing noticed —
+    register_health_task returned True because schtasks had registered the task
+    perfectly well; it was the task that could not run. Source installs on
+    Windows therefore had no wedged-daemon recovery at all while being told they
+    did.
+
+    So when a working directory is needed, the command is wrapped in ``cmd /c cd
+    /d <dir> && …``. The frozen path is left exactly as it was — it works today,
+    it is what the installer ships, and it is not worth putting a shell in front
+    of the majority case to fix the minority one.
+    """
     run = f'"{exe}"'
     if args:
         run += f" {args}"
     run += " health-check"
+    if app_dir:
+        # /d so it changes drive as well as directory; cmd exits with the
+        # command's own status, so the scheduler still records real failures.
+        run = f'cmd /c cd /d "{app_dir}" && {run}'
+    return run
+
+
+def create_task_command(
+    exe: str,
+    args: str = "",
+    *,
+    every_minutes: int = 5,
+    as_system: bool = False,
+    app_dir: str | None = None,
+) -> list[str]:
+    """The schtasks invocation that registers the recurring health check.
+    /F overwrites an existing registration, so re-install converges instead of
+    erroring — same reinstall-replaces rule as the services themselves."""
+    run = task_run_string(exe, args, app_dir)
     cmd = [
         "schtasks", "/Create", "/F",
         "/TN", TASK_NAME,
@@ -94,18 +128,27 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def register_health_task(
-    exe: str, args: str = "", *, every_minutes: int = 5, as_system: bool = False
+    exe: str,
+    args: str = "",
+    *,
+    every_minutes: int = 5,
+    as_system: bool = False,
+    app_dir: str | None = None,
 ) -> bool:
     """Create (or replace) the health task. False off Windows or on refusal —
     callers treat this as best-effort: a daemon without its healer is still a
-    daemon, and the caller logs the outcome."""
+    daemon, and the caller logs the outcome.
+
+    Pass `app_dir` whenever the command needs a working directory to resolve
+    (a source install's ``-m palctl.daemon``); see task_run_string."""
     if not _on_windows():
         return False
     try:
         return (
             _run(
                 create_task_command(
-                    exe, args, every_minutes=every_minutes, as_system=as_system
+                    exe, args, every_minutes=every_minutes, as_system=as_system,
+                    app_dir=app_dir,
                 )
             ).returncode
             == 0
