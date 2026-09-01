@@ -10,7 +10,28 @@ Installers for every release are on the
 
 ## [Unreleased]
 
-## [1.2.8.1] — 2026-09-01
+### Added
+- **Releases cut themselves.** `docs/VERSIONING.md`'s ritual — pick the part to
+  bump, rename `## [Unreleased]` to that number with today's date, open a fresh
+  empty one above it, push a tag spelled exactly the same — is entirely
+  mechanical, and doing it by hand is what left the whole 1.2 line under
+  `[Unreleased]`, shipped 1.2.5.6 against notes titled 1.2.5.7, and failed the
+  1.2.8 release twice on a mismatched tag.
+
+  `.github/workflows/release-cut.yml` now does it on a merge to main: PATCH by
+  default, or whatever a `bump:major` / `bump:minor` / `bump:feature` /
+  `bump:patch` label on the merged PR asks for. It commits the changelog, tags
+  that same commit, and starts the Release build for the tag — which still
+  produces a *draft* GitHub Release, so publishing stays a human decision. A
+  `no-release` label or an empty `[Unreleased]` skips the whole thing, and "Run
+  workflow" cuts one by hand with a `dry_run` tickbox that only prints the
+  number it would use.
+
+  The arithmetic lives in `scripts/bump_version.py`, which bases the next
+  version on the highest existing *tag* (the tag is the version — setuptools-scm
+  reads it), refuses to hand out a number that is already taken, and runs the
+  release gate against the file it just wrote so a cut that couldn't ship fails
+  here instead of in the release run.
 
 ### Fixed
 - **The release gate no longer blocks a release over how the version was

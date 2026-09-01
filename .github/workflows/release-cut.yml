@@ -1,0 +1,173 @@
+name: Cut release
+
+# The bump and the tag, done by machine.
+#
+# docs/VERSIONING.md's ritual — pick the part, rename `## [Unreleased]` to that
+# number with today's date, open a fresh empty one above it, push a tag spelled
+# exactly the same — is entirely mechanical, and doing it by hand is what put
+# the whole 1.2 line under `[Unreleased]`, shipped 1.2.5.6 against notes titled
+# 1.2.5.7, and failed the 1.2.8 release twice on a tag that didn't match its
+# heading. So: merge to main, and this cuts the release.
+#
+#   - On a merge to main it bumps PATCH, or whatever a `bump:` label on the
+#     merged PR asks for. `no-release` on the PR skips it entirely, as does an
+#     empty `[Unreleased]` — there is nothing to ship in either case.
+#   - "Run workflow" cuts one by hand: pick the part, or tick `dry_run` to see
+#     the number it would use without writing anything.
+#
+# It commits the changelog to main, tags that commit, and starts Release for the
+# tag. Release still builds a *draft* GitHub Release — publishing stays a human
+# decision, which is the point at which this can be caught being wrong.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      part:
+        description: "Which part to bump (docs/VERSIONING.md)"
+        type: choice
+        options: [patch, feature, minor, major]
+        default: patch
+      dry_run:
+        description: "Only print the version that would be cut"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write        # commit the changelog, push the tag
+  actions: write         # start Release for the tag it just pushed
+  pull-requests: read    # read the merged PR's bump label
+
+# One cut at a time. Two runs racing would both compute the same next version
+# off the same base and one would push a tag the other already took.
+concurrency:
+  group: cut-release
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned by full commit SHA, not a mutable tag: this job has
+      # `contents: write` and creates the tag the release is built from.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          fetch-depth: 0      # the base version is the highest existing tag
+          fetch-tags: true
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Decide which part to bump
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          INPUT_PART: ${{ inputs.part }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "part=${INPUT_PART:-patch}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A push to main is (almost always) a merged PR. Its labels say how
+          # big the change was; without one, PATCH — docs/VERSIONING.md is
+          # explicit that most PRs are a patch bump, and that's not sloppy.
+          labels=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                     --jq '.[].labels[].name' 2>/dev/null || true)
+          echo "labels on the merged PR: ${labels:-(none)}"
+
+          if grep -qx "no-release" <<<"$labels"; then
+            echo "no-release label — skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          part=patch
+          for candidate in major minor feature patch; do
+            if grep -qx "bump:${candidate}" <<<"$labels"; then
+              part="$candidate"
+              break
+            fi
+          done
+          echo "part=$part" >> "$GITHUB_OUTPUT"
+
+      - name: Work out the next version
+        id: version
+        if: steps.decide.outputs.skip != 'true'
+        env:
+          PART: ${{ steps.decide.outputs.part }}
+        run: |
+          set +e   # the exit code IS the answer here; don't let -e eat it
+          version=$(python scripts/bump_version.py --part "$PART")
+          rc=$?
+          set -e
+          # 3 is "nothing under [Unreleased]" — a normal state for a merge that
+          # ships nothing (a README typo, a CI tweak), not a failure to shout
+          # about. Anything else is a real problem and fails the run.
+          if [ "$rc" -eq 3 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ "$rc" -eq 0 ] || exit "$rc"
+          echo "Next version: $version (${PART} bump)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cut it — changelog, commit, tag
+        id: cut
+        if: >-
+          steps.decide.outputs.skip != 'true'
+          && steps.version.outputs.skip != 'true'
+          && !inputs.dry_run
+        env:
+          PART: ${{ steps.decide.outputs.part }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python scripts/bump_version.py --part "$PART" --apply
+          # Belt and braces: the gate the release itself runs, against the file
+          # as written. A tag is pushed below, and an unpushable one is worse
+          # than no release.
+          python scripts/check_changelog.py "$VERSION"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "Release ${VERSION}" \
+            -m "Cut by .github/workflows/release-cut.yml from the entries under [Unreleased]. The tag is pushed from this commit, so the shipped --version and the notes describing it cannot disagree."
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git tag "$VERSION"
+          git push origin "$VERSION"
+
+      - name: Start the Release build for the tag
+        # A tag pushed with GITHUB_TOKEN does not trigger workflows, so Release
+        # is dispatched explicitly rather than left waiting for a push event
+        # that never arrives. (This is the trap that would have made the whole
+        # thing look like it worked and silently ship nothing.)
+        if: steps.cut.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml --ref "$GITHUB_REF_NAME" -f tag="$VERSION"
+          echo "Release dispatched for ${VERSION}." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Say what happened
+        if: always()
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PART: ${{ steps.decide.outputs.part }}
+        run: |
+          if [ -z "${VERSION:-}" ]; then
+            echo "No release cut: nothing under [Unreleased], or the PR said no-release." \
+              >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "Dry run: would cut **${VERSION}** (${PART} bump). Nothing written." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Cut **${VERSION}** (${PART} bump) and tagged it." >> "$GITHUB_STEP_SUMMARY"
+          fi
