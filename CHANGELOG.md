@@ -10,6 +10,8 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+## [1.2.8.0] — 2026-09-01
+
 ### Added
 - **Auto-pause: an empty server puts itself away, and comes back when somebody
   tries to connect.** Off by default (`autopause_enabled`), and turning it off
@@ -1635,7 +1637,8 @@ restarts and rotating backups, the settings editor, the Discord bot, the
 first-run wizard, and the Windows installer — plus rapid packaging and
 installer iteration. No per-release notes were published for these.
 
-[Unreleased]: https://github.com/SteveWeed79/palctl/compare/1.0.0...HEAD
+[Unreleased]: https://github.com/SteveWeed79/palctl/compare/1.2.8.0...HEAD
+[1.2.8.0]: https://github.com/SteveWeed79/palctl/compare/1.2.7.0...1.2.8.0
 [1.0.0]: https://github.com/SteveWeed79/palctl/compare/0.1.14...1.0.0
 [0.1.14]: https://github.com/SteveWeed79/palctl/compare/0.1.13...0.1.14
 [0.1.13]: https://github.com/SteveWeed79/palctl/compare/0.1.12...0.1.13
