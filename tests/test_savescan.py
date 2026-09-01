@@ -280,22 +280,27 @@ def test_scan_result_is_falsy_about_nothing_it_did_not_measure():
 # ---------------- the frozen build ----------------
 
 
-def test_a_source_build_runs_the_child_with_dash_m():
-    cmd = savescan.child_command(Path("/x/Level.sav"))
+def test_a_source_build_runs_the_child_with_dash_m(tmp_path):
+    level = tmp_path / "Level.sav"
+    cmd = savescan.child_command(level)
 
     assert cmd[1:3] == ["-m", "palctl.savescan"]
-    assert cmd[3] == "/x/Level.sav"
+    # str(Path) is platform-shaped — \x\Level.sav on Windows — so compare
+    # against the same conversion rather than a hardcoded POSIX string.
+    assert cmd[3] == str(level)
 
 
-def test_a_frozen_build_uses_a_marker_argument_instead(monkeypatch):
+def test_a_frozen_build_uses_a_marker_argument_instead(tmp_path, monkeypatch):
     """`sys.executable -m` is wrong when frozen: sys.executable is
     palctl-daemon.exe, which has no -m, so it would start a second daemon
     instead of a save reader. Same shape as the health-task bug."""
     monkeypatch.setattr(sys, "frozen", True, raising=False)
+    level = tmp_path / "Level.sav"
 
-    cmd = savescan.child_command(Path("/x/Level.sav"))
+    cmd = savescan.child_command(level)
 
     assert cmd[1] == savescan.SAVESCAN_FLAG
+    assert cmd[2] == str(level)
     assert "-m" not in cmd
 
 
