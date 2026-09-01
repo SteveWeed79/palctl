@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from check_changelog import check, normalize, sections  # noqa: E402
+from check_changelog import check, key, normalize, sections  # noqa: E402
 
 GOOD = """# Changelog
 
@@ -70,6 +70,34 @@ def test_only_a_leading_v_is_optional():
     assert normalize("v1.2.5.7") == "1.2.5.7"
     assert normalize("1.2.5.7") == "1.2.5.7"
     assert check(GOOD, "release-1.2.5.7") != []
+
+
+def test_a_dropped_trailing_zero_is_the_same_release():
+    """What actually blocked 1.2.8: tag `1.2.8`, heading `## [1.2.8.0]`. Same
+    release, two spellings — the gate must not fail the build over it."""
+    text = GOOD.replace("## [1.2.5.7]", "## [1.2.8.0]").replace("## [1.2.5.6]", "## [1.2.7.0]")
+    assert check(text, "1.2.8") == []
+    assert check(text, "v1.2.8") == []
+    assert check(text, "1.2.8.0") == []
+    # And the equivalence doesn't reach past the zeros: a different release is
+    # still a different release.
+    assert check(text, "1.2.8.1") != []
+    assert check(text, "1.2.7") != []
+
+
+def test_zero_extension_equivalence_is_symmetric():
+    """The heading may be the short spelling and the tag the long one."""
+    text = GOOD.replace("## [1.2.5.7]", "## [1.3]")
+    assert check(text, "1.3.0.0") == []
+
+
+def test_only_dotted_numbers_get_the_equivalence():
+    assert key("1.2.8") == key("1.2.8.0") == key("v1.2.8".lstrip("v")) == (1, 2, 8)
+    assert key("1.0.0.0") == (1,)
+    assert key("1.2.8-rc1") == "1.2.8-rc1"
+    assert key("release-1.2.5.7") != key("1.2.5.7")
+    # A prerelease tag has no zero-extension to reason about: exact or nothing.
+    assert check(GOOD.replace("## [1.2.5.7]", "## [1.2.5.7-rc1]"), "1.2.5.7") != []
 
 
 def test_sections_are_read_in_file_order():

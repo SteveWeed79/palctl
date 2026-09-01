@@ -10,6 +10,19 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+## [1.2.8.1] — 2026-09-01
+
+### Fixed
+- **The release gate no longer blocks a release over how the version was
+  spelled.** `MAJOR.MINOR.FEATURE.PATCH` routinely gets tagged with the
+  trailing zero left off, and the check compared tag to heading as text — so
+  tag `1.2.8` against heading `## [1.2.8.0]`, the same release written two
+  ways, failed the build before anything was built. Versions are now compared
+  as numbers with trailing zeros dropped, so `1.2.8`, `1.2.8.0` and `v1.2.8`
+  all match. Tags that aren't plain dotted numbers (`release-1.2.5.7`,
+  `1.2.8-rc1`) still have to match exactly: a near-miss tag is the drift this
+  check exists to catch.
+
 ## [1.2.8.0] — 2026-09-01
 
 ### Added

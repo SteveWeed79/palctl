@@ -44,7 +44,10 @@ Examples: `1.2.5.5` + a feature → `1.2.6.0`; `1.2.6.0` + a fix → `1.2.6.1`;
 
 1. The **git tag is the only source of the version** — `setuptools-scm` reads it.
 2. Therefore a release's **CHANGELOG heading must equal its tag, exactly**:
-   `## [1.2.5.5]` in the changelog ⇢ tag `1.2.5.5`. No drift, ever.
+   `## [1.2.5.5]` in the changelog ⇢ tag `1.2.5.5`. No drift, ever. The only
+   spellings that count as the same number are a leading `v` (`v1.2.5.5`) and
+   omitted trailing zeros (`1.2.8` is `1.2.8.0`) — the release gate accepts
+   those and nothing else.
 3. Work not yet assigned a version lives under a single `## [Unreleased]`. It
    *becomes* a release the moment we tag — never leave shipped work sitting under
    `[Unreleased]`.
