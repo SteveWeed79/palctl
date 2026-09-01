@@ -27,6 +27,7 @@ from pathlib import Path
 from aiohttp import web
 
 from . import backups, countdown, inifile, leak, localauth, netinfo, procs, supervisor
+from . import metrics as metrics_mod
 from .alerts import WebhookAlerter
 from .api import PalApi, PalApiError, PalApiUnauthorized
 from .bot import run_bot
@@ -1249,12 +1250,35 @@ class Daemon:
                 status=200 if ok else 503,
             )
 
+        async def metrics_endpoint(_: web.Request) -> web.Response:
+            """Prometheus exposition, built from the same document /state
+            serves — two collectors drift, and a metrics endpoint that
+            disagrees with the dashboard is worse than none.
+
+            Token-gated like everything else. Prometheus sends it as a header:
+              authorization / X-Palctl-Token in scrape_configs.
+            """
+            from . import __version__
+
+            payload = await self._state_payload()
+            body = metrics_mod.render(
+                payload, version=__version__, degraded=self.degraded
+            )
+            return web.Response(
+                text=body,
+                content_type="text/plain",
+                charset="utf-8",
+            )
+
         async def state(_: web.Request) -> web.Response:
+            return web.json_response(await self._state_payload())
+
+        async def _state_payload_impl() -> dict:
             stats = await asyncio.to_thread(  # psutil enum off the loop
                 procs.proc_stats, self.cfg.server_root
             )
             service = await self._service_state_cached()
-            return web.json_response(
+            return (
                 {
                     "service": service,
                     "alive": self._alive,
@@ -1295,6 +1319,11 @@ class Daemon:
                     "update": self.scheduler.update_status,
                 }
             )
+
+        # Both /state and /metrics read this one builder. Two collectors drift,
+        # and a metrics endpoint that disagrees with the dashboard is worse
+        # than no metrics endpoint.
+        self._state_payload = _state_payload_impl
 
         async def decisions(request: web.Request) -> web.Response:
             """The full recent decision history — "why isn't palctl doing
@@ -1502,6 +1531,7 @@ class Daemon:
         app.router.add_get("/", index)
         app.router.add_get("/favicon.ico", favicon)
         app.router.add_get("/healthz", healthz)
+        app.router.add_get("/metrics", metrics_endpoint)
         app.router.add_get("/state", state)
         app.router.add_get("/backups", list_backups)
         app.router.add_get("/logs", tail_logs)

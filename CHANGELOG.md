@@ -11,6 +11,32 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Added
+- **A `/metrics` endpoint in Prometheus format.** palctl keeps seven days of
+  metrics and could show about two hours of them, in its own sparkline, with no
+  way to export any of it — so "was the server slow last Tuesday?" was
+  unanswerable from inside palctl and trivial in Grafana. Deliberately the
+  small version of the idea: a handful of well-labelled gauges collected at
+  scrape time, built from the *same* document `/state` serves, because two
+  collectors drift and a metrics endpoint that disagrees with the dashboard is
+  worse than none. Token-gated like everything else. The most alert-worthy
+  sample is `palctl_workers_degraded` — the daemon is up and not doing its job,
+  which `/healthz` alone reports as healthy.
+- **palctl can register the game server on Linux.** Setup's server registration
+  was Windows-only and keyed off `PalServer.exe`, so on Linux it registered
+  nothing and every later `systemctl start` went at a unit that did not exist —
+  the supervision, the watchdog and the scheduler all silently had nothing to
+  drive, on the platform the README advertises as supported. The unit is
+  `Type=simple`, not `notify` (PalServer never calls `sd_notify`; under
+  `Type=notify` systemd waits for a READY that never comes, then kills a
+  healthy server), carries a working directory (the launcher resolves its
+  engine relative to it), waits longer before restarting, and gets 120s to
+  shut down so the world finishes writing. It is registered but **not
+  enabled**: palctl's daemon owns the boot decision, and an enabled unit would
+  start the server behind its back.
+- **`palctl setup` — first-run setup without the desktop wizard.**
+  `setup_flow.run_setup` was written Qt-free on purpose and then only ever
+  called from the GUI, so a headless Linux install could not run setup at all.
+  Dry run by default, like `save-prune`.
 - **`palctl save-prune` removes departed players' records from `Level.sav`** —
   the fix for the save-size death spiral that palctl's memory watchdog could
   only treat the symptom of. It is the only thing in palctl that rewrites a

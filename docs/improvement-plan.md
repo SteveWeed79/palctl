@@ -353,7 +353,7 @@ part on Windows.
 **Do it as a Linux-first opt-in**, with the state machine and the pause-aware health
 check first — those are the parts that make it safe. **Effort:** L.
 
-### 3.3 Headless Linux install path 📋
+### 3.3 Headless Linux install path ✅ *done*
 
 `setup_flow.run_setup` is deliberately Qt-free and contains the entire install
 sequence — and its only caller is the Qt wizard. The README advertises headless Linux;
@@ -364,7 +364,7 @@ WinSW-only, so palctl never creates a systemd unit for the thing it supervises.
 systemd unit generator for the game server mirroring the Windows path. This is mostly
 wiring — the logic exists. **Effort:** M.
 
-### 3.4 Metrics export
+### 3.4 Metrics export ✅ *done*
 
 Seven days are retained; no surface shows more than about two hours, and there is no
 export. mc-monitor's shape is the right template: a small, well-labelled metric set

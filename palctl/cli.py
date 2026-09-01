@@ -184,6 +184,80 @@ def _deep_report(world, seen: dict, days: int) -> str:
     return "\n".join(lines)
 
 
+def _setup(args) -> int:
+    """First-run setup, without Qt.
+
+    `setup_flow.run_setup` was written Qt-free on purpose and then only ever
+    called from the wizard, so the headless Linux install the README advertises
+    had no way to run setup at all. This is the missing front end: same plan
+    object, same sequence, printing instead of updating a progress list.
+
+    Dry run by default, like `save-prune`: setup writes config, edits the game's
+    ini and can register a system service, and an operator on a box they cannot
+    see should be able to read the plan before any of that happens.
+    """
+    from . import discovery, setup_flow
+    from .config import Config
+
+    cfg = Config.load()
+
+    server_root = args.server_root or str(
+        next(iter(discovery.detect_server_roots()), "") or cfg.server_root
+    )
+    steamcmd = args.steamcmd or str(
+        next(iter(discovery.detect_steamcmd()), "") or cfg.steamcmd_path
+    )
+    if not server_root:
+        print(
+            "No Palworld server found, and --server-root wasn't given. Point "
+            "setup at the directory holding PalServer.sh, or pass "
+            "--install-server to fetch it from Steam."
+        )
+        return 1
+
+    plan = setup_flow.SetupPlan(
+        server_root=server_root,
+        steamcmd_path=steamcmd,
+        api_port=args.api_port,
+        password=args.admin_password or cfg.api_password,
+        install_server=args.install_server,
+        install_vcredist=False,  # Windows-only runtime
+        register_server_service=args.register_service,
+        daemon_startup="none",  # the daemon's own unit is `daemon install-service`
+        service_name=cfg.service_name or "palserver",
+        backup_root=args.backup_root or cfg.backup_root,
+    )
+
+    print("Setup plan:")
+    print(f"  Server root     {plan.server_root}")
+    print(f"  steamcmd        {plan.steamcmd_path or '(none — cannot install/update)'}")
+    print(f"  REST API port   {plan.api_port}")
+    password_note = (
+        "set" if plan.password else "NOT SET — the REST API will be unusable"
+    )
+    print(f"  Admin password  {password_note}")
+    print(f"  Backups         {plan.backup_root or '(default)'}")
+    print(f"  Install server  {'yes' if plan.install_server else 'no'}")
+    service_note = (
+        f"register {plan.service_name}" if plan.register_server_service else "no"
+    )
+    print(f"  Server service  {service_note}")
+
+    if not args.apply:
+        print("\nThis was a dry run. Re-run with --apply to do it.")
+        return 0
+
+    result = setup_flow.run_setup(cfg, plan, log=lambda line: print(line, flush=True))
+    if not result.ok:
+        print("\nSetup did not complete. Nothing above that failed was retried.")
+        return 1
+    print(
+        "\nSetup complete. Register the daemon with "
+        "`sudo python -m palctl.daemon install-service`, then `palctl status`."
+    )
+    return 0
+
+
 def _save_prune(days: int, *, apply: bool) -> int:
     """Plan — and with --apply, carry out — a Level.sav prune.
 
@@ -311,6 +385,24 @@ def main(argv: list[str] | None = None) -> int:
         help=f"how long since a player's last session counts as inactive "
              f"(default {saveaudit.INACTIVE_DAYS})",
     )
+    st = sub.add_parser(
+        "setup",
+        help="first-run setup without the desktop wizard (headless Linux)",
+    )
+    st.add_argument("--server-root", default="", help="the Palworld server directory")
+    st.add_argument("--steamcmd", default="", help="path to steamcmd")
+    st.add_argument("--admin-password", default="",
+                    help="REST API admin password to set in PalWorldSettings.ini")
+    st.add_argument("--api-port", type=int, default=8212, help="REST API port")
+    st.add_argument("--backup-root", default="", help="where backups are written")
+    st.add_argument("--install-server", action="store_true",
+                    help="install/update the server from Steam first")
+    st.add_argument("--register-service", action="store_true",
+                    help="register a systemd unit for the game server (needs root)")
+    st.add_argument("--apply", action="store_true",
+                    help="actually do it. Without this, setup only reports the "
+                         "plan it would run.")
+
     sp = sub.add_parser(
         "save-prune",
         help="remove departed players' records from Level.sav (dry run unless "
@@ -402,6 +494,8 @@ def main(argv: list[str] | None = None) -> int:
             print(_save_audit(args.days, deep=args.deep))
         elif args.cmd == "save-prune":
             return _save_prune(args.days, apply=args.apply)
+        elif args.cmd == "setup":
+            return _setup(args)
         elif args.cmd == "start":
             client.action("start")
             print("Server starting.")

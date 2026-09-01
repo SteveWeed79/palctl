@@ -228,3 +228,27 @@ def test_cli_status_drives_the_same_daemon(daemon):
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip()  # printed something
+
+
+def test_metrics_requires_a_token_and_renders_prometheus_text(daemon):
+    """The endpoint is token-gated like everything else — Prometheus sends the
+    header in its scrape_configs — and must come back as the exposition format,
+    not JSON, or the scraper drops the whole target."""
+    assert httpx.get(f"{BASE}/metrics", timeout=5).status_code == 401
+
+    r = httpx.get(f"{BASE}/metrics", headers=_auth(daemon), timeout=5)
+
+    assert r.status_code == 200
+    assert "text/plain" in r.headers.get("content-type", "")
+    assert "palctl_up" in r.text
+    assert r.text.endswith("\n")
+
+
+def test_metrics_and_state_agree_because_they_share_one_collector(daemon):
+    """Two collectors drift, and a metrics endpoint that disagrees with the
+    dashboard is worse than no metrics endpoint."""
+    state = httpx.get(f"{BASE}/state", headers=_auth(daemon), timeout=5).json()
+    text = httpx.get(f"{BASE}/metrics", headers=_auth(daemon), timeout=5).text
+
+    expected = "1" if state.get("alive") else "0"
+    assert f"palctl_server_alive {expected}\n" in text

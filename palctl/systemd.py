@@ -75,6 +75,67 @@ def unit_file(
     return "\n".join(lines)
 
 
+def server_unit_file(
+    name: str,
+    server_root: str,
+    *,
+    user: str | None = None,
+    launcher: str = "PalServer.sh",
+) -> str:
+    """A unit for the *game server*, not for palctl.
+
+    palctl has always been able to `systemctl start` a game-server unit on
+    Linux and has never been able to create one — setup registers a WinSW
+    service and nothing else, so a headless Linux operator had to hand-write
+    this file before any of the supervision, watchdog or scheduling worked.
+    That is the gap this closes.
+
+    Deliberately NOT the daemon's unit shape, and the differences are the
+    whole point:
+
+      * **Type=simple, not notify.** PalServer never calls sd_notify. Under
+        Type=notify systemd waits for a READY it will never get, reports the
+        unit as `activating` for the full 90-second default timeout, then kills
+        a server that was running perfectly well the entire time.
+      * **No WatchdogSec.** Same reason — the pings would never come.
+      * **A working directory is mandatory.** The launcher resolves its engine
+        binary and its `Pal/` tree relative to the current directory; started
+        from `/` it exits immediately.
+      * **RestartSec is longer.** The server takes tens of seconds to release
+        its port and finish writing the world; restarting it after five would
+        fight its own shutdown.
+
+    The StartLimit reasoning from `unit_file` applies unchanged: a server that
+    cannot start — a corrupt world, a port already held — must stop and say so
+    rather than loop under systemd's own rate limiter forever.
+    """
+    root = str(server_root).rstrip("/")
+    lines = [
+        "[Unit]",
+        f"Description={name} (Palworld dedicated server, managed by palctl)",
+        "After=network.target",
+        "StartLimitIntervalSec=300",
+        "StartLimitBurst=5",
+        "",
+        "[Service]",
+        "Type=simple",
+        f"WorkingDirectory={root}",
+        f"ExecStart={root}/{launcher}",
+        "Restart=on-failure",
+        # Longer than the daemon's 5s: the server needs time to release its
+        # UDP port and finish writing the world before a restart can succeed.
+        "RestartSec=20",
+        # The world is written on shutdown; SIGKILL at 90s (the default) can
+        # cut that short. Palworld saves and exits well inside two minutes.
+        "TimeoutStopSec=120",
+        "KillSignal=SIGINT",
+    ]
+    if user:
+        lines.append(f"User={user}")
+    lines += ["", "[Install]", "WantedBy=multi-user.target", ""]
+    return "\n".join(lines)
+
+
 # systemctl blocks on the systemd job it queues; a unit whose start or stop
 # jobs are stuck holds the call open indefinitely. Bounded so installing or
 # removing palctl's own service can't hang the CLI with no way out.
@@ -119,6 +180,39 @@ def install_service(
         # the stale unit/binary. `restart` starts it if stopped and re-launches
         # it if running, so a reinstall actually picks up the rewritten unit.
         _run(["systemctl", "restart", name])
+
+
+def install_server_service(
+    name: str,
+    server_root: str,
+    *,
+    user: str | None = None,
+    launcher: str = "PalServer.sh",
+    enable: bool = False,
+) -> None:
+    """Write and register a unit for the game server.
+
+    `enable=False` by default, which mirrors what setup does on Windows: the
+    game service is registered but NOT set to start itself at boot, because
+    palctl's own daemon owns that decision — it starts the server at boot only
+    if that is how the operator left it, so a deliberate Stop survives a
+    reboot. Enabling this unit as well would have systemd start the server
+    behind the daemon's back, which is the Linux version of the boot-ownership
+    problem `daemoncli._hand_back_server_boot` exists to fix on Windows.
+    """
+    unit_path = UNIT_DIR / f"{name}.service"
+    unit_path.write_text(
+        server_unit_file(name, server_root, user=user, launcher=launcher),
+        encoding="utf-8",
+    )
+    _run(["systemctl", "daemon-reload"])
+    if enable:
+        _run(["systemctl", "enable", name])
+    else:
+        # Explicitly disabled rather than merely not-enabled: a unit left over
+        # from an earlier install could still be enabled, and inheriting that
+        # silently would hand boot back to systemd without anyone choosing it.
+        _run(["systemctl", "disable", name])
 
 
 def is_active(name: str) -> bool:
