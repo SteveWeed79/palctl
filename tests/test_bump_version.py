@@ -102,16 +102,19 @@ def test_a_cut_release_passes_the_release_gate():
 def test_nothing_under_unreleased_is_not_a_release(tmp_path, capsys):
     """A merge that ships nothing must exit 3 (skip), not fail the run."""
     path = tmp_path / "CHANGELOG.md"
-    path.write_text("# Changelog\n\n## [Unreleased]\n\n## [1.0.0.0] — 2026-01-01\n\n- old\n")
+    path.write_text(
+        "# Changelog\n\n## [Unreleased]\n\n## [1.0.0.0] — 2026-01-01\n\n- old\n",
+        encoding="utf-8",
+    )
     assert main(["bump_version.py", "--changelog", str(path), "--part", "patch"]) == 3
     assert "Nothing under" in capsys.readouterr().err
     # And nothing was written.
-    assert "1.0.0.1" not in path.read_text()
+    assert "1.0.0.1" not in path.read_text(encoding="utf-8")
 
 
 def test_apply_writes_the_file_and_prints_the_version(tmp_path, capsys):
     path = tmp_path / "CHANGELOG.md"
-    path.write_text(BEFORE)
+    path.write_text(BEFORE, encoding="utf-8")
     rc = main(
         [
             "bump_version.py",
@@ -128,23 +131,23 @@ def test_apply_writes_the_file_and_prints_the_version(tmp_path, capsys):
     )
     assert rc == 0
     assert capsys.readouterr().out.strip() == "1.2.8.1"
-    assert "## [1.2.8.1] — 2026-09-02" in path.read_text()
+    assert "## [1.2.8.1] — 2026-09-02" in path.read_text(encoding="utf-8")
 
 
 def test_without_apply_nothing_is_written(tmp_path, capsys):
     path = tmp_path / "CHANGELOG.md"
-    path.write_text(BEFORE)
+    path.write_text(BEFORE, encoding="utf-8")
     assert main(["bump_version.py", "--changelog", str(path), "--base", "1.2.8.0"]) == 0
     assert capsys.readouterr().out.strip() == "1.2.8.1"
-    assert path.read_text() == BEFORE
+    assert path.read_text(encoding="utf-8") == BEFORE
 
 
 def test_a_version_that_already_exists_is_refused(tmp_path, capsys):
     """Reusing a number would either move a shipped tag or leave two sections
     claiming the same release."""
     path = tmp_path / "CHANGELOG.md"
-    path.write_text(BEFORE.replace("## [1.2.8.0]", "## [1.2.8.1]"))
+    path.write_text(BEFORE.replace("## [1.2.8.0]", "## [1.2.8.1]"), encoding="utf-8")
     rc = main(["bump_version.py", "--changelog", str(path), "--base", "1.2.8.0", "--apply"])
     assert rc == 1
     assert "already exists" in capsys.readouterr().err
-    assert "## [Unreleased]\n\n### Fixed" in path.read_text()
+    assert "## [Unreleased]\n\n### Fixed" in path.read_text(encoding="utf-8")

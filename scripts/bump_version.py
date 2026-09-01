@@ -82,6 +82,11 @@ def git_tags(repo: Path) -> list[str]:
             cwd=repo,
             capture_output=True,
             text=True,
+            # Never the locale's encoding: this runs on the Windows CI too,
+            # where that is cp1252 and a tag git hands back in UTF-8 would come
+            # out mojibake — or, on the strict path, not at all.
+            encoding="utf-8",
+            errors="replace",
             check=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError):
