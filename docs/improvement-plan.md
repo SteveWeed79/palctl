@@ -374,6 +374,7 @@ Done, with tests that fail against the pre-fix source:
 | 2.5 | Discord delivery failures are logged instead of swallowed — *partial* |
 | 2.6 | Setup warns when backups sit on the server's own disk |
 | 2.7 | Grandfather-father-son retention, layered over the flat count |
+| 2.4 | Actor attribution on every event, via a ContextVar |
 
 **2.1 is partial and honestly so.** `-beta <branch>` holds a server on a named
 branch, which covers "don't take today's build". It is *not* a version pin:
@@ -390,9 +391,14 @@ doesn't revisit it), there is still no `test-alert` command, and alerts carry no
 diagnostic snapshot. A notification-library abstraction (Apprise, shoutrrr) is
 untouched.
 
-Not yet done: 2.4 (actor attribution — the event feed still can't answer "who
-stopped the server", which with four surfaces able to do it is the first
-question after a surprise), and all of Tier 3.
+**2.4 is a label, not an identity.** The control token is one shared per-user
+secret, so every holder is already fully authorised; `actor`/`via` say which
+surface and which person *claimed* to be asking, which is what makes the feed
+readable. It is not authentication and must never be treated as such — a real
+audit trail needs per-user credentials, which is the 2.4-adjacent work still
+open (see "Auth is one shared secret" in the surfaces inventory).
+
+Not yet done: all of Tier 3.
 
 ## Suggested order
 

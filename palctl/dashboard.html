@@ -410,7 +410,10 @@ async function act(what, body, confirmOpts) {
     const r = await fetch(`/action/${what}`, {
       method: "POST",
       headers: { "X-Palctl-Token": token, "Content-Type": "application/json" },
-      body: JSON.stringify(body || {}),
+      // Label the surface so the event feed can say where a stop came
+      // from; the token is the only credential, so this is a label,
+      // not an identity claim.
+      body: JSON.stringify({ via: "web", ...(body || {}) }),
     });
     const d = await r.json().catch(() => ({}));
     if (r.status === 401) note("The daemon rejected the token — reopen with `palctl ui`.");

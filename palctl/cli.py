@@ -97,8 +97,24 @@ def fmt_events(events: list[dict], n: int = 20) -> str:
     if not events:
         return "No recent events."
     return "\n".join(
-        f"{e['at'][:19]}  {e['kind']:<16} {e['message']}" for e in events[-n:]
+        f"{e['at'][:19]}  {e['kind']:<16} {e['message']}{_by(e)}"
+        for e in events[-n:]
     )
+
+
+def _by(event: dict) -> str:
+    """" — by zoe (discord)" when a person asked for this, else nothing.
+
+    Absence is meaningful: no attribution means palctl decided it by itself,
+    which is exactly what someone reading "the server restarted" needs to know
+    first."""
+    actor = (event.get("actor") or "").strip()
+    via = (event.get("via") or "").strip()
+    if not actor and not via:
+        return ""
+    if actor and via:
+        return f"  — by {actor} ({via})"
+    return f"  — by {actor or via}"
 
 
 def find_players(players: list[dict], name: str) -> list[dict]:

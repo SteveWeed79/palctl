@@ -34,7 +34,7 @@ from .client import DAEMON_PORT
 from .config import Config, config_dir, get_admin_password
 from .control import ServerController
 from .decisions import DecisionLog, summarize
-from .events import Event, EventBus, PlayerTracker, SessionStore
+from .events import Event, EventBus, PlayerTracker, SessionStore, set_actor
 from .logging_setup import setup_logging
 from .scheduler import Scheduler
 from .supervisor import Action, Observation, is_boot_start
@@ -1271,7 +1271,17 @@ class Daemon:
                     "players": [asdict(p) for p in self.tracker.online],
                     "history": self._history[-360:],
                     "events": [
-                        {"kind": e.kind, "message": e.message, "at": e.at.isoformat()}
+                        {
+                            "kind": e.kind,
+                            "message": e.message,
+                            "at": e.at.isoformat(),
+                            # Empty for anything palctl decided by itself,
+                            # which is itself the answer to "did a person do
+                            # this?" — so surfaces can render "by zoe (discord)"
+                            # only where there is a person to name.
+                            "actor": e.actor,
+                            "via": e.via,
+                        }
                         for e in self.bus.recent(60)
                     ],
                     # What palctl decided, and why. `why` is the one-liner a
@@ -1314,6 +1324,30 @@ class Daemon:
                     raise _BadRequest(f"missing required field: {field}")
                 return value
 
+            def who() -> tuple[str, str]:
+                """Who is asking, per the client's own claim.
+
+                The token is one shared per-user secret, so this is not an
+                identity check and must never be treated as one — every holder
+                of the token is already fully authorised. It is a *label*, so
+                the event feed can answer "which of my four surfaces stopped
+                the server", which it previously could not answer at all.
+                Trimmed and length-capped because it is rendered in Discord
+                embeds, the dashboard and the desktop GUI.
+                """
+
+                def clean(field: str) -> str:
+                    value = body.get(field)
+                    if not isinstance(value, str):
+                        return ""
+                    # Control characters would break the log line and the
+                    # embed; newlines especially.
+                    return "".join(
+                        c for c in value.strip() if c.isprintable()
+                    )[:64]
+
+                return clean("actor"), clean("via")
+
             def optional_seconds() -> int | None:
                 """`{"seconds": N}` overrides the configured countdown for this
                 one call — 0 means "no warning, go now". Absent = use the
@@ -1330,6 +1364,10 @@ class Daemon:
                     )
                 return value
 
+            # Scoped to this request by aiohttp's per-request task context,
+            # and inherited by anything _spawn_exclusive starts from here — so
+            # a long restore that finishes minutes later is still attributed.
+            set_actor(*who())
             try:
                 if what == "start":
                     # One implementation for start/stop (also the bot's /start,

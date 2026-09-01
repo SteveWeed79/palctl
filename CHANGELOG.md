@@ -11,6 +11,15 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Added
+- **The event feed now records who asked.** Four surfaces can stop this server
+  — the desktop GUI, the web dashboard, the CLI and the Discord bot — and the
+  feed recorded that a stop happened but never who wanted it, so the first
+  question after a surprise had no answer inside palctl. Events now carry an
+  actor and the surface it came from ("zoe (discord)"), shown by `palctl
+  events` and carried on `/state`. Attribution is inherited by whatever an
+  action spawns, so a restart whose countdown ends ten minutes later is still
+  recorded as that person's restart, and it is absent for anything palctl
+  decided itself — which is the answer to "did a person do this?".
 - **Updates now warn the people they are about to disconnect.** An update takes
   the server down for longer than a restart does, and it was the one operation
   that did it with no notice — the countdown machinery existed and updates were

@@ -90,6 +90,11 @@ class DaemonDown(DaemonError):
 
 def call(path: str, body: dict | None = None, *, timeout: float = 10) -> dict:
     headers = _auth_headers()
+    # Say which surface asked, so the event feed can answer "who stopped the
+    # server" when four of them can. Not an identity claim — the token is one
+    # shared secret — just a label the daemon records.
+    if body is not None and path.startswith("/action"):
+        body = {"via": "gui", **body}
     try:
         with httpx.Client(timeout=timeout) as c:
             r = (

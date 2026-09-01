@@ -21,13 +21,15 @@ charges for that.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import json
 import logging
 import sqlite3
 import threading
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -48,6 +50,53 @@ class Event:
     message: str
     data: dict[str, Any] = field(default_factory=dict)
     at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    # Who asked for this, and from where — "zoe" / "discord". Empty for
+    # everything palctl decided by itself (a watchdog restart, a scheduled
+    # backup), which is itself the answer to "did a person do this?".
+    #
+    # Four surfaces can stop this server: the desktop GUI, the web dashboard,
+    # the CLI and the Discord bot. The event feed recorded that a stop
+    # happened and never who asked, so "why did the server go down?" — the
+    # first question after a surprise — was unanswerable from inside palctl.
+    actor: str = ""
+    via: str = ""
+
+
+# The actor for whatever is currently being done, if a person asked for it.
+# A ContextVar rather than a parameter threaded through every call: an admin's
+# Stop travels daemon -> scheduler -> controller and emits events at each
+# layer, and asyncio tasks inherit the context they were created in, so a
+# spawned long-running operation keeps its attribution without any of those
+# call sites knowing the concept exists.
+_actor: contextvars.ContextVar[tuple[str, str]] = contextvars.ContextVar(
+    "palctl_actor", default=("", "")
+)
+
+
+@contextlib.contextmanager
+def acting_as(actor: str, via: str):
+    """Attribute every event emitted in this block to `actor` (via `via`)."""
+    token = _actor.set((actor or "", via or ""))
+    try:
+        yield
+    finally:
+        _actor.reset(token)
+
+
+def set_actor(actor: str, via: str) -> None:
+    """Attribute events from here on *in this task's context*.
+
+    The unscoped sibling of `acting_as`, for a request handler that owns its
+    own context and has no block to wrap: aiohttp runs each request in its own
+    task, so this cannot leak into another request, and a task spawned from
+    here inherits it — which is what keeps a restore that finishes minutes
+    later attributed to the person who asked for it.
+    """
+    _actor.set((actor or "", via or ""))
+
+
+def current_actor() -> tuple[str, str]:
+    return _actor.get()
 
 
 Handler = Callable[[Event], Awaitable[None]]
@@ -76,6 +125,12 @@ class EventBus:
             pass
 
     async def emit(self, event: Event) -> None:
+        # Stamp the acting admin on, unless the caller already named one.
+        # Done here so attribution cannot be forgotten at an emit site.
+        if not event.actor and not event.via:
+            actor, via = current_actor()
+            if actor or via:
+                event = replace(event, actor=actor, via=via)
         self._recent.append(event)
         del self._recent[:-500]
 
@@ -387,7 +442,21 @@ class SessionStore:
         with self._lock:
             self._db.execute(
                 "INSERT INTO events (at, kind, message, data) VALUES (?,?,?,?)",
-                (e.at.isoformat(), e.kind, e.message, json.dumps(e.data)),
+                (
+                    e.at.isoformat(),
+                    e.kind,
+                    e.message,
+                    # Attribution rides inside `data` rather than in new
+                    # columns: the events table already exists on every
+                    # install, and a migration to record who pressed Stop is
+                    # not worth the risk to a table that is only ever appended
+                    # to. An old row simply has no `actor` key.
+                    json.dumps(
+                        {**e.data, "actor": e.actor, "via": e.via}
+                        if (e.actor or e.via)
+                        else e.data
+                    ),
+                ),
             )
             # Timestamps are ISO-8601 UTC written by one writer, so they sort
             # lexicographically and a string comparison is a valid prune.

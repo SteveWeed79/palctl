@@ -33,7 +33,7 @@ from discord import app_commands
 from . import backups, countdown, leak, procs
 from .api import PalApi, PalApiError
 from .config import Config, get_discord_token
-from .events import Event, EventBus, SessionStore
+from .events import Event, EventBus, SessionStore, set_actor
 
 BLUE = 0x47C8FF
 RED = 0xF85149
@@ -421,6 +421,17 @@ class PalBot(discord.Client):
         """Runs before every slash command. Rejecting here means the handler
         never runs, so a command added later is covered without remembering
         anything."""
+        # Same reason, for attribution: naming the Discord user here covers
+        # every command — including ones added later — instead of relying on
+        # thirteen handlers each remembering to do it. discord.py dispatches
+        # each interaction in its own task, so this is scoped to this command
+        # and inherited by anything it spawns; a /restart whose countdown ends
+        # ten minutes later is still recorded as that person's restart.
+        set_actor(
+            getattr(interaction.user, "display_name", "")
+            or getattr(interaction.user, "name", ""),
+            "discord",
+        )
         if command_allowed_here(self._home_guild_id(), interaction.guild_id):
             return True
         logging.getLogger("palctl.bot").warning(

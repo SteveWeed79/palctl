@@ -30,6 +30,17 @@ class DaemonError(RuntimeError):
     """Anything that prevents talking to the daemon — with a human message."""
 
 
+def _os_user() -> str:
+    """The logged-in username, for labelling CLI actions. Never fails: this is
+    cosmetic, and an unnamed actor is better than a crashed command."""
+    import getpass
+
+    try:
+        return getpass.getuser()[:64]
+    except Exception:
+        return ""
+
+
 class DaemonClient:
     # Long default timeout: a Stop waits for the service to actually stop,
     # which on a busy server takes a minute or two.
@@ -38,10 +49,19 @@ class DaemonClient:
         port: int = DAEMON_PORT,
         token: str | None = None,
         timeout: float = 180.0,
+        via: str = "cli",
+        actor: str = "",
     ) -> None:
         self._base = f"http://127.0.0.1:{port}"
         self._token = token if token is not None else localauth.get_or_create_token()
         self._timeout = timeout
+        # Which surface is driving, and which person. The daemon records both on
+        # every event the action produces, so "who stopped the server" has an
+        # answer when the GUI, the dashboard, the CLI and Discord can all do it.
+        # The OS username is a convenience default, not authentication — the
+        # shared token already authorised the call.
+        self.via = via
+        self.actor = actor or _os_user()
 
     def _request(self, method: str, path: str, json: dict | None = None):
         try:
@@ -80,4 +100,7 @@ class DaemonClient:
         return self._request("GET", "/backups")
 
     def action(self, what: str, **body) -> dict:
-        return self._request("POST", f"/action/{what}", json=body or {})
+        # `via`/`actor` label the surface and the person for the event feed.
+        # A caller that sets them explicitly wins; otherwise this is the CLI.
+        labelled = {"via": self.via, "actor": self.actor, **body}
+        return self._request("POST", f"/action/{what}", json=labelled)
