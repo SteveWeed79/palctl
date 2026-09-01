@@ -416,3 +416,71 @@ def test_the_prune_child_command_carries_its_targets(tmp_path, monkeypatch, froz
         child = child[2:]  # past -m palctl.savescan
     assert child[0] == savescan.PRUNE_FLAG
     assert child[2] == f"{ZOE},{ANA}"
+
+
+# ---------------- pruning one named player ----------------
+
+
+def test_naming_a_player_narrows_the_selection(tmp_path):
+    """The escape hatch the 90% refusal points at, and the way to deal with one
+    enormous departed account without lowering the threshold for everybody."""
+    world = make_world(tmp_path, {ZOE: 100, ANA: 100})
+    seen = {ZOE: ("zoe", iso(200)), ANA: ("ana", iso(300))}
+
+    plan = plan_prune(
+        audit_of(world, seen), scan_of(**{ZOE: 10, ANA: 20}), only="zoe", now=NOW
+    )
+
+    assert [t.name for t in plan.targets] == ["zoe"]
+
+
+def test_a_player_can_be_named_by_guid(tmp_path):
+    world = make_world(tmp_path, {ZOE: 100})
+    plan = plan_prune(
+        audit_of(world, {ZOE: ("zoe", iso(200))}),
+        scan_of(**{ZOE: 10}),
+        only=ZOE,
+        now=NOW,
+    )
+
+    assert len(plan.targets) == 1
+
+
+def test_naming_someone_never_widens_the_rules(tmp_path):
+    """Naming a player is not a way around inactivity, identification or the
+    exclusion list — it only narrows what was already eligible."""
+    world = make_world(tmp_path, {ANA: 100})
+    active = {ANA: ("ana", iso(1))}
+
+    plan = plan_prune(
+        audit_of(world, active), scan_of(**{ANA: 900}), only="ana", now=NOW
+    )
+
+    assert plan.targets == []
+    assert not plan.safe  # and it says why rather than silently doing nothing
+
+
+def test_naming_an_excluded_player_still_spares_them(tmp_path):
+    world = make_world(tmp_path, {ZOE: 100})
+    plan = plan_prune(
+        audit_of(world, {ZOE: ("zoe", iso(200))}),
+        scan_of(**{ZOE: 10}),
+        exclusions={ZOE},
+        only="zoe",
+        now=NOW,
+    )
+
+    assert plan.targets == []
+
+
+def test_an_unmatched_name_says_so_rather_than_pruning_nobody_quietly(tmp_path):
+    world = make_world(tmp_path, {ZOE: 100})
+    plan = plan_prune(
+        audit_of(world, {ZOE: ("zoe", iso(200))}),
+        scan_of(**{ZOE: 10}),
+        only="nobody-by-that-name",
+        now=NOW,
+    )
+
+    assert not plan.safe
+    assert "No inactive player matches" in plan.blockers[0]

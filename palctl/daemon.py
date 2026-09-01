@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -1441,6 +1442,27 @@ class Daemon:
                 elif what == "backup":
                     if not self._spawn_exclusive("backup", self.scheduler.backup_now("gui")):
                         return _busy_response(self.control.current_op)
+                elif what == "save-prune":
+                    # The world-rewriting operation, driven from a surface
+                    # rather than the CLI. Two things make this safe to expose:
+                    # it runs under the same operation lock as a backup, so
+                    # nothing else can touch the world while it does, and it
+                    # refuses unless the server is genuinely stopped — checked
+                    # from the process list, not from the service state, in
+                    # saveprune.run_prune itself.
+                    #
+                    # `apply` must be asked for explicitly here exactly as it
+                    # must on the CLI. A dry run is the default over HTTP too,
+                    # so a mis-clicked button reports rather than rewrites.
+                    if not self._spawn_exclusive(
+                        "save-prune",
+                        self._run_save_prune(
+                            apply=bool(body.get("apply", False)),
+                            days=int(body.get("days", 90)),
+                            only=str(body.get("player", "")),
+                        ),
+                    ):
+                        return _busy_response(self.control.current_op)
                 elif what == "update-server":
                     # `{"validate": true}` asks SteamCMD to re-verify every file
                     # against Steam's manifest — a repair for a suspected-broken
@@ -1680,6 +1702,53 @@ class Daemon:
         with contextlib.suppress(Exception):
             await asyncio.to_thread(self.store.close)
         self.log.info("shutdown complete")
+
+    async def _run_save_prune(self, *, apply: bool, days: int, only: str) -> None:
+        """Plan (and optionally run) a Level.sav prune, reporting to the event
+        feed. Everything heavy happens off the event loop: the parse is a child
+        process and the backup is a file copy, and neither may stall the poll
+        loop that is supervising the server."""
+        from . import saveaudit, saveprune
+
+        worlds = await asyncio.to_thread(saveaudit.world_dirs, self.cfg.savegames_dir)
+        if not worlds:
+            await self.bus.emit(Event("error", "No world found to prune."))
+            return
+        if len(worlds) > 1:
+            await self.bus.emit(
+                Event(
+                    "error",
+                    f"{len(worlds)} worlds found — palctl won't guess which one "
+                    "to rewrite. Move the others aside first.",
+                )
+            )
+            return
+
+        seen = await asyncio.to_thread(self.store.last_seen_by_player_id)
+        running = await asyncio.to_thread(procs.find_process, self.cfg.server_root)
+        outcome = await asyncio.to_thread(
+            functools.partial(
+                saveprune.run_prune,
+                worlds[0],
+                self.cfg.savegames_dir,
+                Path(self.cfg.backup_root),
+                seen,
+                server_stopped=running is None,
+                apply=apply,
+                days=days,
+                only=only,
+            )
+        )
+        if outcome.error:
+            await self.bus.emit(Event("error", f"Save prune: {outcome.error}"))
+            return
+        await self.bus.emit(
+            Event(
+                "info" if not outcome.applied else "restore",
+                saveprune.format_plan(outcome.plan, applied=outcome.applied),
+                {"applied": outcome.applied, "backup": outcome.backup},
+            )
+        )
 
     async def _supervised(
         self, name: str, factory, *, restarts: int = _WORKER_RESTART_BUDGET

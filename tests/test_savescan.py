@@ -319,3 +319,57 @@ def test_the_frozen_entry_point_runs_a_save_read(tmp_path, capsys):
 
     assert code == 1  # it ran, and reported that it could not read the file
     assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+# ---------------- guilds and base camps ----------------
+
+
+def guild(*members: str) -> dict:
+    return {
+        "value": {"RawData": {"value": {
+            "individual_character_handle_ids": [
+                {"player_uid": m} for m in members
+            ]
+        }}}
+    }
+
+
+def test_base_camps_are_counted():
+    r = count_records({"BaseCampSaveData": {"value": [{}, {}, {}]}})
+    assert r.base_camps == 3
+
+
+def test_guild_membership_is_attributed_to_each_member():
+    r = count_records({"GroupSaveDataMap": {"value": [guild(ZOE, ANA), guild(ZOE)]}})
+
+    assert r.guilds_by_player["AAAA1111000000000000000000000000"] == 2
+    assert r.guilds_by_player["BBBB2222000000000000000000000000"] == 1
+
+
+def test_a_guild_with_one_live_member_is_never_an_orphan():
+    """Removing it because three inactive guildmates were pruned would take a
+    playing person's base, storage and history with them."""
+    r = count_records({"GroupSaveDataMap": {"value": [guild(ZOE, ANA)]}})
+
+    assert r.orphan_guilds({"AAAA1111000000000000000000000000"}) == 0
+
+
+def test_a_guild_whose_every_member_is_gone_is_an_orphan():
+    r = count_records({"GroupSaveDataMap": {"value": [guild(ZOE, ANA)]}})
+
+    assert r.orphan_guilds({
+        "AAAA1111000000000000000000000000", "BBBB2222000000000000000000000000"
+    }) == 1
+
+
+def test_a_guild_palctl_could_not_read_is_never_an_orphan():
+    """An unreadable membership is an empty set, and an empty set is a subset
+    of everything — which would make every unparseable guild a delete target."""
+    r = count_records({"GroupSaveDataMap": {"value": [{"value": {"RawData": []}}]}})
+
+    assert r.orphan_guilds({"AAAA1111000000000000000000000000"}) == 0
+
+
+def test_no_targets_means_no_orphans():
+    r = count_records({"GroupSaveDataMap": {"value": [guild(ZOE)]}})
+    assert r.orphan_guilds(set()) == 0

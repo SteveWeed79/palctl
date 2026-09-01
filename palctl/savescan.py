@@ -43,6 +43,7 @@ from pathlib import Path
 _WANTED_PROPERTIES = (
     ".worldSaveData.CharacterSaveParameterMap.Value.RawData",
     ".worldSaveData.GroupSaveDataMap",
+    ".worldSaveData.BaseCampSaveData.Value.RawData",
 )
 
 # A save this size will not fit in a sensible amount of RAM once parsed, and the
@@ -106,10 +107,34 @@ class ScanResult:
     # Character records whose owner is not a player GUID at all — wild pals and
     # anything the parser could not attribute. Never a cleanup target.
     unowned: int = 0
+    base_camps: int = 0
+    # playerId -> guilds they belong to, and -> base camps their guild owns.
+    # A guild is shared, so these are NOT additive across players and must
+    # never be summed into a "records owned" figure: two departed guildmates
+    # both point at the same one guild.
+    guilds_by_player: dict[str, int] = field(default_factory=dict)
+    # Per-guild membership, for `orphan_guilds`. Private because it is an
+    # implementation detail of that question, not a number to report.
+    _guild_members: list[frozenset[str]] = field(default_factory=list)
 
     @property
     def attributed(self) -> int:
         return sum(self.by_player.values())
+
+    def orphan_guilds(self, targets: set[str]) -> int:
+        """Guilds whose every member is in `targets`.
+
+        The only guilds a cleanup could remove. A guild with one live member is
+        that member's guild — removing it because their three inactive
+        guildmates were pruned would take a playing person's base, storage and
+        history with it. A guild palctl could not read the membership of has an
+        empty member set and is deliberately never counted here.
+        """
+        if not targets:
+            return 0
+        return sum(
+            1 for members in self._guild_members if members and members <= targets
+        )
 
 
 def _normalise_guid(raw: object) -> str:
@@ -173,6 +198,7 @@ def count_records(world: dict) -> ScanResult:
     """
     characters = world.get("CharacterSaveParameterMap", {}).get("value", []) or []
     groups = world.get("GroupSaveDataMap", {}).get("value", []) or []
+    camps = world.get("BaseCampSaveData", {}).get("value", []) or []
 
     owned: Counter[str] = Counter()
     unowned = 0
@@ -196,13 +222,50 @@ def count_records(world: dict) -> ScanResult:
         else:
             owned[guid] += 1
 
+    guild_members = _guild_membership(groups)
+    guilds_by_player: Counter[str] = Counter()
+    for members in guild_members:
+        for guid in members:
+            guilds_by_player[guid] += 1
+
     return ScanResult(
         ok=True,
         characters=len(characters),
         guilds=len(groups),
         by_player=dict(owned),
         unowned=unowned,
+        base_camps=len(camps),
+        guilds_by_player=dict(guilds_by_player),
+        _guild_members=guild_members,
     )
+
+
+def _guild_membership(groups: list) -> list[frozenset[str]]:
+    """The player GUIDs in each guild.
+
+    A guild record carries its members under RawData; the shape has moved
+    between game patches, so this looks for player ids wherever they are rather
+    than pinning one path — and a guild it cannot read comes back as an empty
+    set, which makes it un-orphanable and therefore safe.
+    """
+    out: list[frozenset[str]] = []
+    for group in groups:
+        raw = _get(group, "value", "RawData", "value") or {}
+        members = raw.get("individual_character_handle_ids") or raw.get("players") or []
+        guids: set[str] = set()
+        if isinstance(members, list):
+            for member in members:
+                if not isinstance(member, dict):
+                    continue
+                guid = _normalise_guid(
+                    member.get("player_uid")
+                    or member.get("uid")
+                    or _get(member, "player_info", "player_uid")
+                )
+                if guid and guid != _NOBODY:
+                    guids.add(guid)
+        out.append(frozenset(guids))
+    return out
 
 
 def _get(node: object, *path: str):
@@ -432,6 +495,14 @@ def scan(level_sav: Path, *, timeout: float = SCAN_TIMEOUT_SECONDS) -> ScanResul
         guilds=int(payload.get("guilds", 0)),
         by_player={str(k): int(v) for k, v in (payload.get("by_player") or {}).items()},
         unowned=int(payload.get("unowned", 0)),
+        base_camps=int(payload.get("base_camps", 0)),
+        guilds_by_player={
+            str(k): int(v) for k, v in (payload.get("guilds_by_player") or {}).items()
+        },
+        _guild_members=[
+            frozenset(str(g) for g in members)
+            for members in (payload.get("guild_members") or [])
+        ],
     )
 
 
@@ -467,6 +538,11 @@ def main(argv: list[str] | None = None) -> int:
                 "guilds": result.guilds,
                 "by_player": result.by_player,
                 "unowned": result.unowned,
+                "base_camps": result.base_camps,
+                "guilds_by_player": result.guilds_by_player,
+                # Membership crosses the process boundary so orphan_guilds can
+                # be answered in the parent, where the target set is known.
+                "guild_members": [sorted(m) for m in result._guild_members],
             }
         )
     )

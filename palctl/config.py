@@ -224,6 +224,14 @@ class Config:
     # Check GitHub for a newer palctl on startup (best-effort; just notifies).
     check_for_updates: bool = True
 
+    # Auto-pause: stop an empty server and start it again when somebody tries
+    # to connect. OFF by default and deliberately so — it trades the first
+    # player's connection for the resources an idle server holds, and that is
+    # not a trade palctl gets to make on an operator's behalf. Turning it off
+    # is always safe: the server simply stays up.
+    autopause_enabled: bool = False
+    autopause_idle_minutes: int = 10
+
     # A second alert channel besides Discord + the GUI/log, so the daemon can
     # still reach you when Discord is down or unconfigured. One outbound HTTP
     # POST to any URL — an ntfy topic, a Slack/Discord incoming webhook, or your

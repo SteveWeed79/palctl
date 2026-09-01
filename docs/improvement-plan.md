@@ -321,14 +321,16 @@ list, a verified backup first, only known/inactive/non-excluded players, a
 90%-of-the-world refusal, a re-read of the rewritten save before it replaces
 anything, and an exclusion list beside the world.
 
-Still to build:
-1. Guild and base-camp records — `savescan` counts guilds but does not attribute
-   them, and abandoned base camps are the third source of bloat.
-2. Driving the prune from the daemon (inside the operation lock) and from
-   Discord, rather than only from the CLI. The CLI is deliberately first: it is
-   the surface where an operator is present and reading output.
-3. Pruning a *named* player on request, which is what the 90% refusal points
-   people at.
+**All three follow-ups are done:** guilds and base camps are counted and
+attributed (with orphan-guild detection that refuses to touch a guild with any
+active member), the prune is drivable from the daemon under the operation lock,
+and `--player NAME` prunes one named account.
+
+Still open: a Discord surface for the prune, and removing the orphaned guild and
+base-camp records themselves — today they are *counted*, and only character
+records are removed. Counting first is deliberate: the guild record is what ties
+a base and its storage together, and getting that wrong takes a live player's
+base with it.
 
 **A gap worth naming:** there is no test of a *successful* end-to-end parse.
 That needs a genuine multi-hundred-megabyte `Level.sav`; upstream's own
@@ -337,7 +339,7 @@ synthesised cheaply. The record-counting that parse feeds is tested
 exhaustively as a pure function, and every failure path of the subprocess
 boundary is covered — but the first real save this meets will be a user's.
 
-### 3.2 Auto-pause when the server is empty
+### 3.2 Auto-pause when the server is empty ✅ *done, by a different route*
 
 palworld-server-docker suspends the server process with `SIGSTOP` once empty (gated on
 a successful save) and wakes it on the first inbound packet via NFLOG, with a knockd

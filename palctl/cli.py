@@ -167,7 +167,8 @@ def _deep_report(world, seen: dict, days: int) -> str:
 
     lines = [
         f"\n  Level.sav holds {result.characters:,} character record(s) "
-        f"({result.unowned:,} wild or unattributed) and {result.guilds:,} guild(s)."
+        f"({result.unowned:,} wild or unattributed), {result.guilds:,} guild(s) "
+        f"and {result.base_camps:,} base camp(s)."
     ]
     idle = {p.player_id.replace("-", "").upper(): p for p in
             saveaudit.audit(world, seen).inactive(days=days)}
@@ -181,6 +182,13 @@ def _deep_report(world, seen: dict, days: int) -> str:
             f"  That is {sum(n for n, _ in owed):,} of {result.characters:,} "
             "records held for players who have stopped playing."
         )
+        orphans = result.orphan_guilds(set(idle))
+        if orphans:
+            lines.append(
+                f"  {orphans} guild(s) have no remaining active member. A guild "
+                "with even one\n  player still around is that player's guild and "
+                "is never counted here."
+            )
     return "\n".join(lines)
 
 
@@ -258,7 +266,7 @@ def _setup(args) -> int:
     return 0
 
 
-def _save_prune(days: int, *, apply: bool) -> int:
+def _save_prune(days: int, *, apply: bool, player: str = "") -> int:
     """Plan — and with --apply, carry out — a Level.sav prune.
 
     Whether the server is stopped is established by looking for its process,
@@ -302,6 +310,7 @@ def _save_prune(days: int, *, apply: bool) -> int:
         server_stopped=not running,
         apply=apply,
         days=days,
+        only=player,
     )
     print(saveprune.format_plan(outcome.plan, applied=outcome.applied))
     if outcome.error:
@@ -414,6 +423,11 @@ def main(argv: list[str] | None = None) -> int:
              f"(default {saveaudit.INACTIVE_DAYS})",
     )
     sp.add_argument(
+        "--player", default="",
+        help="prune only this player (name or GUID). Still subject to every "
+             "rule — they must be known, inactive and not excluded.",
+    )
+    sp.add_argument(
         "--apply", action="store_true",
         help="actually rewrite Level.sav. Without this it only reports what it "
              "would remove. Requires a stopped server; takes and verifies a "
@@ -493,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "save-audit":
             print(_save_audit(args.days, deep=args.deep))
         elif args.cmd == "save-prune":
-            return _save_prune(args.days, apply=args.apply)
+            return _save_prune(args.days, apply=args.apply, player=args.player)
         elif args.cmd == "setup":
             return _setup(args)
         elif args.cmd == "start":

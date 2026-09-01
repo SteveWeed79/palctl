@@ -136,6 +136,7 @@ def plan_prune(
     days: int = saveaudit.INACTIVE_DAYS,
     exclusions: set[str] | None = None,
     now: datetime | None = None,
+    only: str = "",
 ) -> PrunePlan:
     """Decide who would be removed. Pure — no files, no processes, no clock.
 
@@ -154,7 +155,15 @@ def plan_prune(
 
     targets: list[PruneTarget] = []
     excluded: list[str] = []
+    # `only` names one player — the escape hatch the 90% refusal points at, and
+    # the way to deal with a single enormous departed account without lowering
+    # the inactivity threshold for everybody. It NARROWS the automatic
+    # selection and never widens it: the player must still be known, inactive
+    # and unexcluded, so naming somebody is not a way around any of the rules.
+    wanted = only.strip().lower()
     for p in audit.inactive(days=days, now=moment):
+        if wanted and wanted not in (p.name.lower(), p.player_id.lower()):
+            continue
         guid = p.player_id.replace("-", "").upper()
         if guid in protected:
             excluded.append(p.name or p.player_id)
@@ -171,6 +180,13 @@ def plan_prune(
                 records=records,
                 last_seen_days=p.inactive_for_days(moment) or 0.0,
             )
+        )
+
+    if wanted and not targets and not blockers:
+        blockers.append(
+            f"No inactive player matches {only!r}. `palctl save-audit --deep` "
+            "lists who qualifies — a player who is merely idle, not yet past "
+            f"the {days}-day threshold, is not eligible."
         )
 
     if scan.ok and targets and scan.characters and (
@@ -245,6 +261,7 @@ def run_prune(
     apply: bool = False,
     days: int = saveaudit.INACTIVE_DAYS,
     now: datetime | None = None,
+    only: str = "",
 ) -> PruneOutcome:
     """Plan a prune, and — only with `apply=True` — carry it out.
 
@@ -263,7 +280,7 @@ def run_prune(
     audit = saveaudit.audit(world, seen)
     scan = savescan.scan(world / saveaudit.LEVEL_SAV)
     plan = plan_prune(
-        audit, scan, days=days, exclusions=load_exclusions(world), now=now
+        audit, scan, days=days, exclusions=load_exclusions(world), now=now, only=only
     )
 
     if not apply:

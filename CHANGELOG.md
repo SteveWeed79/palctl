@@ -11,6 +11,38 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Added
+- **Auto-pause: an empty server puts itself away, and comes back when somebody
+  tries to connect.** Off by default (`autopause_enabled`), and turning it off
+  is always the safe direction — the server simply stays up.
+
+  palctl **stops** the server rather than `SIGSTOP`-ing it, which is a
+  deliberate departure from how the rest of the field does this. A suspended
+  process still owns the UDP port, so the wake packet lands in its receive
+  buffer where nothing can see it without root and packet capture; a stopped
+  server releases the port and palctl just listens on it. And a suspended
+  process still holds its leaked memory — palctl exists because Palworld leaks,
+  and freezing a 12 GB process leaves 12 GB frozen. The cost is honest and
+  belongs to the first player back: a stopped server takes tens of seconds to
+  load.
+
+  Every branch fails safe toward *running*. It will not act while an operation
+  holds the lock, while the API is silent (that is the watchdog's business, and
+  pausing would hide a sick server behind a deliberate-looking stop), when the
+  player count is unknown as opposed to zero, or on a server somebody stopped
+  on purpose — which it also never wakes. A freshly woken server gets a grace
+  period so the player whose connection woke it isn't put away while still
+  loading in.
+- **`palctl save-prune --player NAME`** prunes one named player — the escape
+  hatch the 90%-of-the-world refusal points at. It only ever *narrows* the
+  automatic selection: the player must still be known, inactive and not
+  excluded, so naming somebody is not a way around any rule.
+- **The deep save audit now counts guilds and base camps**, and reports guilds
+  whose every member has stopped playing. A guild with even one active player
+  is that player's guild and is never counted — and a guild palctl could not
+  read the membership of is never counted either, since an empty member set is
+  a subset of everything and would make every unparseable guild a target.
+- **The prune can be driven from the daemon**, under the same operation lock as
+  a backup, with `apply` off by default over HTTP exactly as on the CLI.
 - **A `/metrics` endpoint in Prometheus format.** palctl keeps seven days of
   metrics and could show about two hours of them, in its own sparkline, with no
   way to export any of it — so "was the server slow last Tuesday?" was
