@@ -257,6 +257,33 @@ def check_server_boot_ownership(service_name: str, daemon_startup: str) -> Check
     return boot_ownership_verdict(mode, daemon_startup)
 
 
+def check_backup_volume(server_root: str | Path, backup_root: str | Path) -> Check:
+    """Whether backups land on a different disk from the server.
+
+    Backups on the server's own volume cover a bad update, a botched restore and
+    a corrupt save — but not the disk, which is the failure the word "backup"
+    makes people assume they are covered for. Never a hard failure: one disk is
+    a perfectly reasonable place to start, and the off-site mirror is the real
+    answer. It just should not be a silent default.
+    """
+    from . import backups as _backups
+
+    same = _backups.same_volume(Path(server_root), Path(backup_root))
+    if same is None:
+        return Check("Backup location", None, "couldn't tell which disk the backups are on")
+    if not same:
+        return Check("Backup location", True, "backups are on a different disk from the server")
+    return Check(
+        "Backup location",
+        None,
+        "backups are on the same disk as the server — that disk failing takes both",
+        fix=(
+            "Point the backup folder at another drive, or turn on off-site "
+            "backups in Config so a second copy leaves this machine."
+        ),
+    )
+
+
 def run_all(
     server_root: str | Path,
     api_port: int,
@@ -265,12 +292,14 @@ def run_all(
     need_admin: bool = True,
     service_name: str = "",
     daemon_startup: str = "",
+    backup_root: str | Path = "",
 ) -> list[Check]:
     """The checks relevant to what the user is about to do.
 
     `service_name`/`daemon_startup` come from the config; without them the
     boot-ownership check is skipped rather than guessed at, so older callers
-    keep working unchanged."""
+    keep working unchanged. `backup_root` is the same deal for the
+    backup-volume check."""
     checks: list[Check] = []
     if need_install:
         checks.append(check_disk_space(server_root))
@@ -279,6 +308,8 @@ def run_all(
     checks.append(check_single_server_instance())
     if service_name:
         checks.append(check_server_boot_ownership(service_name, daemon_startup))
+    if backup_root:
+        checks.append(check_backup_volume(server_root, backup_root))
     if need_admin:
         checks.append(check_admin())
     return checks

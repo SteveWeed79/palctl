@@ -391,8 +391,15 @@ class PalBot(discord.Client):
                     d.welcome_message.replace("{name}", name),
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
-        except discord.DiscordException:
-            pass
+        except discord.DiscordException as e:
+            # Was a bare `pass`. A notification channel that has stopped
+            # delivering is exactly the failure you need told about — the
+            # usual causes (the bot lost Send Messages on that channel, the
+            # channel was deleted) are permanent and invisible until someone
+            # notices they stopped hearing from palctl.
+            logging.getLogger("palctl.bot").warning(
+                "Discord notification not delivered: %s", e
+            )
 
     # ---------- permissions ----------
 

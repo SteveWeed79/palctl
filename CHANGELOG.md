@@ -11,6 +11,29 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Added
+- **Updates now warn the people they are about to disconnect.** An update takes
+  the server down for longer than a restart does, and it was the one operation
+  that did it with no notice — the countdown machinery existed and updates were
+  simply left out of it. They now get the same countdown, the same in-game
+  announcements, and the same two escape hatches (cancel, or skip the wait) as
+  a scheduled restart, and collapse to a few seconds when nobody is online.
+- **A Steam branch can be held.** `steam_branch` (and `steam_beta_password` for
+  a branch that needs one) pass `-beta` through to SteamCMD, so a server can sit
+  on a known-good build instead of taking whatever `public` is serving today.
+  Palworld patches constantly and has shipped save-breaking builds; until now
+  there was no way to say "not that one". Pinning to an exact depot manifest
+  needs DepotDownloader and is not part of this.
+- **Calendar-based backup retention.** `backup_keep_daily` / `_weekly` /
+  `_monthly` keep the newest backup in each of the last N days, ISO weeks and
+  months, layered on top of the flat count — a backup survives if any rule
+  wants it, so turning this on can only ever keep more. Without it, a burst of
+  manual backups (exactly what people take before doing something risky) evicts
+  the entire older history, and the day you need a backup is usually the day
+  you learn the corruption started last week.
+- **Setup warns when backups land on the server's own disk.** That covers a bad
+  update, a botched restore and a corrupt save — but not the disk, which is the
+  failure the word "backup" makes people assume they are covered for. A
+  warning, never a blocker.
 - **Backups now record what they are, and can be checked without restoring
   them.** Every backup gets a `palctl-manifest.json`: the file list with sizes,
   whether the pre-backup save actually flushed, and whether the copy was
@@ -74,6 +97,11 @@ Installers for every release are on the
   nights when Steam had shipped nothing it still stopped, updated and restarted
   the server, in front of whoever was playing. It now checks first, and fails
   *closed*: an inconclusive check is not evidence of a new build.
+- **Discord notifications that failed to send said nothing at all.** The
+  delivery path swallowed `DiscordException` with a bare `pass`, so the usual
+  causes — the bot losing Send Messages on that channel, the channel being
+  deleted — were permanent and invisible until someone noticed palctl had gone
+  quiet. Failures are now logged.
 - **The hung-daemon health task could never run in a source install.**
   `schtasks /Create` has no working-directory option — that lives in the task
   XML — so a scheduled task runs from the scheduler's own directory. For a

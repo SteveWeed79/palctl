@@ -239,6 +239,8 @@ def update_command(
     *,
     validate: bool = True,
     username: str = "anonymous",
+    branch: str = "",
+    beta_password: str = "",
 ) -> list[str]:
     """
     Build the SteamCMD argv.
@@ -247,6 +249,17 @@ def update_command(
     after and SteamCMD silently ignores it and installs into its own directory,
     which is the single most common "why did it download to the wrong place"
     mistake.
+
+    ``branch`` selects a Steam beta branch (``-beta <name>``), with
+    ``beta_password`` for a branch that needs one. Both are arguments *to*
+    ``app_update``, so they go after the app id and before ``validate``.
+
+    This is what a server stays on when Pocketpair ships a build you don't want
+    yet: pointing at a named branch holds the install there instead of taking
+    whatever `public` is serving today. It is not a full version pin — pinning
+    to an exact depot manifest needs ``download_depot`` or DepotDownloader
+    rather than ``app_update``, and that is a larger change; see
+    docs/improvement-plan.md.
     """
     args = [
         str(steamcmd),
@@ -254,6 +267,10 @@ def update_command(
         "+login", username,
         "+app_update", str(app_id),
     ]
+    if branch:
+        args += ["-beta", branch]
+        if beta_password:
+            args += ["-betapassword", beta_password]
     if validate:
         args.append("validate")
     args.append("+quit")
@@ -336,6 +353,8 @@ def run_update(
     validate: bool = True,
     on_line: LineSink | None = None,
     stall_timeout: float = STEAMCMD_STALL_SECONDS,
+    branch: str = "",
+    beta_password: str = "",
 ) -> int:
     """
     Run SteamCMD to completion, streaming stdout lines to ``on_line``. Returns
@@ -346,7 +365,10 @@ def run_update(
     on a wedged SteamCMD, and the setup wizard sits on "Installing the server…"
     with no way forward but killing the app.
     """
-    cmd = update_command(steamcmd, install_dir, app_id, validate=validate)
+    cmd = update_command(
+        steamcmd, install_dir, app_id, validate=validate,
+        branch=branch, beta_password=beta_password,
+    )
     with subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -409,6 +431,8 @@ async def run_update_async(
     validate: bool = True,
     on_line: LineSink | None = None,
     stall_timeout: float = STEAMCMD_STALL_SECONDS,
+    branch: str = "",
+    beta_password: str = "",
 ) -> int:
     """Async twin of :func:`run_update`, for the daemon's event loop.
 
@@ -419,7 +443,10 @@ async def run_update_async(
     server, so a stall lands in the same place as any other failed update
     instead of parking the daemon.
     """
-    cmd = update_command(steamcmd, install_dir, app_id, validate=validate)
+    cmd = update_command(
+        steamcmd, install_dir, app_id, validate=validate,
+        branch=branch, beta_password=beta_password,
+    )
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,

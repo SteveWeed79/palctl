@@ -129,6 +129,15 @@ class ScheduleConfig:
     # the admin can choose anything more frequent.
     backup_hours: int = 6
     backup_retain: int = 24
+    # Grandfather-father-son retention, layered ON TOP of backup_retain (a
+    # backup survives if any rule wants it, so this can only ever keep more).
+    # Without it a burst of manual backups — exactly what people take before
+    # doing something risky — evicts the whole older history, and the day you
+    # need a backup is usually the day you learn the corruption started last
+    # week. 0 on all three restores the old flat-count-only behaviour.
+    backup_keep_daily: int = 7
+    backup_keep_weekly: int = 4
+    backup_keep_monthly: int = 6
     # How many backups to keep on the mirror (second copy). Cloud storage costs
     # money, so you may want fewer copies off-site than on the local disk — or,
     # with cheap cold storage, more. 0 = keep the same count as backup_retain.
@@ -187,6 +196,12 @@ class Config:
     backup_mirror_enabled: bool = False
     service_name: str = "PalServer"
     app_id: str = "2394010"
+    # Steam beta branch to hold the server on, and its password if it needs one.
+    # Empty = the `public` branch, i.e. whatever Steam is serving today. Set a
+    # branch when a build has to be held: Palworld patches often, and an update
+    # that breaks a world or a mod is otherwise irreversible from inside palctl.
+    steam_branch: str = ""
+    steam_beta_password: str = ""
 
     # REST API (the Palworld server's own admin API — palctl only ever talks to
     # it on this box, so this stays loopback).

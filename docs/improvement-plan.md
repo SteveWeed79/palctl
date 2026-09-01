@@ -368,11 +368,31 @@ Done, with tests that fail against the pre-fix source:
 | 1.6 | Crashed worker loops restart with backoff; `degraded` in `/healthz` |
 | 2.3 | Auto-update checks for an update first, and fails closed |
 | 1.7 | Withdrawn — see above |
+| 2.1 | Steam branch/beta selection (`-beta`), config-driven — *partial*, see below |
+| 2.2 | Updates run the countdown, with cancel and skip |
+| 2.3 | Auto-update checks for an update first, and fails closed |
+| 2.5 | Discord delivery failures are logged instead of swallowed — *partial* |
+| 2.6 | Setup warns when backups sit on the server's own disk |
+| 2.7 | Grandfather-father-son retention, layered over the flat count |
 
-Not yet done: 2.1 (build pinning), 2.2 (update countdown), 2.4 (actor
-attribution), 2.5 (alert fan-out), 2.6 (same-volume warning — the `same_volume()`
-helper exists and is tested, but nothing calls it yet), 2.7 (GFS retention), and
-all of Tier 3.
+**2.1 is partial and honestly so.** `-beta <branch>` holds a server on a named
+branch, which covers "don't take today's build". It is *not* a version pin:
+pinning to an exact depot manifest id (what `TARGET_MANIFEST_ID` does in
+palworld-server-docker) requires `download_depot` or DepotDownloader rather
+than `app_update`, which is a different install path and a larger change. So
+rollback to an arbitrary previous build is still not possible from inside
+palctl. Recording the installed build id in each backup manifest — so a restore
+can say which build wrote that world — is also still open.
+
+**2.5 is partial.** Delivery failures are no longer silent, but the event set is
+still fixed at construction (`_kinds` is assigned once and `reconfigure()`
+doesn't revisit it), there is still no `test-alert` command, and alerts carry no
+diagnostic snapshot. A notification-library abstraction (Apprise, shoutrrr) is
+untouched.
+
+Not yet done: 2.4 (actor attribution — the event feed still can't answer "who
+stopped the server", which with four surfaces able to do it is the first
+question after a surprise), and all of Tier 3.
 
 ## Suggested order
 

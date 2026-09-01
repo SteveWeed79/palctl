@@ -430,6 +430,7 @@ class SetupWizard(QDialog):
             # boot, and the wizard is where they come looking.
             service_name=self._cfg.service_name or "PalServer",
             daemon_startup=self._daemon_startup(),
+            backup_root=self.backup_root.text().strip(),
         )
         for c in checks:
             self.log.append(f"  {c.icon} {c.name}: {c.detail}")

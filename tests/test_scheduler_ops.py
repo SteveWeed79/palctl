@@ -84,7 +84,7 @@ def test_update_server_stops_updates_then_starts(tmp_path, monkeypatch):
     calls: list = []
     _patch_service(monkeypatch, calls)
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line, **kw):
         calls.append(("update", str(install_dir), app_id, validate))
         if on_line:
             on_line("Success! App '2394010' fully installed.")
@@ -96,7 +96,7 @@ def test_update_server_stops_updates_then_starts(tmp_path, monkeypatch):
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     assert [c[0] for c in calls] == ["stop", "update", "start"]
     # The update ran against the configured install dir and app id — and
@@ -118,7 +118,7 @@ def test_update_server_restores_blanked_ini(tmp_path, monkeypatch):
 
     _patch_service(monkeypatch, [])
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line, **kw):
         return 0
 
     fake_bak = tmp_path / "PalWorldSettings.ini.bak"
@@ -130,7 +130,7 @@ def test_update_server_restores_blanked_ini(tmp_path, monkeypatch):
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     assert copied and copied[0][0] == fake_bak  # ini restored from the pre-update backup
     assert any("restored it" in e.message for e in events)
@@ -150,7 +150,7 @@ def test_update_server_takes_pre_update_backup(tmp_path, monkeypatch):
 
     _patch_service(monkeypatch, [])
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line, **kw):
         return 0
 
     monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
@@ -159,7 +159,7 @@ def test_update_server_takes_pre_update_backup(tmp_path, monkeypatch):
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     made = [d.name for d in Path(cfg.backup_root).iterdir()]
     assert len(made) == 1 and made[0].endswith("-pre-update")
@@ -181,7 +181,7 @@ def test_update_server_mirrors_backup_when_configured(tmp_path, monkeypatch):
 
     _patch_service(monkeypatch, [])
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line, **kw):
         return 0
 
     monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
@@ -190,7 +190,7 @@ def test_update_server_mirrors_backup_when_configured(tmp_path, monkeypatch):
 
     bus = EventBus()
     _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     primary = [d.name for d in Path(cfg.backup_root).iterdir()]
     mirrored = [d.name for d in Path(cfg.backup_mirror).iterdir()]
@@ -347,7 +347,7 @@ def test_update_server_aborts_when_server_wont_stop(tmp_path, monkeypatch):
     monkeypatch.setattr(sched_mod.procs, "stop_service", stop_fails)
     monkeypatch.setattr(sched_mod.procs, "start_service", start)
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line, **kw):
         calls.append(("update",))
         return 0
 
@@ -355,7 +355,7 @@ def test_update_server_aborts_when_server_wont_stop(tmp_path, monkeypatch):
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     assert ("update",) not in calls  # SteamCMD never ran
     assert [c[0] for c in calls] == ["stop"]  # and we didn't blind-start either
@@ -379,7 +379,7 @@ def test_update_server_aborts_when_backup_of_existing_world_fails(tmp_path, monk
     calls: list = []
     _patch_service(monkeypatch, calls)
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line, **kw):
         calls.append(("update",))
         return 0
 
@@ -392,7 +392,7 @@ def test_update_server_aborts_when_backup_of_existing_world_fails(tmp_path, monk
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     assert calls == []  # never stopped, never updated, never blind-started
     assert any(e.kind == "error" and "Update aborted" in e.message for e in events)
@@ -415,7 +415,7 @@ def test_update_server_backup_failure_opt_out_continues(tmp_path, monkeypatch):
     calls: list = []
     _patch_service(monkeypatch, calls)
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line, **kw):
         calls.append(("update",))
         return 0
 
@@ -430,7 +430,7 @@ def test_update_server_backup_failure_opt_out_continues(tmp_path, monkeypatch):
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     assert [c[0] for c in calls] == ["stop", "update", "start"]
     assert any("continuing with the update anyway" in e.message for e in events)
@@ -450,7 +450,7 @@ def test_update_server_fresh_install_skips_backup_and_proceeds(tmp_path, monkeyp
     calls: list = []
     _patch_service(monkeypatch, calls)
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line, **kw):
         calls.append(("update",))
         return 0
 
@@ -460,7 +460,7 @@ def test_update_server_fresh_install_skips_backup_and_proceeds(tmp_path, monkeyp
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     assert [c[0] for c in calls] == ["stop", "update", "start"]
     assert any("skipping the pre-update backup" in e.message for e in events)
@@ -479,7 +479,7 @@ def test_update_server_reports_update_exceptions(tmp_path, monkeypatch):
 
     _patch_service(monkeypatch, [])
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line, **kw):
         raise OSError("steamcmd exploded")
 
     monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
@@ -488,7 +488,7 @@ def test_update_server_reports_update_exceptions(tmp_path, monkeypatch):
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     assert any(e.kind == "error" and "steamcmd exploded" in e.message for e in events)
     # The server is still brought back — on the old files, but running.
@@ -507,7 +507,7 @@ def test_update_server_restores_ini_even_when_steamcmd_dies(tmp_path, monkeypatc
 
     _patch_service(monkeypatch, [])
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line, **kw):
         raise OSError("dropped connection")
 
     fake_bak = tmp_path / "PalWorldSettings.ini.bak"
@@ -519,7 +519,7 @@ def test_update_server_restores_ini_even_when_steamcmd_dies(tmp_path, monkeypatc
 
     bus = EventBus()
     _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     assert copied and copied[0][0] == fake_bak
 
@@ -533,7 +533,7 @@ def test_update_server_aborts_without_steamcmd(tmp_path, monkeypatch):
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     assert not calls  # never touched the service
     assert any(e.kind == "error" for e in events)
@@ -911,20 +911,23 @@ def test_cancel_and_skip_report_idle_when_nothing_is_running():
 
 
 def test_only_operations_that_count_down_can_be_arrived_at_too_late():
-    """"Too late" means the admin missed a window. A backup, an update or the
-    boot-time start never had one, so answering their Cancel with "too late"
-    sends them looking for a countdown that never existed — and, because the
-    daemon starts the server at boot, made the answer depend on how recently
-    the machine came up."""
+    """"Too late" means the admin missed a window. A backup or the boot-time
+    start never had one, so answering their Cancel with "too late" sends them
+    looking for a countdown that never existed — and, because the daemon starts
+    the server at boot, made the answer depend on how recently the machine came
+    up.
+
+    Updates moved into the first group: they now run the same countdown a
+    restart does, so there genuinely is a window to arrive too late for."""
     sched = sched_mod.Scheduler(Config(), FakeApi(), EventBus())
 
     async def verdict_while(op: str) -> tuple[str, str]:
         async with sched._control.operation(op):
             return sched.cancel_countdown(), sched.skip_countdown()
 
-    for op in ("restart", "restore"):
+    for op in ("restart", "restore", "update"):
         assert _run(verdict_while(op)) == ("too_late", "too_late"), op
-    for op in ("backup", "update", "start", "stop", "auto-recover", "watchdog-restart"):
+    for op in ("backup", "start", "stop", "auto-recover", "watchdog-restart"):
         assert _run(verdict_while(op)) == ("idle", "idle"), op
 
 
@@ -1134,7 +1137,7 @@ def test_update_server_records_up_intent(tmp_path, monkeypatch):
     calls: list = []
     _patch_service(monkeypatch, calls)
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line, **kw):
         if on_line:
             on_line("done")
         return 0
@@ -1144,7 +1147,9 @@ def test_update_server_records_up_intent(tmp_path, monkeypatch):
     monkeypatch.setattr(sched_mod, "is_blank", lambda p: False)
     intent: list = []
     _run(
-        sched_mod.Scheduler(cfg, FakeApi(), EventBus(), set_intent=intent.append).update_server()
+        sched_mod.Scheduler(
+            cfg, FakeApi(), EventBus(), set_intent=intent.append
+        ).update_server(seconds=0)
     )
     assert True in intent  # parity with the daemon's HTTP /action/update-server
 
@@ -1166,7 +1171,7 @@ def _patch_steamcmd(monkeypatch, calls, *, installed, latest="200"):
     """Fake SteamCMD whose install leaves `installed` behind as the build id
     (a list, popped per read, so before/after can differ)."""
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line, **kw):
         calls.append(("update",))
         return 0
 
@@ -1200,7 +1205,7 @@ def test_update_aborts_when_a_process_still_holds_the_install(tmp_path, monkeypa
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     assert ("update",) not in calls  # SteamCMD never ran against a locked install
     assert [c[0] for c in calls] == ["stop"]  # and the server wasn't blind-started
@@ -1219,7 +1224,7 @@ def test_update_reports_the_build_it_landed_on(tmp_path, monkeypatch):
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     assert any("Build 100 → 200" in e.message for e in events)
     assert not any(e.kind == "error" for e in events)
@@ -1237,7 +1242,7 @@ def test_update_flags_a_build_that_never_changed(tmp_path, monkeypatch):
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     assert ("update",) in calls  # it ran — it just didn't take
     assert any(
@@ -1256,7 +1261,7 @@ def test_update_says_so_when_it_cannot_verify(tmp_path, monkeypatch):
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     assert any("Couldn't verify the update" in e.message for e in events)
 
@@ -1322,7 +1327,7 @@ def test_update_that_resets_the_ini_restores_it_and_keeps_palctl_able_to_see(
     calls: list = []
     _patch_service(monkeypatch, calls)
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line=None):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line=None, **kw):
         ini.write_text(defaults, encoding="utf-8")  # a VALID ini, just reset
         return 0
 
@@ -1332,7 +1337,7 @@ def test_update_that_resets_the_ini_restores_it_and_keeps_palctl_able_to_see(
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     after = PalSettings.load(ini)
     assert after.get("RESTAPIEnabled") is True, "palctl must still be able to see it"
@@ -1357,7 +1362,7 @@ def test_validate_is_available_as_an_explicit_repair(tmp_path, monkeypatch):
     calls: list = []
     _patch_service(monkeypatch, calls)
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line=None):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line=None, **kw):
         calls.append(("update", validate))
         return 0
 
@@ -1365,7 +1370,7 @@ def test_validate_is_available_as_an_explicit_repair(tmp_path, monkeypatch):
     monkeypatch.setattr(sched_mod.steamcmd, "backup_file", lambda p, **kw: None)
 
     bus = EventBus()
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(validate=True))
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(validate=True, seconds=0))
 
     assert ("update", True) in calls
 
@@ -1410,7 +1415,7 @@ def test_an_update_that_leaves_the_server_down_records_that_palctl_did_it(
     bus = EventBus()
     events = _collect(bus)
     _run(
-        sched_mod.Scheduler(cfg, FakeApi(), bus, set_intent=intent).update_server()
+        sched_mod.Scheduler(cfg, FakeApi(), bus, set_intent=intent).update_server(seconds=0)
     )
 
     assert [c[0] for c in calls] == ["stop"]  # still not blind-started
@@ -1502,7 +1507,7 @@ def test_a_completed_operation_still_leaves_the_intent_running(tmp_path, monkeyp
     intent = _IntentSpy()
     bus = EventBus()
     _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus, set_intent=intent).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus, set_intent=intent).update_server(seconds=0))
 
     assert [c[0] for c in calls] == ["stop", "update", "start"]
     assert intent.running is True
@@ -1538,7 +1543,7 @@ def test_a_retention_failure_does_not_fail_the_backup_or_abort_the_update(
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     # The backup exists, was announced, and the update went ahead.
     made = [d.name for d in Path(cfg.backup_root).iterdir()]
@@ -1570,7 +1575,7 @@ def test_a_successful_update_refreshes_the_standing_build_status(tmp_path, monke
 
     sched = sched_mod.Scheduler(cfg, FakeApi(), EventBus())
     sched.update_status = {"state": "behind", "installed": "100", "latest": "200"}
-    _run(sched.update_server())
+    _run(sched.update_server(seconds=0))
 
     assert sched.update_status["state"] == "current"
     assert sched.update_status["installed"] == "200"
@@ -1587,7 +1592,7 @@ def test_an_update_that_did_not_land_says_so_in_the_standing_status(
     monkeypatch.setattr(sched_mod.procs, "processes_under", lambda root: [])
 
     sched = sched_mod.Scheduler(cfg, FakeApi(), EventBus())
-    _run(sched.update_server())
+    _run(sched.update_server(seconds=0))
 
     assert sched.update_status["state"] == "behind"
     assert sched.update_status["installed"] == "100"
@@ -1603,7 +1608,7 @@ def test_an_unverifiable_update_never_claims_a_verdict(tmp_path, monkeypatch):
 
     sched = sched_mod.Scheduler(cfg, FakeApi(), EventBus())
     sched.update_status = {"state": "current", "installed": "100", "latest": "100"}
-    _run(sched.update_server())
+    _run(sched.update_server(seconds=0))
 
     assert sched.update_status["state"] == "unknown"
     assert "appmanifest" in sched.update_status["detail"]
@@ -1630,7 +1635,7 @@ def test_any_retention_failure_leaves_the_backup_standing(tmp_path, monkeypatch)
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     assert [c[0] for c in calls] == ["stop", "update", "start"]
     assert any(e.kind == "backup" and "📦" in e.message for e in events)
@@ -1696,7 +1701,7 @@ def test_the_pre_update_ini_snapshot_lives_outside_the_install(tmp_path, monkeyp
         encoding="utf-8",
     )
 
-    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line):
+    async def fake_update(steamcmd, install_dir, *, app_id, validate, on_line, **kw):
         # The whole Config tree goes with the update.
         shutil.rmtree(ini.parent)
         return 0
@@ -1713,7 +1718,7 @@ def test_the_pre_update_ini_snapshot_lives_outside_the_install(tmp_path, monkeyp
 
     bus = EventBus()
     events = _collect(bus)
-    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server())
+    _run(sched_mod.Scheduler(cfg, FakeApi(), bus).update_server(seconds=0))
 
     snapshots = list((tmp_path / "palctl" / "ini-backups").glob("*.bak"))
     assert len(snapshots) == 1, "the snapshot must survive outside the install"

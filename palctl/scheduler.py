@@ -21,7 +21,7 @@ from .inifile import is_blank
 
 # The emoji each countdown opens with, so the event feed reads the same as the
 # operation it precedes.
-_COUNTDOWN_ICON = {"restart": "🔁", "restore": "♻️"}
+_COUNTDOWN_ICON = {"restart": "🔁", "restore": "♻️", "update": "⏬"}
 
 # Where an admin can reach the two escape hatches. Repeated in the opening
 # event because the old countdown announced `/cancel` — a Discord command that
@@ -32,10 +32,14 @@ _ESCAPES = (
 )
 
 # The operations that run a countdown, and so have a window an admin can arrive
-# too late for. Every *other* operation — a backup, an update, a boot-time
-# start, a watchdog restart that handed its timer to the game — never had one,
-# so "too late" would be the wrong word: there was nothing to be in time for.
-_COUNTDOWN_OPS = frozenset({"restart", "restore"})
+# too late for. Every *other* operation — a backup, a boot-time start, a
+# watchdog restart that handed its timer to the game — never had one, so "too
+# late" would be the wrong word: there was nothing to be in time for.
+#
+# Updates were in that second group and should not have been: an update takes
+# the server down for longer than a restart does, and it did so with no warning
+# to anyone playing.
+_COUNTDOWN_OPS = frozenset({"restart", "restore", "update"})
 
 # How long an overdue backup waits after the daemon comes up before it runs.
 # Not zero: the server is usually still starting at that point, and a copy
@@ -359,6 +363,19 @@ class Scheduler:
             await self._bus.emit(Event("error", f"Backup failed: {e}"))
             return None
 
+    def _keep_policy(self) -> backups.KeepPolicy | None:
+        """The calendar retention rules from config, or None when all three are
+        zero — which is the explicit "flat count only" escape hatch."""
+        sch = self._cfg.schedule
+        policy = backups.KeepPolicy(
+            daily=max(0, sch.backup_keep_daily),
+            weekly=max(0, sch.backup_keep_weekly),
+            monthly=max(0, sch.backup_keep_monthly),
+        )
+        if not (policy.daily or policy.weekly or policy.monthly):
+            return None
+        return policy
+
     async def _prune(self, root: Path, retain: int) -> list[str]:
         """Apply retention to the local backup folder. Never fails the backup.
 
@@ -378,7 +395,9 @@ class Scheduler:
         backup stands on its own.
         """
         try:
-            return await asyncio.to_thread(backups.prune, root, retain)
+            return await asyncio.to_thread(
+                backups.prune, root, retain, self._keep_policy()
+            )
         except backups.BackupRetentionError as e:
             await self._bus.emit(
                 Event("error", f"Backup retention: {e} (the new backup is fine).")
@@ -1092,7 +1111,9 @@ class Scheduler:
 
     # ---------- server update (SteamCMD) ----------
 
-    async def update_server(self, *, validate: bool = False) -> None:
+    async def update_server(
+        self, *, validate: bool = False, seconds: int | None = None
+    ) -> None:
         """
         Stop the server, run SteamCMD `app_update`, and bring it back — the thing
         that finally uses the steamcmd_path / app_id the config always stored.
@@ -1127,6 +1148,23 @@ class Scheduler:
 
         async with self._control.operation("update"):
             self._set_intent(True)  # the server is meant to be up after an update
+            # Warn the people who are about to be disconnected. An update takes
+            # the server down for as long as a restart and then some, and it
+            # was the one operation that did it with no notice at all — the
+            # countdown machinery existed, and updates were simply left out of
+            # it. Same escape hatches as a restart: cancel, or skip the wait.
+            # An empty server collapses this to a few seconds, so nothing is
+            # slowed down for nobody's benefit.
+            requested = (
+                self._cfg.schedule.restart_countdown_seconds
+                if seconds is None
+                else seconds
+            )
+            if not await self._count_down("update", "a server update", requested):
+                await self._bus.emit(
+                    Event("update", "🚫 Update cancelled — the server is untouched.")
+                )
+                return
             await self._update_locked(cfg, validate=validate)
 
     async def _heal_ini_after_update(
@@ -1414,6 +1452,8 @@ class Scheduler:
                     app_id=cfg.app_id,
                     validate=validate,
                     on_line=sink,
+                    branch=cfg.steam_branch,
+                    beta_password=cfg.steam_beta_password,
                 )
             finally:
                 # Whatever the update did to the ini, put it right before the

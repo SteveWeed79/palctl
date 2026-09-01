@@ -620,10 +620,76 @@ def delete(backup_root: Path, name: str) -> None:
 # disk corrupts saves, so an unbounded pile of them is itself a data-safety
 # problem. Keeping the newest few preserves what the exemption was actually
 # for — being able to undo a restore, including the one before last.
+@dataclass(frozen=True)
+class KeepPolicy:
+    """Grandfather-father-son retention, on top of the flat "keep the newest N".
+
+    A flat count is the whole retention story today, and it has one failure that
+    matters: a burst of manual backups — the thing people do *before* touching
+    something risky — evicts every older one. Twelve backups from this afternoon
+    is not a backup history; the day you need one is usually the day you learn
+    the corruption started a week ago.
+
+    So keep the newest `daily`/`weekly`/`monthly` backups that fall in distinct
+    calendar days, ISO weeks and months, ORed with the flat count. A backup
+    survives if ANY rule wants it, which is what makes this safe to layer on: it
+    can only ever keep more than the old behaviour, never less.
+    """
+
+    daily: int = 7
+    weekly: int = 4
+    monthly: int = 6
+
+    @classmethod
+    def off(cls) -> KeepPolicy:
+        """No calendar rules — the flat count alone, exactly as before."""
+        return cls(daily=0, weekly=0, monthly=0)
+
+
+def _period_keys(when: datetime) -> tuple[str, str, str]:
+    """(day, ISO week, month) buckets a backup falls in."""
+    iso = when.isocalendar()
+    return (
+        when.strftime("%Y-%m-%d"),
+        f"{iso.year}-W{iso.week:02d}",
+        when.strftime("%Y-%m"),
+    )
+
+
+def _doomed_scheduled(
+    scheduled: list[Backup], retain: int, keep: KeepPolicy | None
+) -> list[Backup]:
+    """Which scheduled backups retention should delete, newest-first input.
+
+    Union of the rules, never an intersection: the flat `retain` newest are kept
+    unconditionally, and each calendar rule additionally keeps the newest backup
+    in each of its most recent N periods.
+    """
+    if keep is None:
+        return scheduled[retain:]
+
+    survivors = {b.name for b in scheduled[:retain]}
+    seen: tuple[dict[str, str], ...] = ({}, {}, {})
+    for b in scheduled:  # newest first, so the first hit in a period is the keeper
+        try:
+            when = datetime.strptime(b.name[:19], "%Y-%m-%d_%H-%M-%S")
+        except ValueError:
+            survivors.add(b.name)  # unparseable name: never our call to delete
+            continue
+        for slot, key in enumerate(_period_keys(when)):
+            seen[slot].setdefault(key, b.name)
+    for slot, limit in enumerate((keep.daily, keep.weekly, keep.monthly)):
+        for name in list(seen[slot].values())[:limit]:
+            survivors.add(name)
+    return [b for b in scheduled if b.name not in survivors]
+
+
 PRE_RESTORE_RETAIN = 3
 
 
-def prune(backup_root: Path, retain: int) -> list[str]:
+def prune(
+    backup_root: Path, retain: int, keep: KeepPolicy | None = None
+) -> list[str]:
     """Keep the newest `retain` backups, and the newest few -pre-restore copies.
 
     `retain` is clamped to at least 1: a hand-edited (or future-version)
@@ -658,7 +724,7 @@ def prune(backup_root: Path, retain: int) -> list[str]:
     scheduled = [b for b in ours if not b.name.endswith("-pre-restore")]
     pre_restore = [b for b in ours if b.name.endswith("-pre-restore")]
 
-    doomed = scheduled[retain:] + pre_restore[PRE_RESTORE_RETAIN:]
+    doomed = _doomed_scheduled(scheduled, retain, keep) + pre_restore[PRE_RESTORE_RETAIN:]
     deleted: list[str] = []
     stuck: list[str] = []
     for b in doomed:

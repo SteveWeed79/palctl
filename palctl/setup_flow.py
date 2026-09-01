@@ -285,6 +285,9 @@ def _preflight(plan: SetupPlan, log: Log) -> bool:
         # is where such a host comes back, so it is where they have to be told.
         service_name=plan.service_name,
         daemon_startup=plan.daemon_startup,
+        # Backups on the server's own disk are a reasonable place to start and
+        # a bad place to stop. Setup is where to say so, once.
+        backup_root=plan.backup_root,
     )
     blocking = False
     for c in checks:
