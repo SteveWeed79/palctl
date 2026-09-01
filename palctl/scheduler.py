@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import shutil
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -35,6 +36,12 @@ _ESCAPES = (
 # start, a watchdog restart that handed its timer to the game — never had one,
 # so "too late" would be the wrong word: there was nothing to be in time for.
 _COUNTDOWN_OPS = frozenset({"restart", "restore"})
+
+# How long an overdue backup waits after the daemon comes up before it runs.
+# Not zero: the server is usually still starting at that point, and a copy
+# taken across its first save is exactly the torn backup the retry logic in
+# backups.create exists to avoid.
+_BACKUP_OVERDUE_GRACE = 300.0
 
 
 def ini_backup_dir() -> Path:
@@ -149,6 +156,9 @@ class Scheduler:
         # first: they're refused at the join screen while palctl — correctly —
         # reports a healthy server.
         self.update_status: dict = {"state": "unknown", "checked_at": None}
+        # One "your backups aren't running" warning per daemon run, cleared by
+        # a backup actually landing. See _warn_if_backups_stale.
+        self._backup_stale_warned = False
 
     def reconfigure(self, cfg: Config, api: PalApi) -> None:
         self._cfg = cfg
@@ -181,19 +191,82 @@ class Scheduler:
 
     # ---------- backups ----------
 
+    def _seconds_until_backup_due(self, hours: int) -> float:
+        """How long to wait before the next scheduled backup, measured from the
+        newest backup on disk rather than from this daemon's start.
+
+        This used to be a flat `sleep(interval)` at the top of the loop, which
+        made the schedule restart-amnesiac: every daemon restart put the clock
+        back to zero, so a box that reboots nightly with the default 24-hour
+        interval never reached a backup at all — and nothing said so, because
+        no backup had *failed*. Asking the backup folder when it last got
+        something is a source of truth that survives restarts, survives palctl
+        being reinstalled, and cannot claim a backup that isn't there.
+        """
+        interval = max(1, hours) * 3600
+        try:
+            last = backups.last_backup_at(Path(self._cfg.backup_root))
+        except Exception:
+            last = None
+        if last is None:
+            # Nothing to go on — a fresh install, or a backup root that was
+            # emptied. Wait a full interval rather than backing up a world the
+            # server may not even have opened yet.
+            return float(interval)
+        due = interval - (datetime.now() - last).total_seconds()
+        # Overdue gets a short grace rather than firing the instant the daemon
+        # comes up: the server is usually still starting, and a backup taken
+        # across its first save is the torn copy this all exists to avoid.
+        # Clamped above by `interval` so a clock jump can't park the loop.
+        return float(min(max(due, _BACKUP_OVERDUE_GRACE), interval))
+
     async def _backup_loop(self) -> None:
         while True:
             # Local backups run at least once a day: the interval is capped at
             # 24h so a stale or hand-edited config can't push them below the daily
             # floor the GUI enforces.
             hours = backup_interval_hours(self._cfg.schedule.backup_hours)
-            await asyncio.sleep(max(1, hours) * 3600)
+            await asyncio.sleep(self._seconds_until_backup_due(hours))
             if not self._cfg.schedule.enabled or hours <= 0:
+                await self._warn_if_backups_stale(hours)
                 continue
             try:
                 await self.backup_now("scheduled")
+                self._backup_stale_warned = False
             except Exception as e:
                 await self._bus.emit(Event("error", f"Scheduled backup failed: {e}"))
+
+    async def _warn_if_backups_stale(self, hours: int) -> None:
+        """Alert on the backup that did *not* happen.
+
+        Everything else here reports a backup that failed. Nothing reported the
+        quieter case: scheduling switched off, or an interval of zero, while the
+        operator believes backups are running because they set them up once and
+        the tab still shows a folder. Once per daemon run, so it reads as a
+        warning rather than a nag.
+        """
+        if self._backup_stale_warned:
+            return
+        try:
+            last = backups.last_backup_at(Path(self._cfg.backup_root))
+        except Exception:
+            return
+        if last is None:
+            age = "no backup has ever been taken here"
+        else:
+            days = (datetime.now() - last).total_seconds() / 86400
+            if days < max(1.0, (max(1, hours) * 2) / 24):
+                return
+            age = f"the newest backup is {days:.1f} days old"
+        self._backup_stale_warned = True
+        await self._bus.emit(
+            Event(
+                "error",
+                f"⚠️ Automatic backups are not running — {age}. Turn schedules "
+                "back on in Config, or take one now with Backup.",
+                {"last_backup": last.isoformat() if last else None},
+            )
+        )
 
     async def backup_now(self, label: str = "manual") -> None:
         # Under the op lock: a backup mid-restore would copy a half-swapped
@@ -204,8 +277,23 @@ class Scheduler:
 
     async def _do_backup(self, label: str = "manual") -> backups.Backup | None:
         try:
-            # Flush the world to disk first, or the backup is a few minutes stale.
-            await self._control.save_best_effort(settle=3)
+            # Flush the world to disk first, or the backup is a few minutes
+            # stale. The answer matters and used to be thrown away: when the
+            # REST API is wedged — exactly when a good backup matters most —
+            # save_best_effort returns False and palctl went on to copy an
+            # unflushed world and file it as a clean backup. Now the copy still
+            # happens (an older world beats no world) but it is announced, and
+            # recorded in the backup's manifest so a restore can say so too.
+            flushed = await self._control.save_best_effort(settle=3)
+            if not flushed:
+                await self._bus.emit(
+                    Event(
+                        "error",
+                        "⚠️ Couldn't save before this backup — the server's API "
+                        "didn't answer. Backing up anyway; the world may be a "
+                        "few minutes older than this backup's timestamp.",
+                    )
+                )
 
             # Don't start a backup the disk can't hold. A copy that fills the
             # volume mid-write leaves a corrupt backup AND breaks the live world's
@@ -226,10 +314,13 @@ class Scheduler:
                 return None
 
             b = await asyncio.to_thread(
-                backups.create,
-                self._cfg.savegames_dir,
-                Path(self._cfg.backup_root),
-                label,
+                functools.partial(
+                    backups.create,
+                    self._cfg.savegames_dir,
+                    Path(self._cfg.backup_root),
+                    label,
+                    flushed=flushed,
+                )
             )
             pruned = await self._prune(
                 Path(self._cfg.backup_root), self._cfg.schedule.backup_retain
@@ -475,6 +566,32 @@ class Scheduler:
                         "stopped on purpose. Start it, then use Update when ready.",
                     )
                 )
+                await asyncio.sleep(60)
+                continue
+
+            # Ask whether there is anything to install before taking the server
+            # down for it. This loop used to go straight to update_server(), so
+            # a nightly auto-update stopped, ran SteamCMD and restarted the
+            # server every night — in front of whoever was playing — on the
+            # majority of nights when Steam had shipped nothing at all.
+            #
+            # Fail *closed*: an inconclusive check (no steamcmd, Steam
+            # unreachable, an unparseable answer) is not evidence of a new
+            # build, and guessing "yes" is how a working server gets taken down
+            # for a download that then does nothing.
+            try:
+                available = await self.check_update_available()
+            except Exception as e:
+                await self._bus.emit(
+                    Event(
+                        "update",
+                        "⏸️ Skipped the scheduled server update — couldn't check "
+                        f"whether one exists ({e}). Will try again tomorrow.",
+                    )
+                )
+                await asyncio.sleep(60)
+                continue
+            if not available:
                 await asyncio.sleep(60)
                 continue
 

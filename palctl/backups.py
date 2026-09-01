@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import shutil
+import sqlite3
+import tempfile
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -16,6 +19,21 @@ from pathlib import Path
 # Lives inside the backup dir so retention and the off-site mirror cover it
 # with no extra machinery; restore() explicitly excludes it from SaveGames.
 CONFIG_SNAPSHOT_NAME = "palctl-config.zip"
+
+# What create() recorded about this backup at the moment it was taken: the file
+# list with sizes, whether the pre-backup save actually flushed, and whether the
+# copy was consistent. Without it "is this backup any good?" can only be
+# answered by restoring it and finding out, which is the one experiment nobody
+# runs. verify() reads it back. Lives inside the backup dir for the same reason
+# the config snapshot does — retention and the off-site mirror cover it free —
+# and restore() excludes it from SaveGames alongside the snapshot.
+MANIFEST_NAME = "palctl-manifest.json"
+
+# Files create() and restore() put *into* a backup directory that are palctl's
+# own bookkeeping, not part of the world. One list, so a new one can never be
+# added to create() and forgotten in restore() — which would drop a palctl file
+# into the live SaveGames folder.
+PASSENGER_FILES = (CONFIG_SNAPSHOT_NAME, MANIFEST_NAME)
 
 # Whitelist, not "everything in the config dir": logs rotate (big), bin/ holds
 # binaries, and daemon_token is a local secret that must not ride a backup to
@@ -112,12 +130,222 @@ def _copy_matches(before: dict[str, tuple[int, int]], copied: Path) -> bool:
     return True
 
 
+# A Palworld .sav is a 12-byte header followed by the compressed payload:
+# uint32 uncompressed length, uint32 compressed length, the 3-byte magic b"PlZ",
+# and a format byte. The magic is what lets a truncated save be spotted without
+# decompressing anything — the expensive, dependency-laden part this
+# deliberately does not do. See docs/palworld-server-practices.md.
+_SAV_MAGIC = b"PlZ"
+_SAV_HEADER_LEN = 12
+
+
+def _sav_problem(path: Path) -> str | None:
+    """A one-line description of what's wrong with a `.sav`, or None.
+
+    Deliberately conservative: it reports a file that is *definitely* broken —
+    empty, too short to hold a header, or shorter than its own header says it
+    is — and stays quiet about anything it merely doesn't recognise. A backup
+    check that cries wolf about a format Pocketpair changed in a patch is worse
+    than no check, because the next real warning gets ignored too.
+    """
+    try:
+        size = path.stat().st_size
+        if size == 0:
+            return "file is empty"
+        if size < _SAV_HEADER_LEN:
+            return f"file is {size} bytes — too short to be a save"
+        with path.open("rb") as fh:
+            head = fh.read(_SAV_HEADER_LEN)
+    except OSError as e:
+        return f"unreadable: {e}"
+
+    if head[8:11] != _SAV_MAGIC:
+        return None  # not a format we know — say nothing rather than guess
+
+    declared = int.from_bytes(head[4:8], "little")
+    actual = size - _SAV_HEADER_LEN
+    if actual < declared:
+        return f"truncated: header declares {declared} bytes, {actual} present"
+    return None
+
+
+def _manifest_for(dest: Path, *, consistent: bool, flushed: bool | None) -> dict:
+    """What was true about this backup when it was written."""
+    files: dict[str, int] = {}
+    problems: list[str] = []
+    for f in sorted(dest.rglob("*")):
+        if not f.is_file() or f.name in PASSENGER_FILES:
+            continue
+        rel = f.relative_to(dest).as_posix()
+        try:
+            files[rel] = f.stat().st_size
+        except OSError as e:  # pragma: no cover - stat failing mid-walk is rare
+            problems.append(f"{rel}: unreadable: {e}")
+            continue
+        if f.suffix.lower() == ".sav":
+            problem = _sav_problem(f)
+            if problem:
+                problems.append(f"{rel}: {problem}")
+    return {
+        "version": 1,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "consistent": consistent,
+        # None means "nobody told us" — an old backup, or create() called
+        # directly. Distinct from False, which means the save was tried and
+        # did not answer, so this world may be minutes stale.
+        "flushed": flushed,
+        "file_count": len(files),
+        "total_bytes": sum(files.values()),
+        "files": files,
+        "problems_at_creation": problems,
+    }
+
+
+def _write_manifest(dest: Path, *, consistent: bool, flushed: bool | None) -> None:
+    """Best-effort, like the config snapshot: the world copy is the point of a
+    backup and must never fail over its bookkeeping."""
+    try:
+        (dest / MANIFEST_NAME).write_text(
+            json.dumps(_manifest_for(dest, consistent=consistent, flushed=flushed)),
+            encoding="utf-8",
+        )
+    except Exception:
+        with contextlib.suppress(OSError):
+            (dest / MANIFEST_NAME).unlink(missing_ok=True)
+
+
+def read_manifest(backup_root: Path, name: str) -> dict | None:
+    """The manifest create() wrote, or None for a backup taken before manifests
+    existed (or one whose manifest didn't survive)."""
+    try:
+        path = _safe_backup_path(backup_root, name) / MANIFEST_NAME
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+@dataclass(frozen=True)
+class VerifyReport:
+    """The answer to "would this backup actually restore?", short of restoring it."""
+
+    name: str
+    ok: bool
+    checked: int = 0
+    problems: list[str] = field(default_factory=list)
+    # True when there's no manifest to check against, so `ok` rests only on the
+    # file-level checks. Callers should say "looks intact" rather than "verified".
+    unmanifested: bool = False
+
+
+def verify(backup_root: Path, name: str) -> VerifyReport:
+    """Check a backup against what create() recorded about it.
+
+    Three levels, cheapest first, because this runs against multi-GB worlds on
+    slow disks and network shares:
+
+      1. The directory resolves, exists, and holds at least one save.
+      2. Every file the manifest lists is present at the size it listed. This
+         catches the failure that matters — a mirror that dropped files, a
+         share that half-copied, a disk that lost sectors — without reading a
+         byte of content.
+      3. Each `.sav` header is sane (see _sav_problem).
+
+    What it deliberately does NOT do is decompress or parse saves. That needs a
+    Palworld-aware parser and gigabytes of RAM; it belongs in a restore drill,
+    not in a check that should be cheap enough to run after every backup.
+    """
+    try:
+        path = _safe_backup_path(backup_root, name)
+    except ValueError as e:
+        return VerifyReport(name, False, problems=[str(e)])
+    if not path.is_dir():
+        return VerifyReport(name, False, problems=["backup directory is missing"])
+
+    problems: list[str] = []
+    present: dict[str, int] = {}
+    for f in path.rglob("*"):
+        if f.is_file() and f.name not in PASSENGER_FILES:
+            with contextlib.suppress(OSError):
+                present[f.relative_to(path).as_posix()] = f.stat().st_size
+
+    if not present:
+        return VerifyReport(name, False, problems=["backup contains no files"])
+
+    manifest = read_manifest(backup_root, name)
+    if manifest:
+        for rel, size in (manifest.get("files") or {}).items():
+            if rel not in present:
+                problems.append(f"{rel}: missing")
+            elif present[rel] != size:
+                problems.append(
+                    f"{rel}: {present[rel]} bytes, manifest says {size}"
+                )
+        if manifest.get("flushed") is False:
+            problems.append(
+                "the pre-backup save did not complete — this world may be "
+                "minutes older than the backup's timestamp"
+            )
+        if manifest.get("consistent") is False:
+            problems.append(
+                "the copy was taken while the server was writing (torn) — "
+                "usable, but prefer a neighbouring backup if one exists"
+            )
+
+    for rel in sorted(present):
+        if rel.lower().endswith(".sav"):
+            problem = _sav_problem(path / rel)
+            if problem:
+                problems.append(f"{rel}: {problem}")
+
+    if not any(rel.lower().endswith(".sav") for rel in present):
+        problems.append("no .sav files — this does not look like a world")
+
+    return VerifyReport(
+        name,
+        ok=not problems,
+        checked=len(present),
+        problems=problems,
+        unmanifested=manifest is None,
+    )
+
+
+def last_backup_at(backup_root: Path) -> datetime | None:
+    """When the newest backup was taken, from the backup names themselves.
+
+    Derived rather than remembered on purpose. A "last backup" timestamp kept
+    in palctl's own state is a second source of truth that goes wrong in both
+    directions: it survives the backups being deleted (claiming a backup that
+    is gone) and it is lost when the state file is (claiming none when a dozen
+    sit on disk). The stamp in the directory name cannot drift from the thing
+    it describes, and it works for backups this daemon never took.
+    """
+    for b in listing(backup_root, with_size=False):  # newest first
+        with contextlib.suppress(ValueError):
+            return datetime.strptime(b.name[:19], "%Y-%m-%d_%H-%M-%S")
+    return None
+
+
+def same_volume(a: Path, b: Path) -> bool | None:
+    """Whether two paths live on the same disk, or None if it can't be told.
+
+    Backups on the server's own volume protect against a bad update, a botched
+    restore and a corrupt save — but not against the disk, which is the failure
+    the word "backup" makes people think they are covered for.
+    """
+    try:
+        return a.resolve().stat().st_dev == b.resolve().stat().st_dev
+    except OSError:
+        return None
+
+
 def create(
     savegames: Path,
     backup_root: Path,
     label: str = "manual",
     *,
     consistency_retries: int = 2,
+    flushed: bool | None = None,
 ) -> Backup:
     if not savegames.exists():
         raise FileNotFoundError(
@@ -152,15 +380,23 @@ def create(
 
     os.replace(tmp, dest)
     _write_config_snapshot(dest)
+    _write_manifest(dest, consistent=consistent, flushed=flushed)
     return Backup(dest.name, dest, _dir_size_mb(dest), datetime.now(), consistent)
 
 
 def _write_config_snapshot(dest: Path) -> None:
     """Zip palctl's own config/history into the finished backup. Best-effort by
     design — the world copy is the point of a backup and must never fail over
-    its passenger. sessions.db is copied hot (the daemon may be writing); a
-    torn copy of a stats database is an acceptable DR artifact, the config.json
-    beside it is the part that saves the day after a dead disk."""
+    its passenger.
+
+    sessions.db gets the SQLite backup API rather than a file copy. A live
+    SQLite database copied byte-for-byte while the daemon is writing is not
+    merely stale, it can be *invalid*: the copy can straddle a transaction and
+    land with a torn page or a write-ahead log it no longer matches, and
+    nothing says so until the day someone opens it. `.backup()` takes a
+    consistent snapshot through the same locking the database already uses, so
+    what lands in the zip always opens.
+    """
     from .config import config_dir
 
     try:
@@ -170,12 +406,38 @@ def _write_config_snapshot(dest: Path) -> None:
         ) as z:
             for name in _SNAPSHOT_FILES:
                 f = src_dir / name
-                if f.is_file():
+                if not f.is_file():
+                    continue
+                if f.suffix == ".db":
+                    _zip_sqlite(z, f, name)
+                else:
                     z.write(f, name)
     except Exception:
         # Don't leave a half-written zip looking like a snapshot.
         with contextlib.suppress(OSError):
             (dest / CONFIG_SNAPSHOT_NAME).unlink(missing_ok=True)
+
+
+def _zip_sqlite(z: zipfile.ZipFile, src: Path, arcname: str) -> None:
+    """Snapshot a live SQLite file into the zip via the backup API.
+
+    Falls back to a plain copy if the database can't be opened that way (it
+    isn't SQLite after all, or it's locked by something that won't yield): a
+    hot copy is what this did before, so the fallback is never worse than the
+    old behaviour — it just isn't the default any more.
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="palctl-snap-")
+    tmp = Path(tmp_dir) / src.name
+    try:
+        try:
+            with sqlite3.connect(f"file:{src}?mode=ro", uri=True) as source, \
+                    sqlite3.connect(tmp) as target:
+                source.backup(target)
+        except sqlite3.Error:
+            shutil.copy2(src, tmp)
+        z.write(tmp, arcname)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def listing(backup_root: Path, *, with_size: bool = True) -> list[Backup]:
@@ -274,7 +536,7 @@ def restore(backup_root: Path, name: str, savegames: Path) -> str | None:
         # mirroring — but it is palctl's file, not the world's. Restoring it
         # into SaveGames would hand the game server a stray zip.
         shutil.copytree(
-            src, staged, ignore=shutil.ignore_patterns(CONFIG_SNAPSHOT_NAME)
+            src, staged, ignore=shutil.ignore_patterns(*PASSENGER_FILES)
         )
     except BaseException:
         shutil.rmtree(staged, ignore_errors=True)

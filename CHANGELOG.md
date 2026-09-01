@@ -11,6 +11,20 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Added
+- **Backups now record what they are, and can be checked without restoring
+  them.** Every backup gets a `palctl-manifest.json`: the file list with sizes,
+  whether the pre-backup save actually flushed, and whether the copy was
+  consistent. `backups.verify()` reads it back — every file present at the size
+  it was written at, plus a header check on each `.sav` that catches a
+  truncated save without decompressing anything. Until now the only way to find
+  out whether a backup was any good was to restore it and see, which is the one
+  experiment nobody runs.
+- **Off-site backups can be brought back down.** `rclone.pull()` fetches one
+  backup from the remote into the local backup root, staged through a
+  `.partial` and renamed, so an interrupted download never looks like a
+  finished backup. Off-site copies exist for the case where the box is gone —
+  palctl could upload, list and prune them, but not retrieve one, so the answer
+  to a dead disk was still a manual rclone invocation worked out under pressure.
 - **Setup now checks that something will actually start your server after a
   reboot.** palctl sets the game service to Manual only when its own daemon runs
   as a boot service and takes that job on; in every other arrangement Manual
@@ -24,6 +38,42 @@ Installers for every release are on the
   somebody deliberately turning the server off.
 
 ### Fixed
+- **A backup was taken even when the save before it failed, and filed as
+  clean.** The pre-backup flush returns whether the server's REST API answered,
+  and that answer was discarded — so when the API was wedged, which is exactly
+  when a good backup matters most, palctl copied an unflushed world and
+  reported success. The copy still happens (an older world beats no world) but
+  it is now announced, and recorded in the backup's manifest so a restore can
+  say the world may be older than the backup's timestamp.
+- **Scheduled backups forgot where they were across a daemon restart.** The
+  loop slept a full interval before its first backup, measured from daemon
+  start, so a box that restarts more often than the interval never reached a
+  backup at all — and nothing warned, because no backup had *failed*. The wait
+  is now measured from the newest backup on disk, which cannot drift from the
+  thing it describes. An overdue backup runs after a short grace rather than
+  the instant the daemon comes up, since the server is usually still starting.
+- **Nothing ever said "your backups aren't running".** Everything reported a
+  backup that failed; the quieter case — scheduling switched off, or an
+  interval of zero, while the operator believes backups are running because
+  they set them up once — was silent. palctl now says so once per daemon run
+  when the newest backup is older than it should be.
+- **`sessions.db` was copied hot into every backup.** A live SQLite file copied
+  byte-for-byte can land mid-transaction and restore as invalid, not merely
+  stale, and nothing says so until someone opens it. The config snapshot now
+  takes it through SQLite's own backup API, so what lands in the zip always
+  opens.
+- **A crashed worker loop was never restarted.** One escaped exception retired
+  that loop for the life of the daemon — the memory watchdog, or the scheduler,
+  simply gone — while the daemon stayed up, the control API kept answering and
+  `/healthz` kept reporting "ok". Loops are now restarted with a 5s → 30s → 2m
+  → 10m backoff and a bounded budget, and once that budget is spent the daemon
+  reports itself `degraded` in `/healthz` and `/state` instead of claiming
+  health it doesn't have.
+- **The nightly auto-update took the server down whether or not there was an
+  update.** The loop went straight to running SteamCMD, so on the majority of
+  nights when Steam had shipped nothing it still stopped, updated and restarted
+  the server, in front of whoever was playing. It now checks first, and fails
+  *closed*: an inconclusive check is not evidence of a new build.
 - **The hung-daemon health task could never run in a source install.**
   `schtasks /Create` has no working-directory option — that lives in the task
   XML — so a scheduled task runs from the scheduler's own directory. For a

@@ -145,16 +145,25 @@ missing its watchdog should not report healthy.
 
 **Effort:** S–M. `daemon.py`.
 
-### 1.7 SteamCMD's own archive is downloaded without an integrity check ✅
+### 1.7 SteamCMD's own archive is downloaded without an integrity check — *withdrawn*
 
-`download_steamcmd` (`steamcmd.py:289`) fetches over TLS and extracts. Meanwhile the
-WinSW wrapper in the same codebase is SHA-256 pinned on the cached copy, the bundled
-copy *and* the download. The inconsistency is the finding.
+The observation is true (`steamcmd.py:289` fetches over TLS and extracts, while the
+WinSW wrapper in the same codebase is SHA-256 pinned on all three acquisition paths),
+but the recommended fix was wrong and is withdrawn rather than implemented.
 
-**Do:** pin the archive hash the same way, with the same "cached / bundled /
-downloaded all checked" structure.
+WinSW is pinnable because palctl pins a *version*: a specific release asset that never
+changes. Valve publishes SteamCMD at a single rolling URL whose contents change
+whenever they update it, with no versioned archives and no published checksums. A
+pinned hash there would not harden the download; it would break every install the
+first time Valve rebuilt the archive, and the pressure would then be to bump the
+constant without checking anything — security theatre with an outage attached.
+LinuxGSM, which is careful about this class of thing, does not pin it either.
 
-**Effort:** S. `steamcmd.py`.
+What is worth doing instead is narrower and is **not** yet done: after extraction,
+confirm the binary is what it claims to be before executing it (a real PE/ELF of
+plausible size, not an HTML error page a captive portal returned with a 200), and
+record its hash on first install so a *change* between runs can be reported. That is a
+tamper-evidence measure, not a pin. Filed as future work.
 
 ---
 
@@ -344,6 +353,26 @@ Recording these so they don't come back around:
   editor that preserves unknown keys and comments byte-for-byte is the better answer.
 
 ---
+
+## Status
+
+Done, with tests that fail against the pre-fix source:
+
+| Item | What shipped |
+|---|---|
+| 1.1 | A failed pre-backup save is announced and recorded in the manifest |
+| 1.2 | `sessions.db` snapshotted through SQLite's backup API |
+| 1.3 | Per-backup manifest, `verify()`, and a `.sav` truncation check |
+| 1.4 | Backup schedule measured from the newest backup; stale-backup warning |
+| 1.5 | `rclone.pull()` — off-site backups can be retrieved |
+| 1.6 | Crashed worker loops restart with backoff; `degraded` in `/healthz` |
+| 2.3 | Auto-update checks for an update first, and fails closed |
+| 1.7 | Withdrawn — see above |
+
+Not yet done: 2.1 (build pinning), 2.2 (update countdown), 2.4 (actor
+attribution), 2.5 (alert fan-out), 2.6 (same-volume warning — the `same_volume()`
+helper exists and is tested, but nothing calls it yet), 2.7 (GFS retention), and
+all of Tier 3.
 
 ## Suggested order
 

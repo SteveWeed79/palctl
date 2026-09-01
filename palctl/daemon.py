@@ -78,6 +78,14 @@ def sd_notify(state: str) -> None:
 # permanent one. See _load_ever_alive.
 _STATE_PATH = config_dir() / "daemon_state.json"
 
+# A worker loop that raises out of its own guards is restarted rather than
+# retired: a daemon still answering /healthz with its memory watchdog quietly
+# gone is the worst of both worlds. The budget is what stops a genuinely
+# unstartable loop (bad config, missing dependency) from spinning forever —
+# after it, the daemon is degraded and says so. See DaemonApp._supervised.
+_WORKER_RESTART_BUDGET = 3
+_WORKER_RESTART_BACKOFF = (5.0, 30.0, 120.0, 600.0)
+
 
 def _read_state() -> dict:
     try:
@@ -358,6 +366,10 @@ class Daemon:
         # One-shot: warn if the running server was started from a different
         # install than the one updates rewrite (see _maybe_warn_wrong_server_root).
         self._root_warned = False
+        # Worker loops that crashed past their restart budget: name -> last
+        # error. Non-empty means palctl is running with something missing, and
+        # /healthz must stop claiming everything is fine.
+        self.degraded: dict[str, str] = {}
         # Wall-clock of the last completed poll, for the /healthz liveness probe.
         self._last_poll_at = 0.0
         # Set by a SIGTERM/SIGINT handler to unblock run() into graceful shutdown.
@@ -524,7 +536,7 @@ class Daemon:
         self._bot_task = self._spawn(
             self._supervised(
                 "discord bot",
-                run_bot(
+                lambda: run_bot(
                     self.cfg, self.api, self.bus, self.store, self.scheduler,
                     on_created=self._set_bot,
                 ),
@@ -1220,11 +1232,19 @@ class Daemon:
                 now=time.time(),
                 poll_seconds=self.cfg.poll_seconds,
             )
+            # A worker that crashed past its restart budget is not a healthy
+            # daemon, even with the poll loop turning: "ok" here is what the
+            # health task and any external monitor trust, and it must not be
+            # true while the watchdog or the scheduler is gone. Reported as
+            # `degraded`, distinct from `stale` — the remedy differs. Still
+            # 200: restarting the daemon is the operator's call once the cause
+            # is fixed, and the health task's blind restart would only loop.
             return web.json_response(
                 {
                     "status": "ok" if ok else "stale",
                     "alive": self._alive,
                     "last_poll_age_seconds": round(age, 1) if age is not None else None,
+                    "degraded": dict(self.degraded),
                 },
                 status=200 if ok else 503,
             )
@@ -1495,7 +1515,13 @@ class Daemon:
         # nothing below depends on them, so they run off the loop and, more
         # importantly, must not delay the workers or READY=1 behind a slow
         # external tool. Spawned rather than awaited for the same reason.
-        self._spawn(self._supervised("startup checks", self._startup_side_effects(host)))
+        self._spawn(
+            self._supervised(
+                "startup checks",
+                lambda: self._startup_side_effects(host),
+                restarts=0,  # one-shot diagnostics; retrying just re-runs netsh
+            )
+        )
 
         self._install_signal_handlers()
 
@@ -1506,19 +1532,27 @@ class Daemon:
         # whether a STOPPED service is about to be started (the flag it clears
         # gates external-stop adoption) — but spawned, because waiting for the
         # SCM must not delay READY=1.
-        self._spawn(self._supervised("boot intent", self._restore_boot_intent()))
+        self._spawn(
+            self._supervised(
+                "boot intent",
+                self._restore_boot_intent,
+                restarts=0,  # one-shot; a second pass would fight the operator
+            )
+        )
 
         self._start_bot()
-        for name, coro in (
-            ("poll loop", self._poll_loop()),
-            ("watchdog", self.watchdog.run()),
-            ("scheduler", self.scheduler.run()),
-            ("leak forecaster", self._predict_loop()),
-            ("update check", self._update_check_loop()),
-            ("disk watch", self._disk_loop()),
-            ("liveness", self._liveness_loop()),
+        # Factories, not coroutines: _supervised restarts a crashed loop, and a
+        # coroutine object cannot be awaited a second time.
+        for name, factory in (
+            ("poll loop", self._poll_loop),
+            ("watchdog", self.watchdog.run),
+            ("scheduler", self.scheduler.run),
+            ("leak forecaster", self._predict_loop),
+            ("update check", self._update_check_loop),
+            ("disk watch", self._disk_loop),
+            ("liveness", self._liveness_loop),
         ):
-            self._spawn(self._supervised(name, coro))
+            self._spawn(self._supervised(name, factory))
 
         sd_notify("READY=1")
         await self._stop.wait()  # runs until SIGTERM/SIGINT
@@ -1579,23 +1613,69 @@ class Daemon:
             await asyncio.to_thread(self.store.close)
         self.log.info("shutdown complete")
 
-    async def _supervised(self, name: str, coro) -> None:
-        """One escaped exception in any loop must not kill the whole daemon.
+    async def _supervised(
+        self, name: str, factory, *, restarts: int = _WORKER_RESTART_BUDGET
+    ) -> None:
+        """One escaped exception in any loop must not kill the whole daemon —
+        and must not silently retire that loop either.
 
         Every loop guards its tick body, but errors can still raise outside
         those guards — a wrong-typed hand-edited config value at loop setup,
         or a startup-time failure. gather() propagates the first one and
         cancels everything: watchdog, scheduler, control API, bot, all gone.
-        Log it, tell the event feed, and keep the rest of the daemon alive."""
-        try:
-            await coro
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self.log.error("%s crashed; the rest of palctl keeps running", name, exc_info=True)
-            with contextlib.suppress(Exception):
-                await self.bus.emit(
-                    Event("error", f"{name} crashed and is disabled until restart: {e}")
+
+        This used to catch that, log it, and stop. The daemon stayed up, the
+        control API kept answering and /healthz kept saying "ok" — with the
+        memory watchdog, or the scheduler, simply gone. A supervisor that
+        outlives the thing it supervises and still reports healthy is the
+        exact silent failure this codebase exists to avoid.
+
+        So: restart the loop, backing off 5s → 30s → 2m → 10m, and give up
+        only after _WORKER_RESTART_BUDGET failures — a genuinely unstartable
+        loop (bad config, missing dependency) must not spin forever. Once the
+        budget is spent the daemon is *degraded*, and says so where it counts:
+        the event feed, the log, and `degraded` in /state and /healthz.
+
+        `factory` is a zero-argument callable returning the coroutine, not a
+        coroutine — a coroutine object cannot be awaited twice, so restarting
+        means building a fresh one.
+        """
+        for attempt in range(restarts + 1):
+            try:
+                await factory()
+                return  # a loop that returns on its own is done, not crashed
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last = attempt >= restarts
+                self.log.error(
+                    "%s crashed (attempt %d/%d)%s",
+                    name,
+                    attempt + 1,
+                    restarts + 1,
+                    "" if last else "; restarting it",
+                    exc_info=True,
+                )
+                if last:
+                    self.degraded[name] = str(e)
+                    with contextlib.suppress(Exception):
+                        await self.bus.emit(
+                            Event(
+                                "error",
+                                f"🛑 {name} crashed {restarts + 1} time(s) "
+                                f"and has stopped for good: {e}. palctl is "
+                                "running degraded — restart the daemon once the "
+                                "cause is fixed.",
+                                {"worker": name},
+                            )
+                        )
+                    return
+                with contextlib.suppress(Exception):
+                    await self.bus.emit(
+                        Event("error", f"{name} crashed and is restarting: {e}")
+                    )
+                await asyncio.sleep(
+                    _WORKER_RESTART_BACKOFF[min(attempt, len(_WORKER_RESTART_BACKOFF) - 1)]
                 )
 
     async def _liveness_loop(self) -> None:
