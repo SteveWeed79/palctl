@@ -80,7 +80,10 @@ def frozen_entry(argv: list[str]) -> int | None:
     Lives here rather than in packaging/ so the marker and its handler cannot
     drift apart."""
     if len(argv) >= 2 and argv[0] == SAVESCAN_FLAG:
-        return main([argv[1]])
+        # Forward EVERYTHING after the marker, not just the first argument: a
+        # prune carries a mode flag, a path and a target list, and dropping the
+        # tail would silently turn it into a malformed read.
+        return main(argv[1:])
     return None
 
 
@@ -217,6 +220,148 @@ def _get(node: object, *path: str):
     return node
 
 
+PRUNE_FLAG = "--prune"
+
+# What the original is renamed to before the rewritten save takes its place.
+# Kept rather than deleted: the verified backup is the real undo, but a copy
+# right beside the world costs nothing and is the first thing anyone reaches
+# for when a world does not load.
+ORIGINAL_SUFFIX = ".pre-prune"
+
+
+def rewrite_without(level_sav: Path, targets: set[str]) -> dict:
+    """Remove every character record owned by `targets`. Runs in the CHILD.
+
+    The order here is the whole safety argument:
+
+      1. Parse with the FULL custom-property set. The scan reads a subset to
+         save memory, which is fine when only counting — but anything left as
+         raw bytes must be written back byte-for-byte, and re-encoding a map
+         palctl decoded with one property set using another is how a save gets
+         silently mangled.
+      2. Filter, in memory.
+      3. Write to a NEW file. The original is not touched yet.
+      4. Re-read the new file and check it: the targets are gone, and every
+         other player's count is exactly what it was. This is the step that
+         catches a parser that lost data on the round trip — the failure that
+         would otherwise be discovered by a player, weeks later.
+      5. Only then move the original aside and the new file into place.
+    """
+    sys.path.insert(0, str(Path(__file__).parent / "vendor"))
+    from palworld_save_tools.gvas import GvasFile
+    from palworld_save_tools.palsav import compress_gvas_to_sav, decompress_sav_to_gvas
+    from palworld_save_tools.paltypes import (
+        PALWORLD_CUSTOM_PROPERTIES,
+        PALWORLD_TYPE_HINTS,
+    )
+
+    raw, save_type = decompress_sav_to_gvas(level_sav.read_bytes())
+    gvas = GvasFile.read(raw, PALWORLD_TYPE_HINTS, PALWORLD_CUSTOM_PROPERTIES,
+                         allow_nan=True)
+    world = gvas.properties.get("worldSaveData", {}).get("value", {})
+    before = count_records(world)
+
+    entries = world.get("CharacterSaveParameterMap", {}).get("value", []) or []
+    kept = [e for e in entries if _owner_of(e) not in targets]
+    removed = len(entries) - len(kept)
+    if not removed:
+        return {"ok": False, "error": "No matching records found — nothing was changed."}
+    world["CharacterSaveParameterMap"]["value"] = kept
+
+    new_file = level_sav.with_suffix(level_sav.suffix + ".new")
+    new_file.write_bytes(
+        compress_gvas_to_sav(gvas.write(PALWORLD_CUSTOM_PROPERTIES), save_type)
+    )
+
+    # Step 4 — the check that makes this a rewrite rather than a gamble.
+    try:
+        check_raw, _ = decompress_sav_to_gvas(new_file.read_bytes())
+        check = GvasFile.read(check_raw, PALWORLD_TYPE_HINTS,
+                              PALWORLD_CUSTOM_PROPERTIES, allow_nan=True)
+        after = count_records(
+            check.properties.get("worldSaveData", {}).get("value", {})
+        )
+    except Exception as e:  # noqa: BLE001 — an unreadable result is the point of checking
+        new_file.unlink(missing_ok=True)
+        return {"ok": False, "error": f"The rewritten save did not read back: {e}"}
+
+    survivors = set(after.by_player) & targets
+    if survivors:
+        new_file.unlink(missing_ok=True)
+        return {
+            "ok": False,
+            "error": f"{len(survivors)} target(s) still present after the rewrite.",
+        }
+    for guid, count in before.by_player.items():
+        if guid in targets:
+            continue
+        if after.by_player.get(guid, 0) != count:
+            new_file.unlink(missing_ok=True)
+            return {
+                "ok": False,
+                "error": (
+                    f"The rewrite changed an untouched player's records "
+                    f"({guid}: {count} -> {after.by_player.get(guid, 0)}). "
+                    "Nothing was replaced."
+                ),
+            }
+
+    original = level_sav.with_suffix(level_sav.suffix + ORIGINAL_SUFFIX)
+    original.unlink(missing_ok=True)
+    level_sav.rename(original)
+    new_file.rename(level_sav)
+    return {
+        "ok": True,
+        "removed": removed,
+        "original": original.name,
+        "characters_before": before.characters,
+        "characters_after": after.characters,
+    }
+
+
+def _owner_of(entry: object) -> str:
+    """The normalised GUID a character record belongs to. Mirrors the
+    attribution in count_records — deliberately the same rules, because a
+    record counted against a player must be the same record removed for them."""
+    if not isinstance(entry, dict):
+        return ""
+    params = _get(
+        entry, "value", "RawData", "value", "object", "SaveParameter", "value"
+    ) or {}
+    owner = _get(params, "OwnerPlayerUId", "value")
+    if owner is None:
+        owner = _get(entry, "key", "PlayerUId", "value")
+    guid = _normalise_guid(owner)
+    return "" if guid == _NOBODY else guid
+
+
+def prune_records(level_sav: Path, targets: list[str],
+                  *, timeout: float = SCAN_TIMEOUT_SECONDS) -> dict:
+    """Rewrite Level.sav without `targets`, in a child process. Never raises."""
+    if not targets:
+        return {"ok": False, "error": "No players named."}
+    argv = child_command(level_sav)
+    argv.insert(-1, PRUNE_FLAG)
+    argv.append(",".join(targets))
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "The rewrite took too long and was stopped."}
+    except OSError as e:
+        return {"ok": False, "error": f"Couldn't start the save writer: {e}"}
+
+    if proc.stdout.strip():
+        try:
+            return json.loads(proc.stdout)
+        except ValueError:
+            pass
+    detail = (proc.stderr or "").strip().splitlines()
+    return {
+        "ok": False,
+        "error": detail[-1] if detail else f"the writer exited {proc.returncode}",
+    }
+
+
 def scan(level_sav: Path, *, timeout: float = SCAN_TIMEOUT_SECONDS) -> ScanResult:
     """Weigh a Level.sav in a child process. Never raises.
 
@@ -297,6 +442,14 @@ def main(argv: list[str] | None = None) -> int:
     the parent has something to show an operator either way.
     """
     args = sys.argv[1:] if argv is None else argv
+    if len(args) == 3 and args[0] == PRUNE_FLAG:
+        targets = {t.strip().upper() for t in args[2].split(",") if t.strip()}
+        try:
+            result = rewrite_without(Path(args[1]), targets)
+        except Exception as e:  # noqa: BLE001
+            result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        print(json.dumps(result))
+        return 0 if result.get("ok") else 1
     if len(args) != 1:
         print(json.dumps({"ok": False, "error": "usage: palctl.savescan <Level.sav>"}))
         return 2

@@ -184,6 +184,61 @@ def _deep_report(world, seen: dict, days: int) -> str:
     return "\n".join(lines)
 
 
+def _save_prune(days: int, *, apply: bool) -> int:
+    """Plan — and with --apply, carry out — a Level.sav prune.
+
+    Whether the server is stopped is established by looking for its process,
+    not by asking the daemon or trusting a flag. This is the one command that
+    rewrites a world, and "the service says STOPPED" is a weaker claim than
+    "there is no PalServer process running".
+    """
+    from pathlib import Path
+
+    from . import procs, saveprune
+    from .config import Config
+    from .events import SessionStore
+
+    cfg = Config.load()
+    worlds = saveaudit.world_dirs(cfg.savegames_dir)
+    if not worlds:
+        print(f"No world found under {cfg.savegames_dir}.")
+        return 1
+    if len(worlds) > 1:
+        print(
+            f"{len(worlds)} worlds found under {cfg.savegames_dir}. palctl will "
+            "not guess which one to rewrite — move the others aside first."
+        )
+        return 1
+
+    running = procs.find_process(cfg.server_root) is not None
+    store = SessionStore()
+    try:
+        seen = store.last_seen_by_player_id()
+    finally:
+        store.close()
+
+    if apply:
+        print("Reading Level.sav and taking a verified backup — this takes a while…",
+              flush=True)
+    outcome = saveprune.run_prune(
+        worlds[0],
+        cfg.savegames_dir,
+        Path(cfg.backup_root),
+        seen,
+        server_stopped=not running,
+        apply=apply,
+        days=days,
+    )
+    print(saveprune.format_plan(outcome.plan, applied=outcome.applied))
+    if outcome.error:
+        print(f"\n{outcome.error}")
+    if outcome.message:
+        print(f"\n{outcome.message}")
+    if not apply and outcome.plan.safe:
+        print("\nRe-run with --apply to do it, with the server stopped.")
+    return 0 if outcome.ok else 1
+
+
 def find_players(players: list[dict], name: str) -> list[dict]:
     """All online players matching an in-game name (case-insensitive) — the
     daemon's kick/ban actions want the user_id, which nobody types by hand.
@@ -256,6 +311,23 @@ def main(argv: list[str] | None = None) -> int:
         help=f"how long since a player's last session counts as inactive "
              f"(default {saveaudit.INACTIVE_DAYS})",
     )
+    sp = sub.add_parser(
+        "save-prune",
+        help="remove departed players' records from Level.sav (dry run unless "
+             "--apply)",
+    )
+    sp.add_argument(
+        "--days", type=int, default=saveaudit.INACTIVE_DAYS,
+        help=f"how long since a player's last session counts as inactive "
+             f"(default {saveaudit.INACTIVE_DAYS})",
+    )
+    sp.add_argument(
+        "--apply", action="store_true",
+        help="actually rewrite Level.sav. Without this it only reports what it "
+             "would remove. Requires a stopped server; takes and verifies a "
+             "backup first.",
+    )
+
     sa.add_argument(
         "--deep", action="store_true",
         help="also read Level.sav to count each player's characters and pals "
@@ -328,6 +400,8 @@ def main(argv: list[str] | None = None) -> int:
             print(fmt_events(client.state().get("events", []), args.n))
         elif args.cmd == "save-audit":
             print(_save_audit(args.days, deep=args.deep))
+        elif args.cmd == "save-prune":
+            return _save_prune(args.days, apply=args.apply)
         elif args.cmd == "start":
             client.action("start")
             print("Server starting.")

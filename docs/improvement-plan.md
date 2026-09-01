@@ -315,13 +315,20 @@ player still holds. Vendored rather than a pip extra because the frozen Windows
 installer has no pip, and the frozen build needs a marker argument rather than
 `-m` — the same trap as the health-task bug.
 
-Still to build, in order:
-1. The prune itself: gated behind a fresh *verified* backup (1.3's manifest and
-   `verify()` exist for exactly this), inside the operation lock, with a
-   persistent exclusion list so a returning player isn't pruned twice.
-2. A dry run that reports what it *would* remove, and is the default.
-3. Guild and base-camp records — `savescan` counts guilds but does not yet
-   attribute them, and abandoned base camps are the third source of bloat.
+**Steps 2 and 3 are done.** `saveprune.py` plus `palctl save-prune` implement
+the prune: dry run by default, a stopped server established from the process
+list, a verified backup first, only known/inactive/non-excluded players, a
+90%-of-the-world refusal, a re-read of the rewritten save before it replaces
+anything, and an exclusion list beside the world.
+
+Still to build:
+1. Guild and base-camp records — `savescan` counts guilds but does not attribute
+   them, and abandoned base camps are the third source of bloat.
+2. Driving the prune from the daemon (inside the operation lock) and from
+   Discord, rather than only from the CLI. The CLI is deliberately first: it is
+   the surface where an operator is present and reading output.
+3. Pruning a *named* player on request, which is what the 90% refusal points
+   people at.
 
 **A gap worth naming:** there is no test of a *successful* end-to-end parse.
 That needs a genuine multi-hundred-megabyte `Level.sav`; upstream's own

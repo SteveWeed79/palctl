@@ -11,6 +11,27 @@ Installers for every release are on the
 ## [Unreleased]
 
 ### Added
+- **`palctl save-prune` removes departed players' records from `Level.sav`** —
+  the fix for the save-size death spiral that palctl's memory watchdog could
+  only treat the symptom of. It is the only thing in palctl that rewrites a
+  world, and it is built as a series of refusals with a mutation at the end:
+
+  * **Dry run unless you pass `--apply`.** You have to ask twice.
+  * **The server must be stopped**, established by looking for its process
+    rather than by asking the service manager. Rewriting a save the server has
+    open corrupts it, and its next autosave would overwrite the result anyway.
+  * **A backup is taken and *verified* first** (`backups.verify`) — an undo
+    nobody checked is not an undo.
+  * **Only players palctl can identify, has not seen for months, and has not
+    already pruned.** A save file it cannot match to a session is never a
+    target. A plan that would remove more than 90% of the world's records is
+    refused outright, because that is far likelier to be an attribution bug
+    than a world that is 90% abandoned.
+  * **The rewritten save is re-read and checked before it replaces anything** —
+    the targets gone, and every other player's record count unchanged. Only
+    then is the file swapped, with the original kept beside it.
+  * **An exclusion list beside the world** records who was pruned, so a player
+    who comes back is never pruned a second time.
 - **`palctl save-audit --deep` reads `Level.sav` itself**, and reports how many
   character records — a player's own character plus every pal they caught —
   are held for players who stopped playing months ago. That is the number the
