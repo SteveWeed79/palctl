@@ -35,20 +35,6 @@ Installers for every release are on the
   release gate against the file it just wrote so a cut that couldn't ship fails
   here instead of in the release run.
 
-### Fixed
-- **The release gate no longer blocks a release over how the version was
-  spelled.** `MAJOR.MINOR.FEATURE.PATCH` routinely gets tagged with the
-  trailing zero left off, and the check compared tag to heading as text — so
-  tag `1.2.8` against heading `## [1.2.8.0]`, the same release written two
-  ways, failed the build before anything was built. Versions are now compared
-  as numbers with trailing zeros dropped, so `1.2.8`, `1.2.8.0` and `v1.2.8`
-  all match. Tags that aren't plain dotted numbers (`release-1.2.5.7`,
-  `1.2.8-rc1`) still have to match exactly: a near-miss tag is the drift this
-  check exists to catch.
-
-## [1.2.8.0] — 2026-09-01
-
-### Added
 - **Auto-pause: an empty server puts itself away, and comes back when somebody
   tries to connect.** Off by default (`autopause_enabled`), and turning it off
   is always the safe direction — the server simply stays up.
@@ -227,7 +213,28 @@ Installers for every release are on the
   existed. A Disabled service is reported but never called a failure — that is
   somebody deliberately turning the server off.
 
+- **A CPU trend line in the desktop dashboard.** The CPU series was already
+  sampled every poll, stored in SQLite and published on `/state` — and drawn by
+  nothing, leaving the tile as a lone 0.3-second sample of a process whose work
+  arrives in bursts. It now sits beside the FPS and Memory sparklines.
+
+### Changed
+- Listing backups no longer measures every file of every backup when only the
+  names are needed. Retention runs right after each backup and used to pay for a
+  full recursive walk of the whole backup tree — a real cost with a couple of
+  dozen retained multi-GB worlds on a slow disk or a network share.
+
 ### Fixed
+- **The release gate no longer blocks a release over how the version was
+  spelled.** `MAJOR.MINOR.FEATURE.PATCH` routinely gets tagged with the
+  trailing zero left off, and the check compared tag to heading as text — so
+  tag `1.2.8` against heading `## [1.2.8.0]`, the same release written two
+  ways, failed the build before anything was built. Versions are now compared
+  as numbers with trailing zeros dropped, so `1.2.8`, `1.2.8.0` and `v1.2.8`
+  all match. Tags that aren't plain dotted numbers (`release-1.2.5.7`,
+  `1.2.8-rc1`) still have to match exactly: a near-miss tag is the drift this
+  check exists to catch.
+
 - **A backup was taken even when the save before it failed, and filed as
   clean.** The pre-backup flush returns whether the server's REST API answered,
   and that answer was discarded — so when the API was wedged, which is exactly
@@ -356,13 +363,6 @@ Installers for every release are on the
   behind it, it used to hand that process's numbers to every surface. It now says
   the reading is unavailable, which is the truth.
 
-### Added
-- **A CPU trend line in the desktop dashboard.** The CPU series was already
-  sampled every poll, stored in SQLite and published on `/state` — and drawn by
-  nothing, leaving the tile as a lone 0.3-second sample of a process whose work
-  arrives in bursts. It now sits beside the FPS and Memory sparklines.
-
-### Fixed
 - **palctl blamed you for stops it made itself.** Three paths deliberately stop
   the server and then refuse to go on: an update or a restore that finds a
   PalServer process still holding the files, and a restore that fails with no
@@ -421,12 +421,6 @@ Installers for every release are on the
   server update takes up to three; with scheduled auto-updates on, that is
   roughly a thousand files a year that nothing ever removed. The newest ten are
   kept.
-
-### Changed
-- Listing backups no longer measures every file of every backup when only the
-  names are needed. Retention runs right after each backup and used to pay for a
-  full recursive walk of the whole backup tree — a real cost with a couple of
-  dozen retained multi-GB worlds on a slow disk or a network share.
 
 ## [1.2.7.0] — 2026-08-10
 
@@ -1673,8 +1667,8 @@ restarts and rotating backups, the settings editor, the Discord bot, the
 first-run wizard, and the Windows installer — plus rapid packaging and
 installer iteration. No per-release notes were published for these.
 
-[Unreleased]: https://github.com/SteveWeed79/palctl/compare/1.2.8.0...HEAD
-[1.2.8.0]: https://github.com/SteveWeed79/palctl/compare/1.2.7.0...1.2.8.0
+[Unreleased]: https://github.com/SteveWeed79/palctl/compare/1.2.8.2...HEAD
+[1.2.8.2]: https://github.com/SteveWeed79/palctl/compare/1.2.7.0...1.2.8.2
 [1.0.0]: https://github.com/SteveWeed79/palctl/compare/0.1.14...1.0.0
 [0.1.14]: https://github.com/SteveWeed79/palctl/compare/0.1.13...0.1.14
 [0.1.13]: https://github.com/SteveWeed79/palctl/compare/0.1.12...0.1.13
