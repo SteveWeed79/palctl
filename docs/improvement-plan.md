@@ -439,7 +439,19 @@ readable. It is not authentication and must never be treated as such — a real
 audit trail needs per-user credentials, which is the 2.4-adjacent work still
 open (see "Auth is one shared secret" in the surfaces inventory).
 
-Not yet done: all of Tier 3.
+Tier 3 shipped as well, after this table was first written:
+
+| Item | What shipped |
+|---|---|
+| 3.1 | `save-audit`, and `save-prune` — the only thing in palctl that rewrites a world — *partial*, see below |
+| 3.2 | Auto-pause, by stopping the server rather than suspending it |
+| 3.3 | A systemd unit for the game server, and a `palctl setup` that needs no Qt |
+| 3.4 | `/metrics` in Prometheus format, built from the same document `/state` serves |
+
+**3.1 is partial, and 3.1 above says how.** Orphaned guild and base-camp records
+are counted and attributed but not removed, so the reclaimable figure stays a
+floor; the prune has no Discord surface; and there is still no test of a
+*successful* end-to-end parse, only of every failure path around it.
 
 ## Suggested order
 
