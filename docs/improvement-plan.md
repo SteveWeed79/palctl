@@ -453,15 +453,40 @@ are counted and attributed but not removed, so the reclaimable figure stays a
 floor; the prune has no Discord surface; and there is still no test of a
 *successful* end-to-end parse, only of every failure path around it.
 
-## Suggested order
+## What's left, in order
 
-1. **Tier 1 as one PR** — 1.1, 1.2, 1.4, 1.6 are each a few lines and each closes a
-   silent failure. 1.3's manifest, 1.5's pull, and 1.7's hash follow naturally.
-2. **2.2 + 2.3 as one small PR** — both are in `scheduler.py`, both are visible to
-   players the day they ship.
-3. **2.1 build pinning** — the highest-value Tier 2 item; the parsing already exists.
-4. **3.1 save-bloat surgery** — scoped as its own project, on top of the verified
-   backups from 1.3.
+Tiers 1-3 have shipped. What follows is the residue, ordered by value against
+effort — every item is described in the sections above; this is only the order.
+
+1. **2.5's alert plumbing** — the smallest, and the last of the silent-failure
+   class this review started with. Which events raise an alert is
+   `DEFAULT_ALERT_KINDS`, a module constant assigned once in
+   `WebhookAlerter.__init__`; no config field overrides it and `reconfigure()`
+   has nothing to revisit, so an operator who wants a different set has to edit
+   the source. A `test-alert` command and a diagnostic snapshot on the alert
+   itself belong in the same change.
+2. **2.1 build pinning** — still the highest-value Tier 2 item, and the largest
+   here. An exact build needs `download_depot` or DepotDownloader instead of
+   `app_update`, which is a different install path. Recording the installed
+   build id in each backup manifest is the cheap half and worth doing first: a
+   restore that cannot say which build wrote a world can silently pair a save
+   with the wrong binary.
+3. **3.1's removal half** — orphaned guild and base-camp records are counted and
+   attributed but never removed, which is what keeps the audit's figure a floor.
+   Deliberately last of the prune work: the guild record ties a base and its
+   storage together, and getting that wrong takes a live player's base with it.
+4. **A Discord surface for the prune** — small, and rides on 3: every refusal
+   already lives in `saveprune.py`, so this is a rendering job, with `apply`
+   staying as hard to reach from chat as `--apply` is from the CLI.
+5. **Per-user credentials** — the 2.4-adjacent work, and the most invasive thing
+   on this list. Until it exists, `actor`/`via` are a label on top of one shared
+   secret and must never be read as authentication.
+
+**One gap that is not scheduled, because it cannot be.** There is still no test
+of a *successful* end-to-end `Level.sav` parse. It needs a genuine
+multi-hundred-megabyte save; upstream's own fixtures are 56 MB, and a valid one
+cannot be synthesised cheaply. The first real save the parser meets will be a
+user's — which is why every failure path around it is covered instead.
 
 ---
 
