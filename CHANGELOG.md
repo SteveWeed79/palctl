@@ -10,6 +10,8 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+## [1.2.8.2] — 2026-09-02
+
 ### Added
 - **Releases cut themselves.** `docs/VERSIONING.md`'s ritual — pick the part to
   bump, rename `## [Unreleased]` to that number with today's date, open a fresh
