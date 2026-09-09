@@ -10,6 +10,8 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+## [1.2.8.3] — 2026-09-09
+
 ### Added
 - **Updates can be installed the moment Steam has one.**
   `schedule.auto_update_on_detect` (Config → Schedule → *Update as soon as one
