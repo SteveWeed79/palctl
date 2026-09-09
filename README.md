@@ -83,11 +83,16 @@ PC, which is the situation most people are trying to get out of.
   second disk, a network share, or an **rclone cloud remote** (Google Drive,
   Dropbox, S3, OneDrive …) — backups on the server's own disk don't survive the
   disk, and a house fire takes the network share with it
-- Opt-in scheduled auto-update (Palworld patches constantly) — the same
-  save → backup → SteamCMD → restart flow as a manual update, world backup
-  included (updates are exactly when saves get eaten), and **no backup means
-  no update** unless you opt out. Reports the build id it actually installed,
-  so "it ran" and "it updated" aren't the same message
+- **Knows when Steam has a new server build** — an anonymous SteamCMD
+  metadata query every hour (no Steam account, no Steam Guard), each new build
+  announced once — and, opt-in, **installs it**: either at a set time each day
+  or **as soon as it is found**, because a player whose game client has
+  updated is refused with a version mismatch until the server catches up. The
+  same save → backup → SteamCMD → restart flow as a manual update, with the
+  in-game countdown, world backup included (updates are exactly when saves get
+  eaten), and **no backup means no update** unless you opt out. Reports the
+  build id it actually installed, so "it ran" and "it updated" aren't the
+  same message
 - One **operation lock**: scheduled restarts, watchdog restarts, updates,
   restores, and crash recovery can't fire into the middle of each other
 - Notifies when a newer server build is available, or a newer palctl release
@@ -97,6 +102,10 @@ PC, which is the situation most people are trying to get out of.
   default — so if you want a hang fixed rather than just reported, turn on
   *Auto-restart on crash/hang* in Config. With it off, palctl says so once per
   outage rather than leaving you to wonder why nothing happened
+- Opt-in **auto-pause**: an empty server is saved and stopped after a set idle
+  time, and palctl listens on the game port so the first connection attempt
+  starts it again. A stopped server holds no leaked memory and no core; the
+  first player back pays about a minute of loading
 - Join / leave / level-up events, synthesised by diffing the player list
 - Session + playtime tracking in SQLite (Palworld remembers none of this)
 - Metrics history in SQLite too, so the graphs survive a daemon restart

@@ -220,6 +220,74 @@ def test_an_adopted_stop_survives_a_daemon_restart(sim):
     )
 
 
+# ---------------- an empty server puts itself away ----------------
+
+
+def test_an_empty_server_is_put_to_sleep_and_a_knock_wakes_it(tmp_path):
+    """Auto-pause, end to end: the real daemon stops a real (fake) server once
+    nobody has been on for the idle time, holds the game's UDP port, and
+    starts the server again on the first packet.
+
+    The two things this proves that no unit test can: the supervisor does not
+    mistake palctl's own pause for an admin's Stop (it used to — "stopped
+    outside palctl", intent flipped to stay-down, and the knock refused), and
+    the port really is handed back before the service is started."""
+    import socket
+
+    def free_udp_port() -> int:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    port = free_udp_port()
+    s = Sim(tmp_path)
+    s.write_config(autopause_enabled=True, autopause_idle_minutes=1, game_port=port)
+    try:
+        running_server(s)
+        s.set_server_mode("empty")
+        s.wait_for(
+            lambda: s.state().get("players") == [], timeout=30, what="the server to empty"
+        )
+        # A minute of nobody, plus a tick, plus the stop itself.
+        s.wait_for(
+            lambda: s.state().get("paused") is True and s.service_state() == "inactive",
+            timeout=150,
+            what="auto-pause to put the server to sleep",
+        )
+        assert any("sleep" in e.lower() for e in s.events())
+        assert s.read_daemon_state().get("paused") is True
+        assert s.read_daemon_state().get("desired_running", True) is True
+        # It stays asleep, and palctl neither reports an outage nor decides an
+        # admin stopped it.
+        s.stays(
+            lambda: s.service_state() == "inactive"
+            and s.read_daemon_state().get("desired_running", True) is True,
+            seconds=10,
+            what="the server staying asleep without being adopted as a Stop",
+        )
+        assert not any("stopped outside palctl" in e for e in s.events())
+        assert not any("Server is **down**" in e for e in s.events())
+
+        knock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        knock.sendto(b"hello?", ("127.0.0.1", port))
+        knock.close()
+        s.wait_for(
+            lambda: s.service_state() == "active" and s.state().get("paused") is False,
+            timeout=60,
+            what="the knock to wake the server",
+        )
+        s.wait_for(
+            lambda: s.state()["alive"] is True, timeout=60, what="the woken server to answer"
+        )
+        assert any("waking" in e.lower() for e in s.events())
+        assert s.read_daemon_state().get("paused") is False
+    finally:
+        s.shutdown()
+
+
 # ---------------- the machine reboots ----------------
 
 

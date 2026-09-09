@@ -151,6 +151,15 @@ class ScheduleConfig:
     # updated server whose world can't be rolled back. Opt out only if you'd
     # rather the update always proceed (e.g. backups live on a flaky share).
     update_requires_backup: bool = True
+    # Apply a server update as soon as the periodic check finds one, instead of
+    # (or as well as) waiting for `auto_update_at`. Opt-in, like `auto_update`:
+    # it takes the server down unasked — with the same countdown, in-game
+    # warnings, cancel/skip and pre-update backup as every other update. Worth
+    # turning on because a player whose game client has updated is refused
+    # with a version mismatch until the server catches up, so "tonight at
+    # 05:00" can mean a day of nobody being able to join. Independent of
+    # `auto_update`; both honour `enabled` and a deliberate Stop.
+    auto_update_on_detect: bool = False
 
 
 @dataclass
@@ -221,8 +230,19 @@ class Config:
 
     poll_seconds: int = 10
 
+    # The UDP port the game server listens on — its `-port` launch argument,
+    # 8211 unless you changed it. Auto-pause listens here while the server is
+    # asleep, so a connection attempt can wake it; nothing else uses it.
+    game_port: int = 8211
+
     # Check GitHub for a newer palctl on startup (best-effort; just notifies).
     check_for_updates: bool = True
+    # How often to ask Steam whether a newer server build exists — an anonymous
+    # SteamCMD metadata query, no account involved. Palworld patches often, and
+    # a client that updates before the server is refused with a version
+    # mismatch, so this is deliberately not a once-a-day thing. The daemon
+    # clamps it to at least ten minutes. Each new build is announced once.
+    update_check_minutes: int = 60
 
     # Auto-pause: stop an empty server and start it again when somebody tries
     # to connect. OFF by default and deliberately so — it trades the first

@@ -692,7 +692,7 @@ def test_daily_restart_loop_skips_when_intentionally_stopped(monkeypatch):
 def _patch_buildids(monkeypatch, installed, latest):
     monkeypatch.setattr(sched_mod.steamcmd, "installed_buildid", lambda root, app: installed)
 
-    async def _latest(sc, app):
+    async def _latest(sc, app, **kw):
         return latest
 
     monkeypatch.setattr(sched_mod.steamcmd, "latest_buildid", _latest)
@@ -1175,7 +1175,7 @@ def _patch_steamcmd(monkeypatch, calls, *, installed, latest="200"):
         calls.append(("update",))
         return 0
 
-    async def fake_latest(sc, app):
+    async def fake_latest(sc, app, **kw):
         return latest
 
     reads = list(installed)
@@ -1708,7 +1708,7 @@ def test_the_pre_update_ini_snapshot_lives_outside_the_install(tmp_path, monkeyp
 
     monkeypatch.setattr(sched_mod.steamcmd, "run_update_async", fake_update)
 
-    async def no_latest(sc, app):
+    async def no_latest(sc, app, **kw):
         return None
 
     monkeypatch.setattr(sched_mod.steamcmd, "latest_buildid", no_latest)

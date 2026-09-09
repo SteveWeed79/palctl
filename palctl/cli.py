@@ -41,6 +41,9 @@ def fmt_status(state: dict) -> str:
     lines = []
     alive = state.get("alive")
     api = "REST API answering" if alive else "REST API not answering"
+    if state.get("paused"):
+        # Stopped and silent on purpose — the opposite of an outage.
+        api = "asleep — auto-pause; the first connection attempt wakes it"
     lines.append(f"server     {state.get('service', 'UNKNOWN')} ({api})")
     if state.get("operation"):
         lines.append(f"operation  {state['operation']} in progress")

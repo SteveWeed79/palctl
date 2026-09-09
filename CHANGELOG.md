@@ -10,6 +10,132 @@ Installers for every release are on the
 
 ## [Unreleased]
 
+### Added
+- **Updates can be installed the moment Steam has one.**
+  `schedule.auto_update_on_detect` (Config → Schedule → *Update as soon as one
+  is found*) follows the periodic update check with the update itself — the
+  same countdown, in-game warnings, cancel/skip and pre-update backup as every
+  other update — instead of announcing it and waiting for `auto_update_at`.
+  Opt-in, like the timed auto-update, and it stands down for a server stopped
+  on purpose or an operation already holding the lock. Worth having because a
+  player whose game client has updated is refused with a version mismatch
+  until the server catches up, so "tonight at 05:00" can mean a day of nobody
+  being able to join.
+- **The update check has a knob.** `update_check_minutes` (hourly by default,
+  ten minutes at the fastest) is how often Steam is asked for a newer build —
+  an anonymous SteamCMD metadata query, no Steam account or Steam Guard
+  involved. Each new build is announced once, not on every check.
+- **Scheduled auto-update, and auto-pause, can now be turned on from the
+  desktop GUI.** Config → Schedule gained *Auto-update at a set time*, its
+  time, *Update as soon as one is found* and the check interval; a new
+  *Auto-pause* group carries the switch, the idle time and the game port. The
+  timed auto-update had no controls at all before — the only way to enable it
+  was editing `config.json` by hand, which the config module's own docstring
+  says nobody should have to do.
+- `game_port` (8211 unless the server's `-port` was changed): the UDP port
+  auto-pause listens on while the server is asleep.
+- **A sleeping server says so everywhere.** `/state` carries `paused`; the
+  dashboard badge, `palctl status` and Discord read "asleep — auto-pause; the
+  first connection attempt wakes it" instead of "REST API not answering"; and
+  `/metrics` exports `palctl_server_paused`, so a Grafana alert on
+  `server_alive` can tell a nap from an outage.
+
+### Fixed
+- **The update check could never see an update.** SteamCMD answers
+  `app_info_print` from its own `appcache/appinfo.vdf`, and the documented
+  "force a refresh" (`+app_info_update 1`) does not reliably refresh it — a
+  well-known SteamCMD quirk. For a SteamCMD that last ran to *install* the
+  current build, the cached "latest" was the current build: installed equalled
+  latest, forever, and the first anyone heard of a patch was players bouncing
+  off a version mismatch. palctl now deletes that cache before every check
+  (SteamCMD rebuilds it), the fix every server manager that checks builds this
+  way settles on.
+- **…and, when it did see one, could read the wrong branch's build id.** The
+  parser took the first `"buildid"` after the first `"public"` in the dump —
+  but every depot lists its manifests per branch long before the `branches`
+  block, so the first `"public"` was a depot's, and the build id that followed
+  belonged to whichever branch Steam happened to list first. It now reads the
+  `branches` block per branch, and a server held on a beta branch
+  (`steam_branch`) is compared against *that* branch's build rather than
+  reported permanently behind the public one.
+- **The check ran every six hours**, which for a game whose clients update
+  themselves could mean most of a day of players being refused before palctl
+  even knew. Hourly now (see `update_check_minutes`), announced once per new
+  build rather than repeating the same news every time.
+- **Two SteamCMDs could run at once.** The periodic check landing in the
+  middle of an update started a second SteamCMD in the same directory, on top
+  of the one rewriting the install. SteamCMD now runs one at a time in the
+  daemon; the check stands aside while an update holds it.
+- **A SteamCMD updating itself was killed mid-bootstrap.** The metadata query
+  had a flat two-minute cap, and SteamCMD's first run (and its run after every
+  one of Valve's updates to it) downloads a new copy of itself first — chatty
+  and legitimately slow on a bad line. Like an update, it is now killed for
+  *silence* (two minutes without output is a hung Steam connection), with a
+  separate ceiling nothing legitimate reaches.
+- **Auto-pause did nothing.** 1.2.8.2 shipped the decision logic, the knock
+  listener, the tests and the config switch — and nothing in the daemon called
+  any of it, so `autopause_enabled` was a setting with no effect. It is wired
+  in now, and the wiring is where the real work was: from the outside a pause
+  looks exactly like an admin stopping the server in services.msc, so without
+  telling the rest of the daemon the poll loop announced an outage, the
+  external-stop detector adopted palctl's own pause as a deliberate Stop and
+  flipped the intent to stay-down, the knock that should have woken the server
+  was refused as "stopped on purpose", and a backup of the sleeping world
+  warned that its save had failed. Each of those now asks. The pause survives
+  a daemon restart (a daemon that forgot it left a server nobody could wake),
+  every start path — Start, restart, update, restore, recovery, the boot-time
+  start — hands the game its port back first (a PalServer started while palctl
+  still held the port died at bind), and every failure falls toward *running*:
+  a port that can't be taken starts the server again, and turning the feature
+  off wakes a sleeping server rather than leaving it asleep.
+- **One crashed scheduler loop turned into two of everything.** The scheduler
+  ran its four loops under `gather()`, which propagates the first exception and
+  leaves the other three running. The daemon's supervisor then restarted the
+  scheduler — four more loops beside the three survivors, so a single bad
+  config value in the restart loop left the server with two backup loops, two
+  autosave loops and two auto-update loops, and a third set after the next
+  crash. A TaskGroup cancels the siblings first.
+- **A backup failed outright when the server had a save file open.** On
+  Windows the game's write holds a sharing lock, and the copy failed with
+  "The process cannot access the file because it is being used by another
+  process" — on a server that was merely saving. It is the same event as a
+  torn copy and is now retried the same way, with a pause for the write to
+  finish; only a lock that never clears is a failed backup.
+- **Backups were copied mid-save.** Palworld's `/save` answers as soon as the
+  save is *scheduled*; the world is written over the following seconds, tens
+  of them on a big world, and the copy started three seconds after the call
+  returned. On large worlds every attempt was torn, so backups were routinely
+  flagged "may be inconsistent" — or, on Windows, failed on the lock above.
+  The copy now waits for the world's files to stop changing first (up to two
+  minutes), and the consistency check stays as the backstop.
+- **A damaged save was backed up in silence.** Every backup's manifest has
+  recorded an empty or truncated `.sav` since manifests existed, and nothing
+  ever read it back: a backup of a world the server had already broken was
+  announced exactly like a good one. It is now announced as what it is — the
+  copy is faithful, the *world* is damaged — while an older, intact backup
+  still exists to go back to.
+- **A failing backup was retried every five minutes, forever.** The wait is
+  measured from the newest backup on disk, which a failed backup leaves
+  unchanged, so a persistent failure (a full volume, a share that went away)
+  came straight back after the overdue grace with an error event and a
+  Discord ping each time. The retry now backs off, doubling per failure and
+  never beyond the backup interval — and the loop can finally tell a failed
+  backup from a taken one, which it could not: `backup_now` returned nothing
+  either way.
+- **The CPU reading was a 0.3-second coin toss that blocked every caller.**
+  The previous fix sampled over a real window on every call, which made the
+  first reading right and left two costs: a tick-based game server's work
+  arrives in bursts, and on Windows process CPU time is accounted in ~15.6 ms
+  ticks, so a 0.3 s window quantised to steps of about 5% — an idle-ish server
+  flickered between 0% and 5%, a busy one jumped by tens of percent between
+  readings with nothing changing — and every reading parked a thread for
+  0.3 s while the dashboard asked every two seconds. The sampler now diffs
+  the process's CPU time across calls, so the window is however long it has
+  been since anyone last asked (two seconds for the dashboard, ten for the
+  poll loop) and nothing blocks; only the very first reading of a process
+  still pays for a real window, so `palctl status` right after a start is
+  never 0.0.
+
 ## [1.2.8.2] — 2026-09-02
 
 ### Added

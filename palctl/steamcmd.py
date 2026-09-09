@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import re
 import shutil
 import subprocess
@@ -29,6 +30,17 @@ from collections.abc import Callable
 from pathlib import Path
 
 APP_ID = "2394010"
+
+# The Steam account every SteamCMD run logs in as. The dedicated server is a
+# free tool that Valve serves to anonymous logins, so palctl never needs — and
+# never asks for — a Steam account, a password, or a Steam Guard code. This is
+# also what keeps the update check and the update itself unattended: a named
+# login can block on a Steam Guard prompt nobody is there to answer.
+STEAM_USER = "anonymous"
+
+# Where SteamCMD keeps the app metadata `app_info_print` reads back — see
+# clear_appinfo_cache for why palctl deletes it before every update check.
+APPINFO_CACHE = Path("appcache") / "appinfo.vdf"
 # Valve's canonical SteamCMD archives, per platform.
 STEAMCMD_WIN_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
 STEAMCMD_LINUX_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
@@ -66,9 +78,17 @@ _STEAMCMD_BINARIES = ("steamcmd.exe", "steamcmd.sh")
 # update is in progress" until someone restarts the daemon by hand.
 STEAMCMD_STALL_SECONDS = 1200.0
 
-# Metadata queries (app_info_print) are a small round-trip to Steam, so they get
-# a plain overall cap rather than a stall timer.
+# Metadata queries (app_info_print) are a small round-trip to Steam — but the
+# process making them is SteamCMD, which on its first run (and after every one
+# of Valve's own updates to it) downloads and installs a new copy of itself
+# before it gets to the query. On a slow line that alone can take minutes. So
+# the query gets the same treatment as an update: it is killed for *silence*
+# (STEAMCMD_META_SECONDS without a byte of output is a hung Steam connection),
+# and only separately for an overall runtime nothing legitimate reaches.
 STEAMCMD_META_SECONDS = 120.0
+STEAMCMD_META_TOTAL_SECONDS = 900.0
+
+_log = logging.getLogger("palctl.steamcmd")
 
 
 class SteamCmdStalled(RuntimeError):
@@ -124,6 +144,10 @@ def default_steamcmd_url() -> str:
 # SteamCMD prints e.g. "Update state (0x61) downloading, progress: 42.34 (123 / 456)".
 _PROGRESS_RE = re.compile(r"progress:\s*([\d.]+)")
 _BUILDID_RE = re.compile(r'"buildid"\s*"(\d+)"')
+# One branch inside the `branches` block: a quoted name and a flat `{ ... }` of
+# key/value pairs. Branch entries never nest, which is what lets `[^{}]*` stand
+# in for a real KeyValues parser here.
+_BRANCH_ENTRY_RE = re.compile(r'"([^"]+)"\s*\{([^{}]*)\}')
 
 
 def parse_progress(line: str) -> float | None:
@@ -143,16 +167,119 @@ def parse_installed_buildid(acf_text: str) -> str | None:
     return m.group(1) if m else None
 
 
-def parse_latest_buildid(app_info_text: str) -> str | None:
-    """
-    The public-branch build id from `steamcmd +app_info_print` output (the latest
-    available build). The first buildid after the "public" branch key is it.
-    """
-    idx = app_info_text.find('"public"')
-    if idx == -1:
+def _block_after(text: str, start: int) -> str | None:
+    """The inside of the first brace-balanced `{ ... }` at or after `start`."""
+    opened = text.find("{", start)
+    if opened == -1:
         return None
-    m = _BUILDID_RE.search(app_info_text, idx)
-    return m.group(1) if m else None
+    depth = 0
+    for i in range(opened, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[opened + 1 : i]
+    return text[opened + 1 :]  # unterminated (a cut-off dump): take what's there
+
+
+def parse_branch_buildids(app_info_text: str) -> dict[str, str]:
+    """Every branch's build id from `steamcmd +app_info_print` output, keyed by
+    branch name — `{"public": "20087975", "beta-xyz": "20090001"}`.
+
+    Reads the `"branches"` block *as a block*, per branch. The previous parser
+    took the first `"buildid"` after the first `"public"` in the whole dump,
+    and that is wrong on the output SteamCMD actually prints: every depot
+    lists its manifests per branch (`"manifests" { "public" { "gid" … } }`)
+    long before the `branches` block, so the first `"public"` was a depot's,
+    and the first `"buildid"` after it belonged to whichever branch Steam
+    happened to list first in `branches` — which is Steam's order, not
+    alphabetical, and not always `public`. Read that way, a beta branch's id
+    stood in for the public build and the check reported an update that did
+    not exist, or hid one that did.
+    """
+    idx = app_info_text.find('"branches"')
+    if idx == -1:
+        return {}
+    block = _block_after(app_info_text, idx + len('"branches"'))
+    if block is None:
+        return {}
+    out: dict[str, str] = {}
+    for m in _BRANCH_ENTRY_RE.finditer(block):
+        build = _BUILDID_RE.search(m.group(2))
+        if build:
+            out[m.group(1)] = build.group(1)
+    return out
+
+
+def parse_latest_buildid(app_info_text: str, branch: str = "") -> str | None:
+    """The latest build id of `branch` (the `public` branch when empty) from
+    `steamcmd +app_info_print` output, or None when the dump doesn't say.
+
+    None rather than a guess: an output with no `branches` block is a cut-off
+    or failed dump, and "don't know" is the answer that keeps a scheduled
+    update from acting on it (the auto-update loop fails closed).
+    """
+    return parse_branch_buildids(app_info_text).get(branch or "public")
+
+
+def appinfo_cache_paths(steamcmd: str | Path) -> list[Path]:
+    """Where this SteamCMD may keep its `appinfo.vdf`. Pure.
+
+    SteamCMD's own directory first (the Windows layout, and the Linux tarball
+    run in place), then the Linux homes SteamCMD writes into when it is run
+    from elsewhere — `~/Steam` is where a `steamcmd.sh` without a
+    `force_install_dir` puts *everything*, and the Debian package keeps its
+    copy under `~/.steam/steamcmd`. The Steam *client's* directories
+    (`~/.local/share/Steam`, `~/.steam/steam`) are deliberately not here: that
+    cache belongs to a different program, and palctl has no business in it.
+    """
+    exe = Path(steamcmd)
+    home = Path.home()
+    candidates = [
+        exe.parent / APPINFO_CACHE,
+        home / "Steam" / APPINFO_CACHE,
+        home / ".steam" / APPINFO_CACHE,
+        home / ".steam" / "steamcmd" / APPINFO_CACHE,
+    ]
+    seen: set[str] = set()
+    out: list[Path] = []
+    for p in candidates:
+        key = str(p).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def clear_appinfo_cache(steamcmd: str | Path) -> list[Path]:
+    """Delete SteamCMD's app-info cache so the next `app_info_print` asks
+    Steam instead of answering from disk. Returns what was removed. Never
+    raises — a cache that won't delete just means a check that may be stale,
+    which is the behaviour this used to have on every check.
+
+    This is the fix for the update check that never fired. SteamCMD keeps the
+    metadata `app_info_print` reads in `appcache/appinfo.vdf`, and
+    `+app_info_update 1` — the documented "force a refresh" — does not
+    reliably refresh it: a well-known SteamCMD quirk, and the reason every
+    server manager that checks builds this way (LinuxGSM, for one) deletes the
+    file first. Left in place, the print reports the build id SteamCMD cached
+    the last time it ran — which, for a SteamCMD that last ran to *install*
+    the current build, is the current build. Installed equals latest, no
+    update is ever detected, and the first anyone hears of a patch is players
+    being refused with a version mismatch. SteamCMD rebuilds the cache on the
+    next run; there is nothing in it worth keeping.
+    """
+    removed: list[Path] = []
+    for path in appinfo_cache_paths(steamcmd):
+        try:
+            if path.is_file():
+                path.unlink()
+                removed.append(path)
+        except OSError as e:
+            _log.warning("couldn't clear SteamCMD's app-info cache at %s: %s", path, e)
+    return removed
 
 
 def manifest_path(server_root: str | Path, app_id: str = APP_ID) -> Path | None:
@@ -200,23 +327,29 @@ def installed_buildid(server_root: str | Path, app_id: str = APP_ID) -> str | No
         return None
 
 
-async def latest_buildid(
-    steamcmd: str | Path,
-    app_id: str = APP_ID,
-    *,
-    timeout: float = STEAMCMD_META_SECONDS,
-) -> str | None:
-    """Ask Steam for the latest public build id. Best-effort; None on any failure.
+def app_info_command(steamcmd: str | Path, app_id: str = APP_ID) -> list[str]:
+    """The SteamCMD argv for "what is the latest build of this app?".
 
-    Bounded: this runs from the daemon's six-hourly update check, and a steamcmd
-    that hangs on the metadata query (Steam unreachable, or a login prompt) would
-    otherwise park a child process forever and stop that loop from ever ticking
-    again. On timeout we kill it and report "don't know", which is exactly how
-    every other failure here is already handled."""
-    cmd = [
-        str(steamcmd), "+login", "anonymous",
+    An anonymous login, a forced metadata refresh, a dump of the app's info as
+    Valve KeyValues, and quit. Nothing here touches the install or asks for a
+    Steam account — see STEAM_USER.
+    """
+    return [
+        str(steamcmd), "+login", STEAM_USER,
         "+app_info_update", "1", "+app_info_print", str(app_id), "+quit",
     ]
+
+
+async def _run_capture_async(
+    cmd: list[str], *, stall_timeout: float, total_timeout: float
+) -> str | None:
+    """Run a SteamCMD command line and return everything it printed.
+
+    None when it couldn't be started, printed nothing for `stall_timeout`
+    seconds, or ran for longer than `total_timeout` altogether — killed, tree
+    and all, in both of the last two. Reads in chunks rather than lines so a
+    dump line longer than asyncio's stream limit can't turn into an exception.
+    """
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -224,12 +357,72 @@ async def latest_buildid(
         )
     except OSError:
         return None
+    assert proc.stdout is not None
+    chunks: list[bytes] = []
+    deadline = time.monotonic() + total_timeout
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except TimeoutError:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                await _kill_async(proc)
+                return None
+            try:
+                raw = await asyncio.wait_for(
+                    proc.stdout.read(65536), timeout=min(stall_timeout, left)
+                )
+            except TimeoutError:
+                await _kill_async(proc)
+                return None
+            if not raw:
+                break
+            chunks.append(raw)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=_REAP_SECONDS)
+        return b"".join(chunks).decode(errors="replace")
+    except asyncio.CancelledError:
         await _kill_async(proc)
+        raise
+
+
+async def latest_buildid(
+    steamcmd: str | Path,
+    app_id: str = APP_ID,
+    *,
+    branch: str = "",
+    timeout: float = STEAMCMD_META_SECONDS,
+    total_timeout: float = STEAMCMD_META_TOTAL_SECONDS,
+    clear_cache: bool = True,
+) -> str | None:
+    """Ask Steam for the latest build id of `branch` (public by default).
+    Best-effort; None on any failure — and "don't know" is what every caller
+    wants on a failure, because guessing "current" hides a patch and guessing
+    "behind" takes a server down for nothing.
+
+    Anonymous, always: the dedicated server is served to anonymous logins, so
+    no Steam account, password or Steam Guard code is involved (STEAM_USER).
+
+    The stale-cache trap is handled first (clear_appinfo_cache) — without that
+    this asked SteamCMD and SteamCMD answered from disk, so a server that had
+    just been updated by palctl could never learn about the next patch.
+
+    Bounded two ways: `timeout` is how long SteamCMD may go without printing
+    anything (a hung Steam connection), `total_timeout` a ceiling on the whole
+    run. The distinction matters on Windows, where SteamCMD's first run
+    downloads a new copy of itself before it gets to the question — chatty
+    and legitimately slow on a bad line, and a plain overall cap short enough
+    to catch a hang killed it mid-bootstrap. Either way the process is killed
+    and the answer is "don't know", never a parked child that stops the
+    check loop from ticking again.
+    """
+    if clear_cache:
+        await asyncio.to_thread(clear_appinfo_cache, steamcmd)
+    out = await _run_capture_async(
+        app_info_command(steamcmd, app_id),
+        stall_timeout=timeout, total_timeout=total_timeout,
+    )
+    if out is None:
         return None
-    return parse_latest_buildid(out.decode(errors="replace"))
+    return parse_latest_buildid(out, branch)
 
 
 def update_command(
@@ -238,7 +431,7 @@ def update_command(
     app_id: str = APP_ID,
     *,
     validate: bool = True,
-    username: str = "anonymous",
+    username: str = STEAM_USER,
     branch: str = "",
     beta_password: str = "",
 ) -> list[str]:
@@ -249,6 +442,11 @@ def update_command(
     after and SteamCMD silently ignores it and installs into its own directory,
     which is the single most common "why did it download to the wrong place"
     mistake.
+
+    ``username`` is the anonymous login unless a caller says otherwise, and no
+    caller in palctl does: the dedicated server downloads anonymously, and a
+    named login is what makes an unattended update stall on a Steam Guard
+    prompt.
 
     ``branch`` selects a Steam beta branch (``-beta <name>``), with
     ``beta_password`` for a branch that needs one. Both are arguments *to*

@@ -15,6 +15,7 @@ import contextlib
 import logging
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -336,9 +337,82 @@ def server_account_mismatch(daemon_user: str) -> str | None:
     return server_account_check(daemon_user)[1]
 
 
-# How long proc_stats() samples CPU for. cpu_percent measures work done over a
-# window, so it needs a real window — see the comment in proc_stats().
+# ---------------- CPU sampling ----------------
+#
+# CPU use is work done over a window, so a reading needs a window. The first
+# fix here sampled over a real 0.3-second window on every call, which made the
+# very first read right (psutil's interval=None diffs against the *same object's*
+# previous call, and every caller builds a fresh object, so that always read
+# 0.0). It also left two costs behind, and both looked like "the CPU reading is
+# wrong" all the same:
+#
+#   * 0.3 s is a coin toss for a tick-based game server. Palworld's work arrives
+#     in bursts, and on Windows process CPU time is accounted in ~15.6 ms
+#     scheduler ticks, so a 0.3 s window quantises to steps of about 5%: an
+#     idle-ish server flickered between 0% and 5% and a busy one jumped by tens
+#     of percent from one reading to the next, with nothing changing.
+#   * Every reading parked a worker thread for 0.3 s — and the dashboard asks
+#     every two seconds, the poll loop every ten, the watchdog every minute.
+#
+# So the sampler remembers the last (cpu-seconds, wall-clock) it saw for the
+# server process and diffs against it. The window is then however long it has
+# been since *anyone* last asked — two seconds for a dashboard, ten for the
+# poll loop — which is exactly the averaging a trend line wants, and it costs a
+# single cpu_times() call. Only the first reading for a process, with no
+# history to diff against, pays for a real 0.3 s window, so the first `palctl
+# status` after a start is never 0.0. Two readings closer together than
+# _CPU_MIN_WINDOW share the previous answer rather than diffing over a window
+# too short to mean anything.
 _CPU_SAMPLE_SECONDS = 0.3
+_CPU_MIN_WINDOW = 1.0
+# Forget a process nobody has asked about for this long (a server that
+# restarted has a new pid and a new entry; the old one just needs to go).
+_CPU_FORGET_AFTER = 3600.0
+
+_cpu_lock = threading.Lock()
+# (pid, create_time) -> (cpu seconds, monotonic clock, last cores reading)
+_cpu_seen: dict[tuple[int, float], tuple[float, float, float]] = {}
+
+
+def _busy_seconds(p: psutil.Process) -> float:
+    t = p.cpu_times()
+    return float(t.user) + float(t.system)
+
+
+def _cpu_cores(p: psutil.Process) -> float:
+    """CPU-cores-equivalent for `p` (1.0 = one core fully busy) over the window
+    since it was last measured, or over a fresh 0.3 s window the first time."""
+    key = (p.pid, p.create_time())
+    now = time.monotonic()
+    busy = _busy_seconds(p)
+    with _cpu_lock:
+        prev = _cpu_seen.get(key)
+        if prev is not None:
+            prev_busy, prev_at, prev_cores = prev
+            elapsed = now - prev_at
+            if elapsed < _CPU_MIN_WINDOW:
+                return prev_cores
+            cores = max(0.0, (busy - prev_busy) / elapsed)
+            _cpu_seen[key] = (busy, now, cores)
+            return cores
+    # First reading for this process: no history to diff against, so take a
+    # real window — outside any oneshot() block, which would cache cpu_times()
+    # and make the window diff a value against itself.
+    cores = p.cpu_percent(interval=_CPU_SAMPLE_SECONDS) / 100.0
+    busy = _busy_seconds(p)
+    with _cpu_lock:
+        now = time.monotonic()
+        _cpu_seen[key] = (busy, now, cores)
+        for k, (_b, at, _c) in list(_cpu_seen.items()):
+            if k != key and now - at > _CPU_FORGET_AFTER:
+                del _cpu_seen[k]
+    return cores
+
+
+def _forget_cpu_history() -> None:
+    """Drop every remembered process. A seam for tests, which reuse pids."""
+    with _cpu_lock:
+        _cpu_seen.clear()
 
 
 def format_cpu(
@@ -378,8 +452,9 @@ def proc_stats(server_root: str | Path | None = None) -> ProcStats | None:
     hand, so that a box running two Palworld servers is measured on the one
     palctl manages rather than on whichever psutil listed last. See _pick_server.
 
-    Blocking (it samples CPU over a real window) — every caller runs it via
-    asyncio.to_thread.
+    Blocking (process enumeration, and a real 0.3 s window the first time a
+    process is measured — see the CPU sampling note above) — every caller runs
+    it via asyncio.to_thread.
 
     On the CPU figure, and why there are two of them. `cpu_percent` is the share
     of the whole machine, and that number alone is what made this reading useless
@@ -404,39 +479,21 @@ def proc_stats(server_root: str | Path | None = None) -> ProcStats | None:
     if p is None:
         return None
     try:
-        # CPU has to be measured over a real interval, and it must be measured
-        # BEFORE (and outside) the oneshot() block below.
-        #
-        # The obvious call, cpu_percent(interval=None), is a delta against the
-        # *same Process object's* previous call — so the first call on any object
-        # returns 0.0, and a caller that only reads once (the bot's /status, a
-        # `palctl status` right after start) gets 0.0 every time. A shared "prime
-        # the object once and reuse it" cache tried to paper over this, but it
-        # still reads 0.0 on the first sample and whenever two of our callers
-        # (poll loop, /state, the bot) land back-to-back, and it goes stale the
-        # moment the poll loop that primed it stops running (e.g. the REST API is
-        # unreachable). So we take a real measurement over a fixed window on every
-        # call: cpu_percent(interval>0) snapshots CPU time, sleeps, snapshots
-        # again, and returns a meaningful number the first time and every time.
-        # The sleep is fine because every caller runs proc_stats in a worker
-        # thread (asyncio.to_thread), off the daemon's event loop.
-        #
-        # It must stay outside oneshot(): oneshot() caches cpu_times(), so an
-        # interval sample taken inside it diffs a value against itself and reads
-        # 0.0 — exactly the bug we're fixing.
-        cpu_raw = p.cpu_percent(interval=_CPU_SAMPLE_SECONDS)
-        # Raw psutil cpu_percent is per-core: it sums across cores and can exceed
-        # 100% on an N-core box. Both derived figures come from it — see the
-        # docstring for why publishing only the machine share was the bug.
+        # Measured BEFORE (and outside) the oneshot() block: oneshot() caches
+        # cpu_times(), and the first-read window inside it would diff a value
+        # against itself and read 0.0 — the original always-zero bug.
+        cores_used = _cpu_cores(p)
         cores = psutil.cpu_count() or 1
         with p.oneshot():
             return ProcStats(
                 pid=p.pid,
                 memory_mb=p.memory_info().rss / 1_048_576,
-                cpu_percent=cpu_raw / cores,
+                # The machine share is the same measurement divided across the
+                # box — see the docstring for why publishing only it was the bug.
+                cpu_percent=cores_used * 100.0 / cores,
                 threads=p.num_threads(),
                 uptime_seconds=max(0.0, time.time() - p.create_time()),
-                cpu_cores=cpu_raw / 100.0,
+                cpu_cores=cores_used,
                 cpu_count=cores,
                 instances=instances,
                 measured_launcher=is_launcher,

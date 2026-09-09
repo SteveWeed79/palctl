@@ -89,6 +89,23 @@ def test_create_records_a_manifest(tmp_path):
     )
 
 
+def test_create_hands_back_the_problems_it_recorded(tmp_path):
+    """The manifest has recorded a truncated save since manifests existed, and
+    nothing ever read it back at creation time — a backup of a save the server
+    had already damaged was announced exactly like a good one. The Backup
+    returned by create() now carries what the manifest says."""
+    sg = world(tmp_path)
+    (sg / "0" / "ABC123" / "Level.sav").write_bytes(_sav_bytes(b"x" * 500)[:200])
+
+    b = backups.create(sg, tmp_path / "backups", "test")
+
+    assert b.problems and any("Level.sav" in p and "truncated" in p for p in b.problems)
+    manifest = json.loads((b.path / backups.MANIFEST_NAME).read_text())
+    assert list(b.problems) == manifest["problems_at_creation"]
+    # A healthy world reports nothing.
+    assert backups.create(world(tmp_path, name="Good"), tmp_path / "b2", "t").problems == ()
+
+
 def test_manifest_records_whether_the_save_flushed(tmp_path):
     """The whole point of threading `flushed` down: a restore can say the world
     may be older than the backup's timestamp."""
