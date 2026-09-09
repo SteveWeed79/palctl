@@ -124,6 +124,13 @@ def render(state: dict, *, version: str = "", degraded: Iterable[str] = ()) -> s
         )
 
     lines += _metric(
+        "server_paused",
+        "1 while auto-pause has the server asleep (stopped on purpose, "
+        "woken by the first connection attempt).",
+        1 if state.get("paused") else 0,
+    )
+
+    lines += _metric(
         "operation_in_progress",
         "1 while palctl holds its operation lock (backup, update, restart…).",
         1 if state.get("operation") else 0,

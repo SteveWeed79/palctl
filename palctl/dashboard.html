@@ -61,6 +61,7 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); flex: none; }
   .dot.up   { background: var(--good); }
   .dot.down { background: var(--critical); }
+  .dot.asleep { background: var(--accent); }
   .op { font-size: 12px; color: var(--ink-2); }
   .op::before { content: "· "; color: var(--ink-3); }
   .op:empty { display: none; }
@@ -554,9 +555,14 @@ setInterval(tickClock, 1000);
 
 function render(state) {
   const alive = state.alive === true;
-  $("dot").className = "dot " + (alive ? "up" : "down");
+  // Asleep is stopped-and-silent on purpose (auto-pause), the opposite of an
+  // outage, and it must not be painted like one.
+  const asleep = !alive && state.paused === true;
+  $("dot").className = "dot " + (alive ? "up" : asleep ? "asleep" : "down");
   $("svc").textContent = (state.service || "UNKNOWN") +
-    (alive ? " · REST API answering" : " · REST API not answering");
+    (alive ? " · REST API answering"
+      : asleep ? " · asleep — auto-pause; the first connection attempt wakes it"
+      : " · REST API not answering");
   $("op").textContent = state.operation ? `${state.operation} in progress…` : "";
 
   // Only worth showing while something is off: with the server up and answering,
@@ -564,7 +570,7 @@ function render(state) {
   const why = $("why");
   const behind = state.update && state.update.state === "behind";
   const parts = [];
-  if (!alive && state.why) parts.push(state.why);
+  if (!alive && !asleep && state.why) parts.push(state.why);
   if (behind) parts.push(
     `this server is on build ${state.update.installed}, Steam is serving ` +
     `${state.update.latest} — players will be refused with a version mismatch ` +

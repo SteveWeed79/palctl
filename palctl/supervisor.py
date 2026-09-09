@@ -74,6 +74,14 @@ class Observation:
     recent_restarts: int        # auto-recoveries in the last hour
     confirm_polls: int          # watchdog.crash_confirm_polls
     restart_cap: int            # watchdog.crash_restart_max_per_hour
+    # palctl put the server to sleep itself (auto-pause) and is listening for
+    # a connection attempt to wake it. A stopped service is then the intended
+    # state, not an outage and not somebody's deliberate stop — and without
+    # this flag it read as the latter: after a few polls the external-stop
+    # detector adopted palctl's own pause as an admin's Stop, flipped the
+    # intent to "stay down", and the knock that should have woken the server
+    # was refused as "stopped on purpose".
+    paused: bool = False
 
 
 @dataclass(frozen=True)
@@ -82,14 +90,16 @@ class Decision:
     why: str
 
 
-def needs_service_state(*, desired_running: bool, startup_pending: bool) -> bool:
+def needs_service_state(
+    *, desired_running: bool, startup_pending: bool, paused: bool = False
+) -> bool:
     """Whether the caller has to ask the service manager at all.
 
-    Exactly the two branches `decide` answers before it looks at
-    `service_state`. It exists so the daemon can skip a subprocess per poll for
-    a server that is meant to be down — without the daemon re-implementing the
-    order those branches come in. A test pins the two together."""
-    return desired_running and not startup_pending
+    Exactly the branches `decide` answers before it looks at `service_state`.
+    It exists so the daemon can skip a subprocess per poll for a server that
+    is meant to be down — without the daemon re-implementing the order those
+    branches come in. A test pins the two together."""
+    return desired_running and not paused and not startup_pending
 
 
 def looks_externally_stopped(
@@ -180,6 +190,17 @@ def decide(obs: Observation) -> Decision:
             Action.STAND_DOWN,
             "the server is meant to be stopped, so an unreachable server is "
             "expected — palctl will not start it",
+        )
+
+    if obs.paused:
+        # Before the startup and external-stop branches on purpose: the pause
+        # is palctl's own doing, and it survives a daemon restart, so neither
+        # a STOPPED service at startup nor one confirmed over several polls
+        # is evidence of anything here.
+        return Decision(
+            Action.STAND_DOWN,
+            "the server is asleep — auto-pause stopped it because nobody was "
+            "online, and the first connection attempt wakes it",
         )
 
     if obs.startup_pending:

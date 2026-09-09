@@ -9,6 +9,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import time
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -68,6 +69,18 @@ class Backup:
     # can't know this after the fact, so it reports True; only the Backup
     # returned by create() carries a real verdict.
     consistent: bool = True
+    # What was already wrong with the world's files at the moment they were
+    # copied — an empty or truncated `.sav` (see _sav_problem). Recorded in the
+    # manifest since manifests existed, and until now told to nobody: a backup
+    # of a save the server had already damaged was announced exactly like a
+    # good one. Only the Backup returned by create() carries these.
+    problems: tuple[str, ...] = ()
+
+
+# How long to wait between copy attempts that hit a file the server had open.
+# A save write is over in seconds; this is a pause for it to finish, not a
+# retry budget (that is create()'s consistency loop).
+_COPY_RETRY_SECONDS = 2.0
 
 
 def _stamp() -> str:
@@ -201,17 +214,52 @@ def _manifest_for(dest: Path, *, consistent: bool, flushed: bool | None) -> dict
     }
 
 
-def _write_manifest(dest: Path, *, consistent: bool, flushed: bool | None) -> None:
+def _write_manifest(dest: Path, manifest: dict) -> None:
     """Best-effort, like the config snapshot: the world copy is the point of a
     backup and must never fail over its bookkeeping."""
     try:
-        (dest / MANIFEST_NAME).write_text(
-            json.dumps(_manifest_for(dest, consistent=consistent, flushed=flushed)),
-            encoding="utf-8",
-        )
+        (dest / MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
     except Exception:
         with contextlib.suppress(OSError):
             (dest / MANIFEST_NAME).unlink(missing_ok=True)
+
+
+def wait_for_quiet(
+    root: Path,
+    *,
+    quiet_seconds: float = 5.0,
+    timeout: float = 120.0,
+    poll: float = 1.0,
+) -> bool:
+    """Block until nothing under `root` has changed for `quiet_seconds`.
+
+    True when it went quiet, False when `timeout` ran out first (the caller
+    copies anyway — create()'s consistency check is the backstop). Blocking
+    — call via to_thread.
+
+    This is the other half of "save before you back up". Palworld's `/save`
+    answers as soon as the save is *scheduled*; the world is then written over
+    the next seconds — tens of them, on a big world — so a copy that starts
+    three seconds after the save returns is a copy of a world mid-write. The
+    consistency retries in create() catch that as a torn copy and try again,
+    but every attempt against a long write is torn, so a big world's backups
+    were routinely flagged "may be inconsistent" or failed outright on Windows,
+    where a file the server has open cannot be read at all. Waiting for the
+    files to stop changing means the copy starts after the write ends.
+    """
+    deadline = time.monotonic() + timeout
+    last = _fingerprint(root)
+    stable_since = time.monotonic()
+    while True:
+        time.sleep(poll)
+        now = time.monotonic()
+        current = _fingerprint(root)
+        if current != last:
+            last, stable_since = current, now
+        elif now - stable_since >= quiet_seconds:
+            return True
+        if now >= deadline:
+            return False
 
 
 def read_manifest(backup_root: Path, name: str) -> dict | None:
@@ -364,24 +412,51 @@ def create(
     # Autosaves are minutes apart and the copy takes seconds, so a retry
     # almost always lands clean. If every attempt was dirty, keep the last
     # copy anyway — flagged, because a probably-fine backup beats none.
+    #
+    # A file the server has open is the same event seen from Windows, where
+    # the game's write holds a sharing lock and the copy fails with a
+    # PermissionError (copytree collects it into a shutil.Error at the end)
+    # instead of reading a torn file. That used to fail the whole backup —
+    # "Backup failed: [WinError 32] The process cannot access the file" — on
+    # a server that was merely saving. It is retried like a torn copy is, with
+    # a pause for the write to finish; only the last attempt's failure counts.
     consistent = False
-    for _attempt in range(max(1, consistency_retries + 1)):
+    attempts = max(1, consistency_retries + 1)
+    locked: Exception | None = None
+    for attempt in range(attempts):
         if tmp.exists():
             shutil.rmtree(tmp)  # leftover from a previous failed/dirty attempt
         before = _fingerprint(savegames)
         try:
             shutil.copytree(savegames, tmp)
+        except (shutil.Error, PermissionError) as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            locked = e
+            if attempt + 1 < attempts:
+                time.sleep(_COPY_RETRY_SECONDS)
+            continue
         except BaseException:
             shutil.rmtree(tmp, ignore_errors=True)
             raise
+        locked = None
         if _copy_matches(before, tmp) and _fingerprint(savegames) == before:
             consistent = True
             break
+    if locked is not None:
+        raise locked
 
     os.replace(tmp, dest)
     _write_config_snapshot(dest)
-    _write_manifest(dest, consistent=consistent, flushed=flushed)
-    return Backup(dest.name, dest, _dir_size_mb(dest), datetime.now(), consistent)
+    manifest = _manifest_for(dest, consistent=consistent, flushed=flushed)
+    _write_manifest(dest, manifest)
+    return Backup(
+        dest.name,
+        dest,
+        _dir_size_mb(dest),
+        datetime.now(),
+        consistent,
+        tuple(manifest.get("problems_at_creation") or ()),
+    )
 
 
 def _write_config_snapshot(dest: Path) -> None:

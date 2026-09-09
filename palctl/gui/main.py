@@ -933,6 +933,39 @@ class ConfigTab(QWidget):
             "runs after a successful world backup. Untick to update anyway "
             "when the backup fails — no rollback if the update goes bad."
         )
+        # Scheduled auto-update had no controls here at all: the only way to
+        # turn it on was editing config.json by hand, which the config module
+        # says nobody should have to do.
+        self.sch_auto_update = QCheckBox(checked=cfg.schedule.auto_update)
+        self.sch_auto_update.setToolTip(
+            "Install a server update at the time below, if Steam has one — the "
+            "same backup → SteamCMD → restart flow as the Console's Update "
+            "button, with the same in-game countdown. Nothing happens on "
+            "nights with no update."
+        )
+        self.sch_update_time = NoScrollTimeEdit()
+        uh, _, um = cfg.schedule.auto_update_at.partition(":")
+        try:
+            self.sch_update_time.setTime(QTime(int(uh), int(um or 0)))
+        except ValueError:
+            self.sch_update_time.setTime(QTime(5, 0))
+        self.sch_update_on_detect = QCheckBox(checked=cfg.schedule.auto_update_on_detect)
+        self.sch_update_on_detect.setToolTip(
+            "Update as soon as a new build is found, instead of waiting for the "
+            "time above. Players whose game client has updated are refused "
+            "with a version mismatch until the server catches up, so waiting "
+            "for tonight can mean a day of nobody joining. Same countdown, "
+            "warnings, cancel/skip and pre-update backup as any other update."
+        )
+        self.sch_update_check = NoScrollSpinBox()
+        self.sch_update_check.setRange(10, 24 * 60)
+        self.sch_update_check.setSuffix(" min")
+        self.sch_update_check.setValue(max(10, min(24 * 60, cfg.update_check_minutes)))
+        self.sch_update_check.setToolTip(
+            "How often to ask Steam whether a newer server build exists (an "
+            "anonymous SteamCMD query — no Steam account involved). Each new "
+            "build is announced once."
+        )
         self.sch_restart_cd = NoScrollSpinBox()
         self.sch_restart_cd.setRange(0, countdown.MAX_SECONDS)
         self.sch_restart_cd.setSuffix(" s")
@@ -972,8 +1005,42 @@ class ConfigTab(QWidget):
         sf.addRow("Backup every", self.sch_backup)
         sf.addRow("Backups to keep (local)", self.sch_retain)
         sf.addRow("Copies to keep (mirror)", self.sch_mirror_retain)
+        sf.addRow("Check Steam for server updates every", self.sch_update_check)
+        sf.addRow("Auto-update at a set time", self.sch_auto_update)
+        sf.addRow("At", self.sch_update_time)
+        sf.addRow("Update as soon as one is found", self.sch_update_on_detect)
         sf.addRow("Update requires a backup", self.sch_upd_backup)
         v.addWidget(sch)
+
+        ap = QGroupBox("Auto-pause (empty server)")
+        apf = QFormLayout(ap)
+        self.ap_enabled = QCheckBox(checked=cfg.autopause_enabled)
+        self.ap_idle = NoScrollSpinBox()
+        self.ap_idle.setRange(1, 24 * 60)
+        self.ap_idle.setSuffix(" min")
+        self.ap_idle.setValue(max(1, min(24 * 60, cfg.autopause_idle_minutes)))
+        self.ap_port = NoScrollSpinBox()
+        self.ap_port.setRange(1, 65535)
+        self.ap_port.setValue(cfg.game_port)
+        self.ap_port.setToolTip(
+            "The UDP port the game listens on — its -port launch argument, 8211 "
+            "unless you changed it. palctl listens here while the server is "
+            "asleep so a connection attempt can wake it."
+        )
+        apf.addRow("Put an empty server to sleep", self.ap_enabled)
+        apf.addRow("After nobody has been on for", self.ap_idle)
+        apf.addRow("Game port (UDP)", self.ap_port)
+        ap_help = QLabel(
+            "A Palworld server with nobody on it still burns a core and several "
+            "gigabytes. With this on, palctl saves and <b>stops</b> the server "
+            "once it has been empty for the idle time, then listens on the game "
+            "port: the first connection attempt starts it again. The cost belongs "
+            "to that first player — a stopped server takes about a minute to "
+            "load. Off by default; turning it off is always safe."
+        )
+        ap_help.setWordWrap(True)
+        apf.addRow("", ap_help)
+        v.addWidget(ap)
 
         dc = QGroupBox("Discord bot")
         df = QFormLayout(dc)
@@ -1156,6 +1223,14 @@ class ConfigTab(QWidget):
         c.schedule.backup_retain = self.sch_retain.value()
         c.schedule.mirror_retain = self.sch_mirror_retain.value()
         c.schedule.update_requires_backup = self.sch_upd_backup.isChecked()
+        c.schedule.auto_update = self.sch_auto_update.isChecked()
+        c.schedule.auto_update_at = self.sch_update_time.time().toString("HH:mm")
+        c.schedule.auto_update_on_detect = self.sch_update_on_detect.isChecked()
+        c.update_check_minutes = self.sch_update_check.value()
+
+        c.autopause_enabled = self.ap_enabled.isChecked()
+        c.autopause_idle_minutes = self.ap_idle.value()
+        c.game_port = self.ap_port.value()
 
         c.discord.enabled = self.dc_enabled.isChecked()
         try:

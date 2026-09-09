@@ -55,6 +55,14 @@ class ServerController:
         # `busy` as False and both spawn. reserve() closes that window: it flips
         # busy synchronously, in the same turn as the check, before the task runs.
         self._reserved: str | None = None
+        # Awaited before every service start, whoever asks for it. The daemon
+        # hangs auto-pause's port release here: while the server is asleep
+        # palctl holds the game's UDP port to hear the wake-up knock, and a
+        # PalServer started while it is still held fails to bind and exits —
+        # a sleeping server turned into a dead one by the Start button, a
+        # scheduled restart, an update or auto-recovery. One hook on the one
+        # path every start takes, rather than a release at each of those.
+        self.before_start: Callable[[], Awaitable[None]] | None = None
 
     def reconfigure(self, cfg: Config, api: PalApi) -> None:
         self._cfg = cfg
@@ -171,6 +179,8 @@ class ServerController:
         return await procs.wait_stopped(self._cfg.service_name)
 
     async def start(self) -> bool:
+        if self.before_start is not None:
+            await self.before_start()
         return await procs.start_service(self._cfg.service_name)
 
     async def restart_cycle(

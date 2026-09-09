@@ -7,7 +7,8 @@ Run as a subprocess by fake_service.py:
 The mode file is read on every request, so a test can change the server's
 behaviour mid-flight without restarting anything:
 
-  ok    — answers normally.
+  ok    — answers normally, with one player online.
+  empty — answers normally, with nobody online (what auto-pause acts on).
   slow  — answers, but after a delay long enough to trip a short client timeout.
   hang  — accepts the TCP connection and NEVER responds. This is the important
           one and the reason a mock isn't enough: a wedged PalServer is not a
@@ -58,10 +59,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._should_answer():
             return
+        online = 0 if mode() == "empty" else 1
         if self.path.endswith("/metrics"):
             uptime = int(time.time() - STARTED)
             body = (
-                '{"serverfps":58,"currentplayernum":1,"serverframetime":17.2,'
+                f'{{"serverfps":58,"currentplayernum":{online},"serverframetime":17.2,'
                 f'"maxplayernum":32,"uptime":{uptime},"basecampnum":4,"days":12}}'
             )
         elif self.path.endswith("/players"):
@@ -69,6 +71,7 @@ class Handler(BaseHTTPRequestHandler):
                 '{"players":[{"name":"Ari","accountName":"ari","playerId":"p1",'
                 '"userId":"u1","ip":"10.0.0.5","ping":42.0,"location_x":1.0,'
                 '"location_y":2.0,"level":31,"building_count":88}]}'
+                if online else '{"players":[]}'
             )
         elif self.path.endswith("/info"):
             body = '{"version":"v0.6.1","servername":"sim","description":""}'

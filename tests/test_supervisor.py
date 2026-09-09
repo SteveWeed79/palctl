@@ -147,21 +147,71 @@ def test_needs_service_state_agrees_with_the_branches_that_ignore_it():
     the service state. That shortcut is only safe while these two agree."""
     for desired in (True, False):
         for pending in (True, False):
-            if needs_service_state(desired_running=desired, startup_pending=pending):
-                continue
-            # Whatever the service says, the decision must not depend on it.
-            actions = {
-                decide(
-                    obs(
-                        desired_running=desired,
-                        startup_pending=pending,
-                        service_state=state,
-                    )
-                ).action
-                for state in ("RUNNING", "STOPPED", "UNKNOWN", "START_PENDING")
-            }
-            assert actions <= {Action.STAND_DOWN, Action.AWAIT_STARTUP}
-            assert len(actions) == 1, (desired, pending, actions)
+            for paused in (True, False):
+                if needs_service_state(
+                    desired_running=desired, startup_pending=pending, paused=paused
+                ):
+                    continue
+                # Whatever the service says, the decision must not depend on it.
+                actions = {
+                    decide(
+                        obs(
+                            desired_running=desired,
+                            startup_pending=pending,
+                            paused=paused,
+                            service_state=state,
+                        )
+                    ).action
+                    for state in ("RUNNING", "STOPPED", "UNKNOWN", "START_PENDING")
+                }
+                assert actions <= {Action.STAND_DOWN, Action.AWAIT_STARTUP}
+                assert len(actions) == 1, (desired, pending, paused, actions)
+
+
+# ---------------- a server palctl put to sleep itself ----------------
+#
+# Auto-pause stops the server on purpose and listens for a connection to wake
+# it. To this table that used to look exactly like an admin's Stop in
+# services.msc: STOPPED, palctl not busy, confirmed over several polls — so
+# the pause was "adopted" as deliberate, the intent flipped to stay-down, and
+# the knock that should have woken the server was refused.
+
+
+def test_a_sleeping_server_is_left_asleep_whatever_the_service_says():
+    for state in ("STOPPED", "RUNNING", "UNKNOWN", "START_PENDING"):
+        d = decide(obs(paused=True, service_state=state, external_stop_polls=5))
+        assert d.action is Action.STAND_DOWN, state
+        assert "asleep" in d.why
+
+
+def test_a_sleeping_server_is_never_adopted_as_an_external_stop():
+    """The exact failure: enough STOPPED polls to convince the detector."""
+    d = decide(obs(paused=True, service_state="STOPPED",
+                   external_stop_polls=EXTERNAL_STOP_CONFIRM_POLLS))
+    assert d.action is not Action.ADOPT_EXTERNAL_STOP
+    assert d.action is not Action.CONFIRM_EXTERNAL_STOP
+
+
+def test_a_sleeping_server_is_not_auto_recovered():
+    """Recovery would 'fix' the pause by restarting the server nobody asked for."""
+    d = decide(obs(paused=True, service_state="RUNNING", down_polls=99))
+    assert d.action is not Action.RECOVER
+
+
+def test_a_deliberate_stop_still_outranks_a_pause():
+    """An admin's Stop is the one thing above a pause: if they turned it off,
+    it stays off, sleeping or not."""
+    d = decide(obs(paused=True, desired_running=False))
+    assert d.action is Action.STAND_DOWN
+    assert "meant to be stopped" in d.why
+
+
+def test_paused_defaults_off_so_existing_observations_are_unchanged():
+    assert Observation(**_CRASHED).paused is False
+    assert needs_service_state(desired_running=True, startup_pending=False) is True
+    assert needs_service_state(
+        desired_running=True, startup_pending=False, paused=True
+    ) is False
 
 
 # ---------------- the predicates the table is built from ----------------

@@ -47,6 +47,34 @@ _COUNTDOWN_OPS = frozenset({"restart", "restore", "update"})
 # backups.create exists to avoid.
 _BACKUP_OVERDUE_GRACE = 300.0
 
+# How the pre-backup wait for the world's files to settle is tuned — see
+# backups.wait_for_quiet. Five quiet seconds is longer than the gap between
+# two files of one save being written; two minutes is longer than any save
+# palctl has seen, after which the copy goes ahead and the consistency check
+# is the backstop.
+_SETTLE_QUIET_SECONDS = 5.0
+_SETTLE_TIMEOUT = 120.0
+_SETTLE_POLL = 1.0
+
+# The floor on how often Steam is asked for a newer build. Each check is a
+# SteamCMD run; ten minutes is already far more often than Palworld patches.
+_UPDATE_CHECK_FLOOR = 600.0
+
+
+def update_check_seconds(minutes: object) -> float:
+    """Seconds between server-update checks, from `update_check_minutes`.
+
+    Clamped to the floor above, and a value that isn't a number (a hand-edited
+    config) falls back to hourly rather than raising out of the check loop —
+    a loop that dies over a typo is a server that silently never learns about
+    a patch again.
+    """
+    try:
+        value = float(minutes)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 3600.0
+    return max(_UPDATE_CHECK_FLOOR, value * 60.0)
+
 
 def ini_backup_dir() -> Path:
     """Where the pre-update snapshot of PalWorldSettings.ini is kept.
@@ -126,10 +154,27 @@ class Scheduler:
         control: ServerController | None = None,
         intent_running: Callable[[], bool] | None = None,
         set_intent: Callable[[bool], None] | None = None,
+        is_paused: Callable[[], bool] | None = None,
     ) -> None:
         self._cfg = cfg
         self._api = api
         self._bus = bus
+        # Whether auto-pause has the server asleep (the daemon's `_paused`).
+        # A sleeping server is stopped on purpose and its world is already on
+        # disk, so the loops here treat it differently from a running one — a
+        # scheduled restart of it is pointless, and a backup of it needs no
+        # save. None = never paused (tests and standalone use).
+        self._is_paused = is_paused or (lambda: False)
+        # SteamCMD runs one at a time. Two instances started from the same
+        # directory trip over each other's lock files and app cache, and the
+        # periodic update check landing in the middle of an update — the two
+        # things here that run it — was exactly that collision.
+        self._steam_lock = asyncio.Lock()
+        # The (installed, latest) pair the last "update available" event
+        # described. The check now runs hourly rather than every six, and an
+        # hourly repeat of the same news is a nag, not a notification: each
+        # new build is announced once, and again only when it changes.
+        self._announced_update: tuple[str, str] | None = None
         # The daemon passes its shared controller so scheduled restarts,
         # updates, restores, the watchdog, and auto-recovery all serialise on
         # one lock. Standalone construction (tests) gets a private one.
@@ -173,12 +218,19 @@ class Scheduler:
         self._manifest_warned = False
 
     async def run(self) -> None:
-        await asyncio.gather(
-            self._autosave_loop(),
-            self._backup_loop(),
-            self._daily_restart_loop(),
-            self._auto_update_loop(),
-        )
+        # A TaskGroup, not gather(): when one loop raises, gather() propagates
+        # the exception and leaves the other three running. The daemon's
+        # supervisor then restarts run() — which starts four *more* loops
+        # beside the three survivors, so one crashed restart loop left the
+        # server with two backup loops, two autosave loops and two auto-update
+        # loops, and a third set after the next crash. A TaskGroup cancels
+        # the siblings first, so a restart of run() is a restart of the
+        # scheduler and not a duplication of it.
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(self._autosave_loop())
+            tg.create_task(self._backup_loop())
+            tg.create_task(self._daily_restart_loop())
+            tg.create_task(self._auto_update_loop())
 
     # ---------- autosave ----------
 
@@ -224,21 +276,49 @@ class Scheduler:
         # Clamped above by `interval` so a clock jump can't park the loop.
         return float(min(max(due, _BACKUP_OVERDUE_GRACE), interval))
 
+    @staticmethod
+    def _backup_retry_wait(failures: int, hours: int) -> float:
+        """How long to wait after `failures` consecutive failed backups.
+
+        The wait is measured from the newest backup on disk, and a failed
+        backup leaves that unchanged — so on its own the loop came straight
+        back after the overdue grace: a backup failing for a persistent reason
+        (a full volume, a share that went away, a world the server holds
+        locked) was retried every five minutes, forever, with an error event
+        and a Discord ping each time. Retrying is right; every five minutes is
+        a siren. The pause doubles per failure and never exceeds the interval,
+        so a fixed problem is noticed within an interval either way.
+        """
+        if failures <= 0:
+            return 0.0
+        return min(max(1, hours) * 3600.0, _BACKUP_OVERDUE_GRACE * 2 ** min(failures, 8))
+
     async def _backup_loop(self) -> None:
+        failures = 0
         while True:
             # Local backups run at least once a day: the interval is capped at
             # 24h so a stale or hand-edited config can't push them below the daily
             # floor the GUI enforces.
             hours = backup_interval_hours(self._cfg.schedule.backup_hours)
-            await asyncio.sleep(self._seconds_until_backup_due(hours))
+            await asyncio.sleep(
+                max(
+                    self._seconds_until_backup_due(hours),
+                    self._backup_retry_wait(failures, hours),
+                )
+            )
             if not self._cfg.schedule.enabled or hours <= 0:
                 await self._warn_if_backups_stale(hours)
                 continue
             try:
-                await self.backup_now("scheduled")
-                self._backup_stale_warned = False
+                taken = await self.backup_now("scheduled") is not None
             except Exception as e:
+                taken = False
                 await self._bus.emit(Event("error", f"Scheduled backup failed: {e}"))
+            if taken:
+                failures = 0
+                self._backup_stale_warned = False
+            else:
+                failures += 1
 
     async def _warn_if_backups_stale(self, hours: int) -> None:
         """Alert on the backup that did *not* happen.
@@ -272,12 +352,14 @@ class Scheduler:
             )
         )
 
-    async def backup_now(self, label: str = "manual") -> None:
+    async def backup_now(self, label: str = "manual") -> backups.Backup | None:
+        """Take a backup under the operation lock. The Backup, or None when it
+        failed (already reported) — the scheduled loop needs to know which."""
         # Under the op lock: a backup mid-restore would copy a half-swapped
         # SaveGames. update/restore call _do_backup directly from inside their
         # own operation instead (the lock is not reentrant).
         async with self._control.operation("backup"):
-            await self._do_backup(label)
+            return await self._do_backup(label)
 
     async def _do_backup(self, label: str = "manual") -> backups.Backup | None:
         try:
@@ -288,7 +370,15 @@ class Scheduler:
             # unflushed world and file it as a clean backup. Now the copy still
             # happens (an older world beats no world) but it is announced, and
             # recorded in the backup's manifest so a restore can say so too.
-            flushed = await self._control.save_best_effort(settle=3)
+            #
+            # A server auto-pause has put to sleep needs none of this: it was
+            # saved and then stopped cleanly, so the world on disk is already
+            # the whole world — and asking its silent API would only produce
+            # the warning below about a save that wasn't needed.
+            if self._is_paused():
+                flushed: bool | None = True
+            else:
+                flushed = await self._control.save_best_effort(settle=3)
             if not flushed:
                 await self._bus.emit(
                     Event(
@@ -296,6 +386,28 @@ class Scheduler:
                         "⚠️ Couldn't save before this backup — the server's API "
                         "didn't answer. Backing up anyway; the world may be a "
                         "few minutes older than this backup's timestamp.",
+                    )
+                )
+            # /save returns as soon as the save is scheduled; the write itself
+            # follows, for tens of seconds on a big world. Wait for the files
+            # to stop changing before copying them — see backups.wait_for_quiet
+            # for what a copy taken during that write used to look like.
+            settled = await asyncio.to_thread(
+                functools.partial(
+                    backups.wait_for_quiet,
+                    self._cfg.savegames_dir,
+                    quiet_seconds=_SETTLE_QUIET_SECONDS,
+                    timeout=_SETTLE_TIMEOUT,
+                    poll=_SETTLE_POLL,
+                )
+            )
+            if not settled:
+                await self._bus.emit(
+                    Event(
+                        "backup",
+                        "The world was still being written two minutes after the "
+                        "save — backing up anyway (the copy is checked for "
+                        "consistency and retried if it was torn).",
                     )
                 )
 
@@ -356,6 +468,24 @@ class Scheduler:
                         "actively writing the world, so it may be internally "
                         "inconsistent. It is kept and probably fine — but "
                         "prefer the backup before or after it for a restore.",
+                    )
+                )
+            if b.problems:
+                # The copy is faithful — the *world* is what's damaged. This
+                # is the earliest anyone can hear that a save is truncated or
+                # empty: before the server fails to load it, and while an
+                # older, intact backup still exists to go back to.
+                shown = "; ".join(b.problems[:3])
+                more = f" (+{len(b.problems) - 3} more)" if len(b.problems) > 3 else ""
+                await self._bus.emit(
+                    Event(
+                        "error",
+                        f"⚠️ Backup `{b.name}` copied {len(b.problems)} damaged "
+                        f"save file(s) from the live world: {shown}{more}. The "
+                        "backup is an exact copy — the damage is in the server's "
+                        "own save. Check the world now, while an older backup "
+                        "still exists to restore.",
+                        {"name": b.name, "problems": list(b.problems)},
                     )
                 )
             return b
@@ -535,6 +665,18 @@ class Scheduler:
                         "stopped on purpose. Start it and it'll resume tomorrow.",
                     )
                 )
+            elif self._is_paused():
+                # A sleeping server holds no leaked memory and no players: a
+                # restart would only wake it for nobody. It starts fresh for
+                # whoever connects next, which is what the restart was for.
+                await self._bus.emit(
+                    Event(
+                        "restart",
+                        "💤 Skipped the scheduled restart — the server is asleep "
+                        "(auto-pause), so it will start fresh for the next player "
+                        "anyway.",
+                    )
+                )
             else:
                 # An empty server collapses the countdown to a few seconds, and
                 # a restart that then ran immediately would happen a full lead
@@ -646,7 +788,16 @@ class Scheduler:
             # players bouncing off the join screen. Say so once per daemon run.
             await self._warn_unreadable_manifest()
             return False
-        latest = await steamcmd.latest_buildid(cfg.steamcmd_path, cfg.app_id)
+        if self._steam_lock.locked():
+            # SteamCMD is busy — an update is being installed, or another check
+            # is mid-query. Its result refreshes the status when it finishes;
+            # starting a second SteamCMD beside it is the collision the lock
+            # exists to prevent. The standing answer is the best one for now.
+            return self.update_status.get("state") == "behind"
+        async with self._steam_lock:
+            latest = await steamcmd.latest_buildid(
+                cfg.steamcmd_path, cfg.app_id, branch=cfg.steam_branch
+            )
         if not latest:
             self._record_update_status(
                 state="unknown", installed=installed,
@@ -657,12 +808,17 @@ class Scheduler:
             state="behind" if installed != latest else "current",
             installed=installed, latest=latest,
         )
-        if latest and installed != latest:
+        if installed == latest:
+            self._announced_update = None  # a later new build is news again
+            return False
+        if self._announced_update != (installed, latest):
+            self._announced_update = (installed, latest)
+            branch = f" on the `{cfg.steam_branch}` branch" if cfg.steam_branch else ""
             await self._bus.emit(
                 Event(
                     "update_available",
-                    f"⬆️ A Palworld server update is available (installed build "
-                    f"{installed}, latest {latest}). Once Steam updates a "
+                    f"⬆️ A Palworld server update is available{branch} (installed "
+                    f"build {installed}, latest {latest}). Once Steam updates a "
                     "player's game client, they'll be refused with a **version "
                     "mismatch** until the server is on the same build — so don't "
                     "leave this long. Use `/update` or the Console **Update** "
@@ -670,8 +826,38 @@ class Scheduler:
                     {"installed": installed, "latest": latest},
                 )
             )
-            return True
-        return False
+        return True
+
+    async def update_when_available(self) -> bool:
+        """The periodic check, plus the opt-in follow-through: when a newer
+        build exists and `auto_update_on_detect` is on, install it now — the
+        same countdown, warnings, escape hatches and pre-update backup as
+        every other update — instead of announcing it and waiting for
+        `auto_update_at`.
+
+        Returns whether an update ran. The check itself is what it always
+        was: a comparison and, at most, one announcement per new build. What
+        this adds is that "palctl knows an update is out" and "the server is
+        on it" stop being up to a day apart, which for a game whose clients
+        update themselves is the difference between players joining tonight
+        and players bouncing off a version mismatch until tomorrow morning.
+
+        Refuses, quietly, when the server was stopped on purpose (an admin
+        doing maintenance is not to be surprised by SteamCMD) or when
+        something already holds the operation lock (a restore, a countdown):
+        the next check comes round soon enough, and the announcement already
+        went out.
+        """
+        available = await self.check_update_available()
+        if not available:
+            return False
+        sch = self._cfg.schedule
+        if not (sch.enabled and sch.auto_update_on_detect):
+            return False
+        if self._intentionally_stopped() or self._control.busy:
+            return False
+        await self.update_server()
+        return True
 
     def _record_update_status(
         self,
@@ -1332,7 +1518,9 @@ class Scheduler:
                 )
             )
             return False
-        latest = await steamcmd.latest_buildid(cfg.steamcmd_path, cfg.app_id)
+        latest = await steamcmd.latest_buildid(
+            cfg.steamcmd_path, cfg.app_id, branch=cfg.steam_branch
+        )
         if not latest:
             # Offline / steamcmd trouble: nothing to compare against. The build
             # on disk is still worth recording — it's newer than whatever the
@@ -1445,41 +1633,49 @@ class Scheduler:
                     latest.append(line)
                     del latest[:-1]  # keep only the most recent line
 
-            try:
-                code = await steamcmd.run_update_async(
-                    cfg.steamcmd_path,
-                    cfg.server_root,
-                    app_id=cfg.app_id,
-                    validate=validate,
-                    on_line=sink,
-                    branch=cfg.steam_branch,
-                    beta_password=cfg.steam_beta_password,
-                )
-            finally:
-                # Whatever the update did to the ini, put it right before the
-                # server comes back up. Runs on failure too — a SteamCMD that
-                # died halfway is exactly when the ini is half-rewritten.
-                await self._heal_ini_after_update(cfg, ini, ini_backup)
+            # The one SteamCMD at a time — the periodic update check skips its
+            # own query while this is held rather than starting a second
+            # SteamCMD in the same directory mid-download.
+            async with self._steam_lock:
+                try:
+                    code = await steamcmd.run_update_async(
+                        cfg.steamcmd_path,
+                        cfg.server_root,
+                        app_id=cfg.app_id,
+                        validate=validate,
+                        on_line=sink,
+                        branch=cfg.steam_branch,
+                        beta_password=cfg.steam_beta_password,
+                    )
+                finally:
+                    # Whatever the update did to the ini, put it right before
+                    # the server comes back up. Runs on failure too — a
+                    # SteamCMD that died halfway is exactly when the ini is
+                    # half-rewritten.
+                    await self._heal_ini_after_update(cfg, ini, ini_backup)
 
-            tail = f" ({latest[0]})" if latest else ""
-            after = await asyncio.to_thread(
-                steamcmd.installed_buildid, cfg.server_root, cfg.app_id
-            )
-            build = ""
-            if after and after != before:
-                build = f" Build {before or 'unknown'} → {after}."
-            elif after:
-                build = f" Build {after} (unchanged)."
-            await self._bus.emit(
-                Event(
-                    "update",
-                    (f"✅ SteamCMD finished (exit {code}).{tail}" if code == 0
-                     else f"⚠️ SteamCMD exited {code}.{tail}")
-                    + build + " Starting server.",
-                    {"exit_code": code, "build_before": before, "build_after": after},
+                tail = f" ({latest[0]})" if latest else ""
+                after = await asyncio.to_thread(
+                    steamcmd.installed_buildid, cfg.server_root, cfg.app_id
                 )
-            )
-            await self._verify_update_landed(cfg, before=before, after=after)
+                build = ""
+                if after and after != before:
+                    build = f" Build {before or 'unknown'} → {after}."
+                elif after:
+                    build = f" Build {after} (unchanged)."
+                await self._bus.emit(
+                    Event(
+                        "update",
+                        (f"✅ SteamCMD finished (exit {code}).{tail}" if code == 0
+                         else f"⚠️ SteamCMD exited {code}.{tail}")
+                        + build + " Starting server.",
+                        {"exit_code": code, "build_before": before, "build_after": after},
+                    )
+                )
+                await self._verify_update_landed(cfg, before=before, after=after)
+            # The build on disk is what the next announcement compares
+            # against; whatever was announced before this update is history.
+            self._announced_update = None
         except Exception as e:
             # Without this, a GUI- or bot-triggered update that throws would
             # restart the server and announce success with no trace of the

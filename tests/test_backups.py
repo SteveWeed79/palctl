@@ -288,6 +288,115 @@ def test_create_keeps_but_flags_a_never_quiet_backup(tmp_path: Path, monkeypatch
     assert [x.name for x in backups.listing(root)] == [b.name]
 
 
+def test_create_retries_when_the_server_holds_a_file_open(tmp_path: Path, monkeypatch):
+    """Windows: the game's save write holds a sharing lock, and copytree fails
+    with a PermissionError (collected into a shutil.Error) instead of reading a
+    torn file. That used to fail the whole backup on a server that was merely
+    saving; it is the same event as a torn copy and gets the same retry."""
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+    monkeypatch.setattr(backups, "_COPY_RETRY_SECONDS", 0.0)
+
+    real_copytree = backups.shutil.copytree
+    attempts: list[int] = []
+
+    def locked_on_first_attempt(src, dst, *a, **kw):
+        if Path(src) != sg:
+            return real_copytree(src, dst, *a, **kw)
+        attempts.append(1)
+        if len(attempts) == 1:
+            real_copytree(src, dst, *a, **kw)  # copytree copies what it can...
+            raise shutil.Error([  # ...and reports the locked file at the end
+                (str(sg / "0/world/Level.sav"), str(Path(dst) / "0/world/Level.sav"),
+                 "[Errno 13] Permission denied"),
+            ])
+        return real_copytree(src, dst, *a, **kw)
+
+    monkeypatch.setattr(backups.shutil, "copytree", locked_on_first_attempt)
+    b = backups.create(sg, root, "scheduled")
+
+    assert len(attempts) == 2
+    assert b.consistent is True
+    assert (b.path / "0" / "world" / "Level.sav").read_bytes() == b"x" * 1024
+    assert [x.name for x in backups.listing(root)] == [b.name]  # no .partial left
+
+
+def test_create_gives_up_on_a_file_that_stays_locked(tmp_path: Path, monkeypatch):
+    """A lock that never clears (a hung server, an antivirus with the world
+    open) is still a failed backup — reported as one, with nothing on disk
+    pretending otherwise."""
+    sg = make_savegames(tmp_path)
+    root = tmp_path / "backups"
+    monkeypatch.setattr(backups, "_COPY_RETRY_SECONDS", 0.0)
+    attempts: list[int] = []
+
+    def always_locked(src, dst, *a, **kw):
+        attempts.append(1)
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(backups.shutil, "copytree", always_locked)
+    with pytest.raises(PermissionError):
+        backups.create(sg, root, "scheduled", consistency_retries=2)
+
+    assert len(attempts) == 3  # every attempt was made before giving up
+    assert backups.listing(root) == []
+    assert not any(root.iterdir())
+
+
+def test_wait_for_quiet_returns_once_writing_stops(tmp_path: Path):
+    """The pre-backup save returns before the write finishes. The copy has to
+    wait for the files to stop changing, not for a fixed few seconds."""
+    import threading
+    import time as _time
+
+    sg = make_savegames(tmp_path)
+    target = sg / "0" / "world" / "Level.sav"
+    stop_writing_at = _time.monotonic() + 0.6
+
+    def writer():
+        i = 0
+        while _time.monotonic() < stop_writing_at:
+            target.write_bytes(b"w" * (1024 + i))
+            i += 1
+            _time.sleep(0.05)
+
+    t = threading.Thread(target=writer)
+    t.start()
+    began = _time.monotonic()
+    quiet = backups.wait_for_quiet(sg, quiet_seconds=0.3, timeout=10.0, poll=0.05)
+    t.join()
+
+    assert quiet is True
+    assert _time.monotonic() - began >= 0.6, "it must not report quiet mid-write"
+
+
+def test_wait_for_quiet_gives_up_at_the_timeout(tmp_path: Path):
+    import threading
+    import time as _time
+
+    sg = make_savegames(tmp_path)
+    target = sg / "0" / "world" / "Level.sav"
+    stop = threading.Event()
+
+    def writer():
+        i = 0
+        while not stop.is_set():
+            target.write_bytes(b"w" * (1024 + i))
+            i += 1
+            _time.sleep(0.05)
+
+    t = threading.Thread(target=writer)
+    t.start()
+    try:
+        began = _time.monotonic()
+        quiet = backups.wait_for_quiet(sg, quiet_seconds=1.0, timeout=0.5, poll=0.05)
+        assert quiet is False
+        assert _time.monotonic() - began < 3.0
+    finally:
+        stop.set()
+        t.join()
+
+
 def test_create_flags_a_torn_copy_even_when_source_looks_quiet(tmp_path: Path, monkeypatch):
     # The other tear: the copy itself is short (a file the server replaced
     # mid-read) while the source fingerprint happens to match afterwards.

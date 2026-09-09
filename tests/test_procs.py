@@ -14,6 +14,16 @@ import pytest
 from palctl import procs
 
 
+@pytest.fixture(autouse=True)
+def _fresh_cpu_sampler():
+    """The CPU sampler remembers processes by (pid, create_time) across calls
+    — the point of it — and the fakes below all share a pid. Start each test
+    with nothing remembered."""
+    procs._forget_cpu_history()
+    yield
+    procs._forget_cpu_history()
+
+
 def test_parse_sc_state():
     assert procs._parse_sc_state("        STATE              : 4  RUNNING") == "RUNNING"
     assert procs._parse_sc_state("        STATE              : 1  STOPPED") == "STOPPED"
@@ -188,8 +198,17 @@ class _FakeMetricsProc:
         self.pid = pid
         self._cpu = cpu_raw
         self.cpu_interval = None
+        self.cpu_percent_calls = 0
         self.in_oneshot = False
         self.cpu_sampled_in_oneshot = None
+        # CPU seconds consumed so far, as cpu_times() reports it. Tests advance
+        # it to model a process doing work between two readings.
+        self.busy_seconds = 100.0
+
+    def cpu_times(self):
+        return types.SimpleNamespace(
+            user=self.busy_seconds, system=0.0, children_user=0.0, children_system=0.0
+        )
 
     def oneshot(self):
         import contextlib
@@ -209,6 +228,7 @@ class _FakeMetricsProc:
 
     def cpu_percent(self, interval=None):
         self.cpu_interval = interval
+        self.cpu_percent_calls += 1
         self.cpu_sampled_in_oneshot = self.in_oneshot
         # A real window yields a real number; without one, mimic psutil's 0.0.
         return self._cpu if interval else 0.0
@@ -249,6 +269,66 @@ def test_proc_stats_samples_cpu_outside_oneshot(monkeypatch):
 def test_proc_stats_returns_none_when_server_stopped(monkeypatch):
     monkeypatch.setattr(procs, "_find_server", lambda root=None: (None, False, 0))
     assert procs.proc_stats() is None
+
+
+# ---------- the sampler's window (the jumpy-and-slow CPU reading) ----------
+#
+# A 0.3 s window on every call is a coin toss for a tick-based server and a
+# 0.3 s stall for every caller. After the first reading the sampler diffs CPU
+# time across calls instead, so the window is however long it has been since
+# anyone last asked — and nothing blocks.
+
+
+def _age_last_reading(proc, seconds: float) -> None:
+    """Pretend the sampler's last reading of `proc` was `seconds` ago."""
+    key = (proc.pid, proc.create_time())
+    busy, at, cores = procs._cpu_seen[key]
+    procs._cpu_seen[key] = (busy, at - seconds, cores)
+
+
+def test_a_second_reading_diffs_cpu_time_instead_of_blocking(monkeypatch):
+    proc = _FakeMetricsProc(cpu_raw=100.0)
+    monkeypatch.setattr(procs, "_find_server", lambda root=None: (proc, False, 1))
+    monkeypatch.setattr(procs.psutil, "cpu_count", lambda: 4)
+
+    first = procs.proc_stats()
+    assert first.cpu_cores == 1.0 and proc.cpu_percent_calls == 1
+
+    # Ten seconds pass, during which the process burns five CPU-seconds: that
+    # is half a core, read from cpu_times() with no window slept at all.
+    _age_last_reading(proc, 10.0)
+    proc.busy_seconds += 5.0
+    second = procs.proc_stats()
+    assert proc.cpu_percent_calls == 1, "a second reading must not block on a window"
+    assert abs(second.cpu_cores - 0.5) < 0.01, second
+    assert abs(second.cpu_percent - 12.5) < 0.3, second  # half a core of four
+
+
+def test_two_readings_back_to_back_share_the_last_answer(monkeypatch):
+    """The dashboard, the poll loop and the bot can land within the same
+    second. A window that short means nothing; they get the last answer."""
+    proc = _FakeMetricsProc(cpu_raw=60.0)
+    monkeypatch.setattr(procs, "_find_server", lambda root=None: (proc, False, 1))
+    monkeypatch.setattr(procs.psutil, "cpu_count", lambda: 2)
+
+    first = procs.proc_stats()
+    proc.busy_seconds += 50.0  # would read as absurd over a ~0 s window
+    second = procs.proc_stats()
+    assert second.cpu_cores == first.cpu_cores == 0.6
+    assert proc.cpu_percent_calls == 1
+
+
+def test_a_restarted_server_is_measured_afresh(monkeypatch):
+    """A new process (new pid/create_time) has no history: it gets its own
+    first-read window rather than a diff against the old process's counters."""
+    old = _FakeMetricsProc(pid=100, cpu_raw=100.0)
+    new = _FakeMetricsProc(pid=200, cpu_raw=30.0)
+    monkeypatch.setattr(procs.psutil, "cpu_count", lambda: 1)
+    monkeypatch.setattr(procs, "_find_server", lambda root=None: (old, False, 1))
+    assert procs.proc_stats().cpu_cores == 1.0
+    monkeypatch.setattr(procs, "_find_server", lambda root=None: (new, False, 1))
+    assert procs.proc_stats().cpu_cores == 0.3
+    assert new.cpu_percent_calls == 1
 
 
 # ---------- force-kill escalation primitives ----------
@@ -644,6 +724,16 @@ def test_a_real_busy_server_reads_as_about_one_core(tmp_path):
         # The rendered string is the actual deliverable.
         assert procs.format_cpu(stats.cpu_cores, stats.cpu_percent).endswith("%)")
         assert not procs.format_cpu(stats.cpu_cores, stats.cpu_percent).startswith("0.0 ")
+
+        # The second reading is the one every later poll takes: a diff of CPU
+        # time over the seconds since the first, with no window slept. It must
+        # come back at once and still read as about one core.
+        time.sleep(1.2)
+        t0 = time.monotonic()
+        again = procs.proc_stats()
+        assert time.monotonic() - t0 < 0.25, "a repeat reading must not block"
+        assert again is not None and again.pid == proc.pid
+        assert 0.3 < again.cpu_cores < 2.0, again
     finally:
         proc.kill()
         proc.wait(timeout=10)

@@ -27,7 +27,17 @@ from pathlib import Path
 
 from aiohttp import web
 
-from . import backups, countdown, inifile, leak, localauth, netinfo, procs, supervisor
+from . import (
+    autopause,
+    backups,
+    countdown,
+    inifile,
+    leak,
+    localauth,
+    netinfo,
+    procs,
+    supervisor,
+)
 from . import metrics as metrics_mod
 from .alerts import WebhookAlerter
 from .api import PalApi, PalApiError, PalApiUnauthorized
@@ -88,6 +98,14 @@ _STATE_PATH = config_dir() / "daemon_state.json"
 _WORKER_RESTART_BUDGET = 3
 _WORKER_RESTART_BACKOFF = (5.0, 30.0, 120.0, 600.0)
 
+# How often auto-pause looks at the server. Not the poll interval: the idle
+# clock runs in minutes, and nothing here needs to be prompt except the wake,
+# which a player's connection attempt will retry anyway.
+AUTOPAUSE_TICK = 15.0
+# Where the wake-up listener binds while the server is asleep. All interfaces,
+# because players arrive from the LAN and from the internet alike.
+KNOCK_HOST = "0.0.0.0"
+
 
 def _read_state() -> dict:
     try:
@@ -135,6 +153,20 @@ def _load_ever_alive() -> bool:
 
 def _save_ever_alive(value: bool) -> None:
     _write_state(ever_alive=value)
+
+
+def _load_paused() -> bool:
+    """Whether auto-pause had the server asleep when the daemon last ran.
+
+    Persisted for the same reason the Stop intent is: the pause is palctl's
+    own state, and a daemon that forgot it on restart saw a STOPPED service
+    it was meant to be running, with nothing listening on the game port — so
+    the server stayed asleep with no way to wake it until a human noticed."""
+    return bool(_read_state().get("paused", False))
+
+
+def _save_paused(value: bool) -> None:
+    _write_state(paused=value)
 
 
 def _tail_log_file(n: int) -> str:
@@ -309,8 +341,25 @@ class Daemon:
             # the same property setter the GUI/CLI use, so auto-recovery never
             # fights a stop issued from Discord.
             set_intent=lambda running: setattr(self, "_desired_running", running),
+            # A sleeping server needs no save before a backup and no scheduled
+            # restart; the scheduler asks rather than guessing from the
+            # service state, which looks the same for an admin's Stop.
+            is_paused=lambda: self._paused,
         )
         self.watchdog = Watchdog(self.cfg, self.api, self.bus, self.control)
+
+        # Auto-pause. The decision is autopause.decide; the daemon owns the
+        # clock, the listener and the two transitions (see _autopause_tick).
+        # Persisted, like the Stop intent, so a daemon restart mid-sleep goes
+        # back to listening instead of leaving a server nobody can wake.
+        self._knock = autopause.KnockListener()
+        self._paused = _load_paused()
+        self._empty_since: float | None = None  # monotonic; None = not empty
+        self._woke_at = 0.0                      # monotonic; 0 = never woken
+        # Every path that starts the server — Start, restart, update, restore,
+        # recovery, the boot-time start — goes through the controller, and a
+        # server started while palctl still holds its UDP port dies at bind.
+        self.control.before_start = self._release_knock_port
         self.bot = None  # set by run_bot if the Discord bot is enabled
         # The run_bot task. reload-config relaunches it when it has finished
         # (bot was disabled / token missing or rejected at the last attempt),
@@ -734,7 +783,11 @@ class Daemon:
                 1, self.cfg.watchdog.crash_confirm_polls
             ):
                 await self.tracker.handle_server_down()
-                await self.bus.emit(Event("server_down", "🔴 Server is **down**."))
+                # A server auto-pause just put to sleep is not down: the pause
+                # announced itself, and "🔴 Server is down" on top of it would
+                # send the admin looking for an outage that isn't one.
+                if not self._paused:
+                    await self.bus.emit(Event("server_down", "🔴 Server is **down**."))
                 self._alive = False
                 # Don't keep serving the last-seen FPS/frametime/uptime next to a
                 # server that's down — /state would read as if it were still up.
@@ -986,6 +1039,7 @@ class Daemon:
         needs_state = supervisor.needs_service_state(
             desired_running=self._desired_running,
             startup_pending=self._boot_intent_pending,
+            paused=self._paused,
         )
         obs = Observation(
             # ttl=0: never decide from the display cache. That cache exists so
@@ -1010,6 +1064,7 @@ class Daemon:
             recent_restarts=len(self._autorestart_times),
             confirm_polls=wd.crash_confirm_polls,
             restart_cap=wd.crash_restart_max_per_hour,
+            paused=self._paused,
         )
         decision = supervisor.decide(obs)
         self._decide(decision.action.value, decision.why)
@@ -1109,6 +1164,202 @@ class Daemon:
                 )
         except Exception as e:
             await self.bus.emit(Event("error", f"Auto-recover failed: {e}"))
+
+    # ---------- auto-pause ----------
+    #
+    # Put an empty server away; wake it when somebody knocks. The policy is
+    # autopause.decide, pure; this is the clock it needs, the listener that
+    # hears the knock, and the two transitions. Off by default, and every
+    # branch here fails toward *running* — see the module docstring for why a
+    # half-working auto-pause is worse than none.
+    #
+    # The daemon's other machinery has to know about a pause, because from the
+    # outside it looks exactly like an admin stopping the server in
+    # services.msc: the poll loop would announce an outage, the supervisor
+    # would adopt the stop as deliberate and refuse the wake, and a backup
+    # would warn that the save before it failed. Each of those asks
+    # `_paused` instead.
+
+    def _set_paused(self, value: bool) -> None:
+        self._paused = value
+        _save_paused(value)
+
+    async def _autopause_loop(self) -> None:
+        # A daemon that restarts while the server is asleep must go back to
+        # listening, or nobody can wake it — see _load_paused.
+        if self._paused:
+            await self._resume_listening()
+        while True:
+            await asyncio.sleep(AUTOPAUSE_TICK)
+            try:
+                await self._autopause_tick()
+            except Exception as e:
+                self.log.warning("auto-pause tick failed: %s", e)
+
+    async def _resume_listening(self) -> None:
+        cfg = self.cfg
+        if not (cfg.autopause_enabled and self._desired_running):
+            # Switched off, or stopped on purpose, while the daemon was down:
+            # not asleep any more, whatever the state file says. The tick
+            # below wakes a server that should be running.
+            self._set_paused(False)
+            return
+        if await self._knock.start(KNOCK_HOST, cfg.game_port):
+            self.log.info(
+                "auto-pause: the server was asleep when the daemon last ran — "
+                "listening on UDP %d for a connection again", cfg.game_port,
+            )
+            return
+        # The port is taken. The likeliest holder is the server itself,
+        # started by hand while the daemon was down — so it isn't asleep.
+        self.log.warning(
+            "auto-pause: the server was recorded asleep but UDP %d is in use "
+            "(%s) — treating it as awake", cfg.game_port, self._knock.error,
+        )
+        self._set_paused(False)
+
+    async def _autopause_tick(self) -> None:
+        cfg = self.cfg
+        now = time.monotonic()
+        # None when the API isn't answering: "nobody is on" and "I can't tell"
+        # lead opposite ways, and decide() keeps them apart.
+        players: int | None = len(self.tracker.online) if self._alive else None
+        if players:
+            self._empty_since = None
+        elif players == 0 and self._empty_since is None:
+            self._empty_since = now
+
+        if not cfg.autopause_enabled:
+            if self._paused or self._knock.listening:
+                # Turned off while the server was asleep. Fail safe toward
+                # running: wake it — unless an admin has since stopped it on
+                # purpose, in which case only the listener goes.
+                if self._desired_running:
+                    await self._wake("auto-pause was turned off")
+                else:
+                    await self._release_knock_port()
+            return
+
+        obs = autopause.Observation(
+            enabled=True,
+            paused=self._paused,
+            knocked=self._knock.knocked,
+            players=players,
+            alive=bool(self._alive),
+            service_state=await self._service_state_cached(),
+            operation=self.control.current_op,
+            desired_running=self._desired_running,
+            empty_seconds=(now - self._empty_since) if self._empty_since is not None else 0.0,
+            # A floor of a minute, whatever the config says: a server that
+            # empties between two friends' sessions must not spend that gap
+            # restarting for the second one.
+            idle_after_seconds=max(60, int(cfg.autopause_idle_minutes) * 60),
+            since_wake_seconds=(now - self._woke_at) if self._woke_at else 1e9,
+        )
+        decision = autopause.decide(obs)
+        # Only the transitions are recorded: a HOLD every fifteen seconds
+        # would bury the supervisor's own reasoning, which is what the
+        # decision log and the dashboard's "why" strip exist to show.
+        if decision.action is autopause.Action.PAUSE:
+            await self._pause(decision.why)
+        elif decision.action is autopause.Action.WAKE:
+            await self._wake(decision.why)
+
+    async def _pause(self, why: str) -> None:
+        op = self.control.try_operation("auto-pause")
+        if op is None:
+            return  # something else has the server; decide() re-asks next tick
+        port = self.cfg.game_port
+        async with op:
+            self._decide("autopause_sleep", why)
+            await self.bus.emit(
+                Event(
+                    "server_down",
+                    f"💤 {why[0].upper()}{why[1:]} — putting the server to sleep. "
+                    "The first connection attempt wakes it (allow a minute for "
+                    "it to load).",
+                    {"action": "autopause"},
+                )
+            )
+            # Marked asleep before the stop, not after: the poll loop notices
+            # the API going silent within seconds, and must already know this
+            # is a pause rather than announce an outage. Undone on any failure.
+            self._paused = True
+            await self.control.save_best_effort(settle=3)
+            if not await self.control.stop():
+                self._paused = False
+                await self.bus.emit(
+                    Event(
+                        "error",
+                        "⚠️ Auto-pause couldn't stop the server (it never confirmed "
+                        "STOPPED) — leaving it running.",
+                        {"action": "autopause_failed"},
+                    )
+                )
+                return
+            if not await self._knock.start(KNOCK_HOST, port):
+                self._paused = False
+                await self.bus.emit(
+                    Event(
+                        "error",
+                        f"⚠️ Auto-pause stopped the server but can't listen on UDP "
+                        f"port {port} ({self._knock.error}). A server put away "
+                        "with no way to wake it is one nobody can reach, so it is "
+                        "being started again — check `game_port` in Config.",
+                        {"action": "autopause_failed"},
+                    )
+                )
+                await self.control.start()
+                return
+            self._set_paused(True)
+            self._empty_since = None
+
+    async def _wake(self, why: str) -> None:
+        op = self.control.try_operation("auto-pause")
+        if op is None:
+            return
+        async with op:
+            self._decide("autopause_wake", why)
+            await self.bus.emit(
+                Event(
+                    "server_up",
+                    f"⏰ {why[0].upper()}{why[1:]} — waking the server (it takes "
+                    "a minute to load).",
+                    {"action": "autowake"},
+                )
+            )
+            # start() runs _release_knock_port first: the port is handed back
+            # and the pause is cleared before the service is asked to start.
+            if not await self.control.start():
+                await self.bus.emit(
+                    Event(
+                        "error",
+                        "⚠️ The server didn't reach RUNNING after being woken. "
+                        "Check it — or use Start.",
+                        {"action": "autowake_failed"},
+                    )
+                )
+
+    async def _release_knock_port(self) -> None:
+        """ServerController.before_start: hand the game its port back.
+
+        Waits for the port to actually become bindable (KnockListener.stop
+        confirms it) — a transport close is asynchronous, and a PalServer
+        started a turn too early finds the port held and exits, turning a
+        sleeping server into a dead one on the one path nobody is watching.
+        """
+        if not self._paused and not self._knock.listening:
+            return
+        port = self.cfg.game_port
+        if not await self._knock.stop(KNOCK_HOST, port):
+            self.log.warning(
+                "auto-pause: UDP %d was not released in time — the server may "
+                "fail to bind it", port,
+            )
+        if self._paused:
+            self._set_paused(False)
+            self._woke_at = time.monotonic()
+        self._empty_since = None
 
     # ---------- leak forecasting ----------
 
@@ -1283,6 +1534,11 @@ class Daemon:
                 {
                     "service": service,
                     "alive": self._alive,
+                    # True while auto-pause has the server asleep: STOPPED and
+                    # not answering, on purpose, and waking on the first
+                    # connection. Without it every surface would read the
+                    # same state as an outage or an admin's Stop.
+                    "paused": self._paused,
                     "restarting": self.watchdog.is_restarting,
                     "operation": self.control.current_op,
                     # The live restart/restore countdown, or None. Published so
@@ -1641,6 +1897,7 @@ class Daemon:
             ("update check", self._update_check_loop),
             ("disk watch", self._disk_loop),
             ("liveness", self._liveness_loop),
+            ("auto-pause", self._autopause_loop),
         ):
             self._spawn(self._supervised(name, factory))
 
@@ -1699,6 +1956,10 @@ class Daemon:
             await runner.cleanup()
         with contextlib.suppress(Exception):
             await self.api.aclose()
+        # The pause itself is persisted and resumes on the next start; only the
+        # socket needs closing here.
+        with contextlib.suppress(Exception):
+            await self._knock.stop()
         with contextlib.suppress(Exception):
             await asyncio.to_thread(self.store.close)
         self.log.info("shutdown complete")
@@ -1880,15 +2141,22 @@ class Daemon:
                 self.log.warning("disk check failed: %s", e)
 
     async def _update_check_loop(self) -> None:
-        """Ask Steam whether a newer server build exists, a couple of minutes
-        after start and then every few hours. Purely a notification."""
+        """Ask Steam whether a newer server build exists — a couple of minutes
+        after start, then every `update_check_minutes` (hourly by default; it
+        was every six hours, which for a game whose clients update themselves
+        could mean most of a day of players being refused with a version
+        mismatch before palctl even knew). An anonymous SteamCMD metadata
+        query, announced once per new build — and, if `auto_update_on_detect`
+        is on, followed by the update itself."""
+        from .scheduler import update_check_seconds
+
         await asyncio.sleep(120)
         while True:
             try:
-                await self.scheduler.check_update_available()
+                await self.scheduler.update_when_available()
             except Exception as e:
                 self.log.warning("server update check failed: %s", e)
-            await asyncio.sleep(6 * 3600)
+            await asyncio.sleep(update_check_seconds(self.cfg.update_check_minutes))
 
     async def _check_palctl_update(self) -> None:
         from . import __version__, selfupdate

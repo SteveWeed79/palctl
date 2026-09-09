@@ -204,8 +204,10 @@ def _format_schedule(schedule, now: datetime) -> str:
     if schedule.auto_update:
         nxt = next_daily(now, schedule.auto_update_at, 5)
         lines.append(f"⏬ Auto-update at **{schedule.auto_update_at}** — next {nxt:%a %H:%M}")
-    else:
+    elif not getattr(schedule, "auto_update_on_detect", False):
         lines.append("⏬ Auto-update: off")
+    if getattr(schedule, "auto_update_on_detect", False):
+        lines.append("⏬ Auto-update: **as soon as a new build is found** (with a countdown)")
     return "\n".join(lines)
 
 
